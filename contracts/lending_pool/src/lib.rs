@@ -72,11 +72,26 @@ pub enum DataKey {
     LoanCount,
     /// Ledger sequence at which a lender last deposited.
     /// Used to enforce the same-block deposit/withdraw guard.
+    ///
+    /// TTL strategy: stored in **persistent** storage so the guard survives
+    /// instance TTL expiry.  The key is bumped via `extend_ttl` on every
+    /// deposit and withdraw.  Without persistent storage an attacker could
+    /// wait for instance TTL to expire, then deposit and withdraw in the same
+    /// ledger sequence — silently bypassing the flash-loan guard.
     LenderDepositLedger(Address),
     /// Running borrow total for an address within the current ledger sequence.
     /// Resets when the ledger sequence advances.
+    ///
+    /// TTL strategy: stored in **persistent** storage with `extend_ttl` on
+    /// every borrow.  This prevents the per-block borrow cap from being
+    /// silently reset by instance TTL expiry, which would allow an attacker
+    /// to drain the pool in a single transaction.
     BlockBorrowTotal(Address),
     /// Ledger sequence recorded when the per-block borrow total was last written.
+    ///
+    /// TTL strategy: stored in **persistent** storage with `extend_ttl` on
+    /// every borrow.  Paired with `BlockBorrowTotal` to ensure the accumulator
+    /// resets correctly across ledger sequences even after TTL expiry.
     BlockBorrowLedger(Address),
     /// Snapshot of total liquidity at the start of the current ledger sequence.
     /// Used to detect intra-block balance manipulation.
@@ -100,6 +115,23 @@ const LIQUIDATION_SECONDS: u64 = LIQUIDATION_DAYS * 86_400;
 /// Maximum amount a single address may borrow within one ledger sequence.
 /// Set to 10% of the pool's liquidity snapshot; enforced dynamically.
 const PER_BLOCK_BORROW_CAP_BPS: i128 = 1_000; // 10 %
+
+// ---------------------------------------------------------------------------
+// TTL constants for flash-loan guard entries (persistent storage)
+// ---------------------------------------------------------------------------
+
+/// Retention period for flash-loan guard entries: 7 days in ledgers
+/// (assuming ~5s per ledger).  This is the maximum time a ledger-guard
+/// entry should be kept before it is eligible for archival.
+const LEDGER_GUARD_TTL: u32 = 120_960; // 7 days at 5s/ledger
+/// TTL threshold: when remaining lifetime drops below this many ledgers,
+/// extend the TTL.  500k ledgers ≈ 29 days at 5s/ledger.
+const LEDGER_GUARD_TTL_THRESHOLD: u32 = 500_000;
+/// TTL bump amount in ledgers: extend lifetime by this amount.
+/// 1_209_600 ledgers ≈ 70 days (10 weeks) at 5s/ledger — well beyond the
+/// 7-day instance TTL default, guaranteeing the flash-loan guard cannot
+/// be silently expired.
+const LEDGER_GUARD_TTL_BUMP: u32 = 1_209_600;
 
 // ---------------------------------------------------------------------------
 // Contract
@@ -195,9 +227,17 @@ impl LendingPool {
 
         // Record the ledger sequence of this deposit so that same-block
         // withdrawals can be rejected.
-        env.storage().instance().set(
-            &DataKey::LenderDepositLedger(lender),
-            &env.ledger().sequence(),
+        //
+        // Stored in persistent storage with a TTL bump so the guard
+        // survives instance TTL expiry (see DataKey::LenderDepositLedger).
+        let deposit_ledger_key = DataKey::LenderDepositLedger(lender);
+        env.storage()
+            .persistent()
+            .set(&deposit_ledger_key, &env.ledger().sequence());
+        env.storage().persistent().extend_ttl(
+            &deposit_ledger_key,
+            LEDGER_GUARD_TTL_THRESHOLD,
+            LEDGER_GUARD_TTL_BUMP,
         );
 
         Ok(lp_tokens)
@@ -218,11 +258,22 @@ impl LendingPool {
         // Flash-loan guard: reject withdrawals in the same ledger sequence as
         // the deposit.  An attacker who deposits and immediately withdraws
         // within one transaction cannot manipulate pool balances.
+        //
+        // Read from persistent storage and bump TTL so the entry cannot be
+        // silently expired by instance TTL expiry.
+        let deposit_ledger_key = DataKey::LenderDepositLedger(lender.clone());
         let deposit_ledger: u32 = env
             .storage()
-            .instance()
-            .get(&DataKey::LenderDepositLedger(lender.clone()))
+            .persistent()
+            .get(&deposit_ledger_key)
             .unwrap_or(0);
+        if deposit_ledger != 0 {
+            env.storage().persistent().extend_ttl(
+                &deposit_ledger_key,
+                LEDGER_GUARD_TTL_THRESHOLD,
+                LEDGER_GUARD_TTL_BUMP,
+            );
+        }
         if deposit_ledger == env.ledger().sequence() {
             return Err(Error::SameBlockDepositWithdraw);
         }
@@ -352,6 +403,12 @@ impl LendingPool {
             total_liquidity
         };
 
+        // Bump instance TTL on every borrow to prevent silent expiry of
+        // the liquidity snapshot and other instance-scoped data.
+        env.storage()
+            .instance()
+            .extend_ttl(LEDGER_GUARD_TTL_THRESHOLD, LEDGER_GUARD_TTL_BUMP);
+
         // Compute the per-block cap for this borrower.
         let per_block_cap = liquidity_snapshot
             .checked_mul(PER_BLOCK_BORROW_CAP_BPS)
@@ -360,16 +417,38 @@ impl LendingPool {
             .unwrap_or(i128::MAX);
 
         // Accumulate the borrower's total within this ledger sequence.
+        //
+        // Read from persistent storage so the per-block cap cannot be
+        // silently reset by instance TTL expiry.  Bump TTL on every access.
+        let borrow_ledger_key = DataKey::BlockBorrowLedger(borrower.clone());
         let borrow_ledger: u32 = env
             .storage()
-            .instance()
-            .get(&DataKey::BlockBorrowLedger(borrower.clone()))
+            .persistent()
+            .get(&borrow_ledger_key)
             .unwrap_or(0);
+        if borrow_ledger != 0 {
+            env.storage().persistent().extend_ttl(
+                &borrow_ledger_key,
+                LEDGER_GUARD_TTL_THRESHOLD,
+                LEDGER_GUARD_TTL_BUMP,
+            );
+        }
+
+        let borrow_total_key = DataKey::BlockBorrowTotal(borrower.clone());
         let block_total: i128 = if borrow_ledger == current_seq {
-            env.storage()
-                .instance()
-                .get(&DataKey::BlockBorrowTotal(borrower.clone()))
-                .unwrap_or(0)
+            let total: i128 = env
+                .storage()
+                .persistent()
+                .get(&borrow_total_key)
+                .unwrap_or(0);
+            if total != 0 {
+                env.storage().persistent().extend_ttl(
+                    &borrow_total_key,
+                    LEDGER_GUARD_TTL_THRESHOLD,
+                    LEDGER_GUARD_TTL_BUMP,
+                );
+            }
+            total
         } else {
             0 // Reset for the new ledger sequence.
         };
@@ -379,13 +458,24 @@ impl LendingPool {
             return Err(Error::PerBlockBorrowLimitExceeded);
         }
 
-        // Persist the updated per-block accumulator.
+        // Persist the updated per-block accumulator in persistent storage
+        // with TTL bumping.
         env.storage()
-            .instance()
-            .set(&DataKey::BlockBorrowTotal(borrower.clone()), &new_block_total);
+            .persistent()
+            .set(&borrow_total_key, &new_block_total);
+        env.storage().persistent().extend_ttl(
+            &borrow_total_key,
+            LEDGER_GUARD_TTL_THRESHOLD,
+            LEDGER_GUARD_TTL_BUMP,
+        );
         env.storage()
-            .instance()
-            .set(&DataKey::BlockBorrowLedger(borrower.clone()), &current_seq);
+            .persistent()
+            .set(&borrow_ledger_key, &current_seq);
+        env.storage().persistent().extend_ttl(
+            &borrow_ledger_key,
+            LEDGER_GUARD_TTL_THRESHOLD,
+            LEDGER_GUARD_TTL_BUMP,
+        );
 
         // Calculate fee (2% flat) using cache for common amounts
         let fee = Self::get_cached_fee(&env, amount);
@@ -494,18 +584,38 @@ impl LendingPool {
 
     /// Return the cumulative amount borrowed by `borrower` in the current
     /// ledger sequence.  Returns 0 if no borrow has occurred this sequence.
+    ///
+    /// Reads from persistent storage and bumps TTL to prevent silent expiry.
     pub fn get_block_borrow_total(env: Env, borrower: Address) -> i128 {
         let current_seq = env.ledger().sequence();
+        let borrow_ledger_key = DataKey::BlockBorrowLedger(borrower.clone());
         let borrow_ledger: u32 = env
             .storage()
-            .instance()
-            .get(&DataKey::BlockBorrowLedger(borrower.clone()))
+            .persistent()
+            .get(&borrow_ledger_key)
             .unwrap_or(0);
+        if borrow_ledger != 0 {
+            env.storage().persistent().extend_ttl(
+                &borrow_ledger_key,
+                LEDGER_GUARD_TTL_THRESHOLD,
+                LEDGER_GUARD_TTL_BUMP,
+            );
+        }
         if borrow_ledger == current_seq {
-            env.storage()
-                .instance()
-                .get(&DataKey::BlockBorrowTotal(borrower))
-                .unwrap_or(0)
+            let borrow_total_key = DataKey::BlockBorrowTotal(borrower);
+            let total: i128 = env
+                .storage()
+                .persistent()
+                .get(&borrow_total_key)
+                .unwrap_or(0);
+            if total != 0 {
+                env.storage().persistent().extend_ttl(
+                    &borrow_total_key,
+                    LEDGER_GUARD_TTL_THRESHOLD,
+                    LEDGER_GUARD_TTL_BUMP,
+                );
+            }
+            total
         } else {
             0
         }

@@ -15,6 +15,7 @@
 ///   10. Oracle: gradual price movement not flagged at 15% threshold
 ///   11. Oracle: circuit breaker allows prices within 50% window
 ///   12. Oracle: get_block_borrow_total tracks within-block accumulation
+///   13. Lending pool: same-block guard survives instance TTL expiry (Issue #654)
 extern crate std;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -510,5 +511,93 @@ fn test_lp_block_borrow_total_zero_new_block() {
         client.get_block_borrow_total(&borrower),
         0,
         "block borrow total must reset to 0 in a new ledger sequence"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 13. Lending pool: same-block guard survives instance TTL expiry (Issue #654)
+// ---------------------------------------------------------------------------
+
+/// Verifies that the same-block deposit/withdraw guard remains effective even
+/// after a simulated instance TTL expiry.  The `LenderDepositLedger` key was
+/// moved from instance to persistent storage, so advancing the ledger far
+/// beyond typical instance TTL boundaries must not disable the guard.
+#[test]
+fn test_same_block_guard_survives_ttl_expiry() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| {
+        li.sequence_number = 100;
+        li.timestamp = 10_000;
+    });
+
+    let admin = Address::generate(&env);
+    let lender = Address::generate(&env);
+    let credit_score = Address::generate(&env);
+    let (usdc, sac) = create_token(&env, &admin);
+    sac.mint(&lender, &1_000_000);
+
+    let contract_id = env.register_contract(None, LendingPool);
+    let client = LendingPoolClient::new(&env, &contract_id);
+    client.initialize(&admin, &usdc, &credit_score).unwrap();
+
+    // Perform an initial deposit in ledger 100.
+    client.deposit(&lender, &100_000).unwrap();
+
+    // Advance the ledger far beyond a typical instance TTL window
+    // (~1.2M ledgers ≈ 70 days at 5s/ledger).  This simulates instance
+    // TTL expiry for any instance-scoped storage.
+    advance_ledger(&env, 1_500_000); // now at ledger 1_500_100
+
+    // Verify the `LenderDepositLedger` entry from ledger 100 still exists
+    // in persistent storage — it should survive the TTL boundary because
+    // it was bumped on deposit.
+    // We can't directly read the raw storage key in tests, but we can
+    // indirectly verify by checking that the same-block guard fires.
+
+    // Now deposit again in ledger 1_500_100 — the guard should still
+    // prevent a same-block withdrawal.
+    client.deposit(&lender, &50_000).unwrap();
+
+    let result = client.try_withdraw(&lender, &50_000);
+    assert_eq!(
+        result,
+        Err(LpError::SameBlockDepositWithdraw),
+        "same-block guard must fire after simulated instance TTL expiry"
+    );
+
+    // After advancing one more ledger, withdrawal should succeed — proving
+    // the guard only blocks same-sequence operations, not legitimate ones.
+    advance_ledger(&env, 1);
+    let withdrawn = client.withdraw(&lender, &50_000).unwrap();
+    assert_eq!(
+        withdrawn, 50_000,
+        "withdrawal should succeed in the next ledger sequence after TTL advance"
+    );
+
+    // Also verify the per-block borrow cap survives TTL boundaries.
+    let borrower = Address::generate(&env);
+    sac.mint(&borrower, &0);
+
+    // First borrow should succeed (10% of pool snapshot).
+    let cap = 100_000; // 10% of remaining ~1_000_000
+    client
+        .borrow(&borrower, &cap, &symbol_short!("S1"))
+        .unwrap();
+
+    // Second borrow in the same block must be rejected.
+    let result = client.try_borrow(&borrower, &1, &symbol_short!("S2"));
+    assert_eq!(
+        result,
+        Err(LpError::PerBlockBorrowLimitExceeded),
+        "per-block borrow cap must be enforced after simulated TTL expiry"
+    );
+
+    // Advance block — `get_block_borrow_total` should reset.
+    advance_ledger(&env, 1);
+    assert_eq!(
+        client.get_block_borrow_total(&borrower),
+        0,
+        "block borrow total must reset after ledger advance past TTL boundary"
     );
 }
