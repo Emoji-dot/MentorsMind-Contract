@@ -139,6 +139,23 @@ const AUCTION_DURATION_SECS: u64 = 24 * 60 * 60; // 24 hours
 const MAX_AUCTION_DISCOUNT_BPS: i128 = 2_000; // 20%
 
 // ---------------------------------------------------------------------------
+// TTL constants for flash-loan guard entries (persistent storage)
+// ---------------------------------------------------------------------------
+
+/// Retention period for flash-loan guard entries: 7 days in ledgers
+/// (assuming ~5s per ledger).  This is the maximum time a ledger-guard
+/// entry should be kept before it is eligible for archival.
+const LEDGER_GUARD_TTL: u32 = 120_960; // 7 days at 5s/ledger
+/// TTL threshold: when remaining lifetime drops below this many ledgers,
+/// extend the TTL.  500k ledgers ≈ 29 days at 5s/ledger.
+const LEDGER_GUARD_TTL_THRESHOLD: u32 = 500_000;
+/// TTL bump amount in ledgers: extend lifetime by this amount.
+/// 1_209_600 ledgers ≈ 70 days (10 weeks) at 5s/ledger — well beyond the
+/// 7-day instance TTL default, guaranteeing the flash-loan guard cannot
+/// be silently expired.
+const LEDGER_GUARD_TTL_BUMP: u32 = 1_209_600;
+
+// ---------------------------------------------------------------------------
 // Contract
 // ---------------------------------------------------------------------------
 
@@ -510,9 +527,16 @@ impl LendingPool {
 
         let deposit_ledger: u32 = env
             .storage()
-            .instance()
-            .get(&DataKey::LenderDepositLedger(lender.clone()))
+            .persistent()
+            .get(&deposit_ledger_key)
             .unwrap_or(0);
+        if deposit_ledger != 0 {
+            env.storage().persistent().extend_ttl(
+                &deposit_ledger_key,
+                LEDGER_GUARD_TTL_THRESHOLD,
+                LEDGER_GUARD_TTL_BUMP,
+            );
+        }
         if deposit_ledger == env.ledger().sequence() {
             return Err(Error::SameBlockDepositWithdraw);
         }
@@ -647,14 +671,32 @@ impl LendingPool {
 
         let borrow_ledger: u32 = env
             .storage()
-            .instance()
-            .get(&DataKey::BlockBorrowLedger(borrower.clone()))
+            .persistent()
+            .get(&borrow_ledger_key)
             .unwrap_or(0);
+        if borrow_ledger != 0 {
+            env.storage().persistent().extend_ttl(
+                &borrow_ledger_key,
+                LEDGER_GUARD_TTL_THRESHOLD,
+                LEDGER_GUARD_TTL_BUMP,
+            );
+        }
+
+        let borrow_total_key = DataKey::BlockBorrowTotal(borrower.clone());
         let block_total: i128 = if borrow_ledger == current_seq {
-            env.storage()
-                .instance()
-                .get(&DataKey::BlockBorrowTotal(borrower.clone()))
-                .unwrap_or(0)
+            let total: i128 = env
+                .storage()
+                .persistent()
+                .get(&borrow_total_key)
+                .unwrap_or(0);
+            if total != 0 {
+                env.storage().persistent().extend_ttl(
+                    &borrow_total_key,
+                    LEDGER_GUARD_TTL_THRESHOLD,
+                    LEDGER_GUARD_TTL_BUMP,
+                );
+            }
+            total
         } else {
             0
         };
@@ -665,11 +707,21 @@ impl LendingPool {
         }
 
         env.storage()
-            .instance()
-            .set(&DataKey::BlockBorrowTotal(borrower.clone()), &new_block_total);
+            .persistent()
+            .set(&borrow_total_key, &new_block_total);
+        env.storage().persistent().extend_ttl(
+            &borrow_total_key,
+            LEDGER_GUARD_TTL_THRESHOLD,
+            LEDGER_GUARD_TTL_BUMP,
+        );
         env.storage()
-            .instance()
-            .set(&DataKey::BlockBorrowLedger(borrower.clone()), &current_seq);
+            .persistent()
+            .set(&borrow_ledger_key, &current_seq);
+        env.storage().persistent().extend_ttl(
+            &borrow_ledger_key,
+            LEDGER_GUARD_TTL_THRESHOLD,
+            LEDGER_GUARD_TTL_BUMP,
+        );
 
         // Check for large transaction and trigger regulatory reporting
         Self::_check_and_report_large_tx(&env, symbol_short!("lend_pool"), symbol_short!("borrow"), &borrower, amount);
@@ -772,16 +824,34 @@ impl LendingPool {
 
     pub fn get_block_borrow_total(env: Env, borrower: Address) -> i128 {
         let current_seq = env.ledger().sequence();
+        let borrow_ledger_key = DataKey::BlockBorrowLedger(borrower.clone());
         let borrow_ledger: u32 = env
             .storage()
-            .instance()
-            .get(&DataKey::BlockBorrowLedger(borrower.clone()))
+            .persistent()
+            .get(&borrow_ledger_key)
             .unwrap_or(0);
+        if borrow_ledger != 0 {
+            env.storage().persistent().extend_ttl(
+                &borrow_ledger_key,
+                LEDGER_GUARD_TTL_THRESHOLD,
+                LEDGER_GUARD_TTL_BUMP,
+            );
+        }
         if borrow_ledger == current_seq {
-            env.storage()
-                .instance()
-                .get(&DataKey::BlockBorrowTotal(borrower))
-                .unwrap_or(0)
+            let borrow_total_key = DataKey::BlockBorrowTotal(borrower);
+            let total: i128 = env
+                .storage()
+                .persistent()
+                .get(&borrow_total_key)
+                .unwrap_or(0);
+            if total != 0 {
+                env.storage().persistent().extend_ttl(
+                    &borrow_total_key,
+                    LEDGER_GUARD_TTL_THRESHOLD,
+                    LEDGER_GUARD_TTL_BUMP,
+                );
+            }
+            total
         } else {
             0
         }
