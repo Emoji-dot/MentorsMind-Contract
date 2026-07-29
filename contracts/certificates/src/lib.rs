@@ -1,7 +1,11 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, vec, Address, Env, Symbol, Vec,
+    contract, contractclient, contractimpl, contracttype, symbol_short, vec, Address, Env, Symbol,
+    Vec,
 };
+
+const MIN_CERT_RATING: u64 = 400; // 4.0/5.0 * 100
+const MIN_SESSIONS_COMPLETED: u32 = 3;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -13,6 +17,8 @@ pub struct CertificateRecord {
     pub sessions_completed: u32,
     pub issued_at: u64,
     pub revoked: bool,
+    pub session_id: Symbol,
+    pub rating_at_time: u64,
 }
 
 #[contracttype]
@@ -23,6 +29,25 @@ pub enum DataKey {
     Cert(u64),
     LearnerCerts(Address),
     SkillCerts(Symbol),
+    EscrowContract,
+    ReputationContract,
+    SessionRegistry,
+}
+
+#[contractclient(name = "EscrowClient")]
+pub trait EscrowTrait {
+    fn get_escrow_by_session(env: Env, session_id: Symbol) -> shared::EscrowRecord;
+}
+
+#[contractclient(name = "ReputationClient")]
+pub trait ReputationTrait {
+    fn get_mentor_rating(env: Env, mentor: Address) -> (u64, u64);
+}
+
+#[contractclient(name = "SessionRegistryClient")]
+pub trait SessionRegistryTrait {
+    fn get_sessions_by_learner(env: Env, learner: Address) -> Vec<Symbol>;
+    fn get_session(env: Env, session_id: Symbol) -> shared::escrow::EscrowRecord;
 }
 
 #[contract]
@@ -30,21 +55,38 @@ pub struct Certificates;
 
 #[contractimpl]
 impl Certificates {
-    pub fn initialize(env: Env, admin: Address, backend: Address) {
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        backend: Address,
+        escrow_contract: Address,
+        reputation_contract: Address,
+        session_registry: Address,
+    ) {
         if env.storage().persistent().has(&DataKey::Admin) {
             panic!("already initialized");
         }
         env.storage().persistent().set(&DataKey::Admin, &admin);
         env.storage().persistent().set(&DataKey::Backend, &backend);
+        env.storage()
+            .persistent()
+            .set(&DataKey::EscrowContract, &escrow_contract);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ReputationContract, &reputation_contract);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SessionRegistry, &session_registry);
     }
 
-    /// Issue a soulbound certificate. Platform backend only.
+    /// Issue a gated certificate. Platform backend only.
+    /// Verifies: escrow released, mentor rating >= 4.0, learner completed >= N sessions.
     pub fn issue_certificate(
         env: Env,
         learner: Address,
         mentor: Address,
         skill: Symbol,
-        sessions_completed: u32,
+        session_id: Symbol,
         issued_at: u64,
     ) -> u64 {
         let backend: Address = env
@@ -53,6 +95,42 @@ impl Certificates {
             .get(&DataKey::Backend)
             .expect("not initialized");
         backend.require_auth();
+
+        // 1. Verify escrow is Released
+        let escrow_addr: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowContract)
+            .expect("escrow contract not set");
+        let escrow_client = EscrowClient::new(&env, &escrow_addr);
+        let escrow = escrow_client.get_escrow_by_session(&session_id);
+        if escrow.status != shared::EscrowStatus::Released {
+            panic!("escrow not released");
+        }
+
+        // 2. Verify mentor rating >= MIN_CERT_RATING
+        let reputation_addr: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReputationContract)
+            .expect("reputation contract not set");
+        let reputation_client = ReputationClient::new(&env, &reputation_addr);
+        let (rating, _count) = reputation_client.get_mentor_rating(&mentor);
+        if rating < MIN_CERT_RATING {
+            panic!("mentor rating too low");
+        }
+
+        // 3. Verify learner completed >= MIN_SESSIONS_COMPLETED sessions
+        let session_registry_addr: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SessionRegistry)
+            .expect("session registry not set");
+        let session_client = SessionRegistryClient::new(&env, &session_registry_addr);
+        let sessions = session_client.get_sessions_by_learner(&learner);
+        if sessions.len() < MIN_SESSIONS_COMPLETED {
+            panic!("insufficient sessions completed");
+        }
 
         let id: u64 = env
             .storage()
@@ -67,17 +145,24 @@ impl Certificates {
             learner: learner.clone(),
             mentor,
             skill: skill.clone(),
-            sessions_completed,
+            sessions_completed: sessions.len(),
             issued_at,
             revoked: false,
+            session_id: session_id.clone(),
+            rating_at_time: rating,
         };
 
         env.storage().persistent().set(&DataKey::Cert(id), &cert);
         push_id(&env, &DataKey::LearnerCerts(learner.clone()), id);
         push_id(&env, &DataKey::SkillCerts(skill.clone()), id);
 
-        env.events()
-            .publish((symbol_short!("cert_iss"), learner), (skill, id));
+        env.events().publish(
+            (
+                Symbol::new(&env, "CertificateEarned"),
+                learner,
+            ),
+            (mentor, session_id, skill, rating),
+        );
 
         id
     }

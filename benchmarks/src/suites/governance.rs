@@ -10,7 +10,7 @@ use mentorminds_governance::{
 use soroban_sdk::{
     contract, contractimpl, contracttype,
     testutils::{Address as _, Ledger},
-    symbol_short, Address, Bytes, BytesN, Env, Symbol,
+    Address, Bytes, BytesN, Env,
 };
 
 const CONTRACT: &str = "governance";
@@ -82,8 +82,8 @@ impl Fixture {
         let proposer = Address::generate(&env);
         let voter = Address::generate(&env);
         let mnt = Address::generate(&env);
-        let snapshot = env.register_contract(None, MockSnapshot);
-        let gov = env.register_contract(None, GovernanceContract);
+        let snapshot = env.register(MockSnapshot, ());
+        let gov = env.register(GovernanceContract, ());
 
         let client = GovernanceContractClient::new(&env, &gov);
         client.initialize(
@@ -167,6 +167,42 @@ pub fn run() -> Vec<BenchResult> {
         results.push(BenchResult {
             contract: CONTRACT.into(),
             entry_point: "execute_proposal".into(),
+            cpu_instructions: snap.cpu_instructions,
+            mem_bytes: snap.mem_bytes,
+            storage_reads: 0,
+            storage_writes: 0,
+            wasm_bytes: wasm,
+        });
+    }
+
+    // --- register_arbitrator (governance action) ---
+    {
+        let f = Fixture::new();
+        let arbitrator = Address::generate(&f.env);
+        let snap = measure(&f.env, || {
+            f.client().register_arbitrator(&f.admin, &arbitrator);
+        });
+        results.push(BenchResult {
+            contract: CONTRACT.into(),
+            entry_point: "register_arbitrator".into(),
+            cpu_instructions: snap.cpu_instructions,
+            mem_bytes: snap.mem_bytes,
+            storage_reads: 0,
+            storage_writes: 0,
+            wasm_bytes: wasm,
+        });
+    }
+
+    // --- cancel_proposal (governance action) ---
+    {
+        let f = Fixture::new();
+        let pid = f.make_proposal();
+        let snap = measure(&f.env, || {
+            f.client().cancel_proposal(&pid);
+        });
+        results.push(BenchResult {
+            contract: CONTRACT.into(),
+            entry_point: "cancel_proposal".into(),
             cpu_instructions: snap.cpu_instructions,
             mem_bytes: snap.mem_bytes,
             storage_reads: 0,

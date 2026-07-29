@@ -33,9 +33,9 @@
 /// 2. Implement the `event_type_symbol` arm in `impl EventType`.
 /// 3. Add an entry to `events_schema.json` at the workspace root.
 /// 4. If this is a breaking payload change, increment `EVENT_SCHEMA_VERSION`.
-#![allow(dead_code)]
+#[allow(dead_code)]
 
-use soroban_sdk::{symbol_short, Env, IntoVal, Symbol, Val, Vec};
+use soroban_sdk::{Env, IntoVal, Symbol, Val};
 
 // ---------------------------------------------------------------------------
 // Schema version — increment when topic layout or required fields change.
@@ -332,7 +332,7 @@ pub fn evt_referral_reward(env: &Env)      -> Symbol { Symbol::new(env, "reward"
 /// Returns `true` if the topic vec has the canonical 3-element layout:
 /// `(Symbol, u32, Symbol)` with the given contract name and schema version.
 #[cfg(any(test, feature = "testutils"))]
-pub fn topic_is_valid(topics: &Vec<Val>, expected_contract: &str, env: &Env) -> bool {
+pub fn topic_is_valid(topics: &soroban_sdk::Vec<Val>, expected_contract: &str, env: &Env) -> bool {
     use soroban_sdk::TryFromVal;
 
     if topics.len() != 3 {

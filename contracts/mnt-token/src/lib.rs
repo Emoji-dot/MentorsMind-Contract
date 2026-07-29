@@ -3,6 +3,7 @@
 use soroban_sdk::token::TokenInterface;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String, Symbol,
+    IntoVal,
 };
 use soroban_token_sdk::metadata::TokenMetadata;
 

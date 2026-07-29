@@ -42,6 +42,7 @@ pub enum DataKey {
     ProposalCount,
     Template(TemplateType),
     Proposal(u32),
+    TemplateHash(Address, Symbol),
 }
 
 #[contract]
@@ -126,11 +127,32 @@ impl ProposalTemplatesContract {
         count
     }
 
+    pub fn add_template(
+        env: Env,
+        admin: Address,
+        target: Address,
+        function: Symbol,
+        args_schema_hash: BytesN<32>,
+    ) {
+        admin.require_auth();
+        Self::require_initialized(&env);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::TemplateHash(target, function), &args_schema_hash);
+    }
+
     pub fn get_template(env: Env, template_type: TemplateType) -> TemplateRecord {
         env.storage()
             .persistent()
             .get(&DataKey::Template(template_type))
             .expect("template not found")
+    }
+
+    pub fn get_template_hash(env: Env, target: Address, function: Symbol) -> Option<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TemplateHash(target, function))
     }
 
     pub fn get_proposal(env: Env, proposal_id: u32) -> ProposalRecord {
@@ -268,7 +290,7 @@ mod tests {
         };
 
         let bytes = Bytes::from_slice(env, descriptor.as_bytes());
-        env.crypto().sha256(&bytes)
+        env.crypto().sha256(&bytes).into()
     }
 
     #[test]

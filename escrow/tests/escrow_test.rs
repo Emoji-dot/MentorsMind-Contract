@@ -506,4 +506,64 @@ fn test_re_approve_token_allows_escrow() {
     assert_eq!(id, 1);
 }
 
+// -----------------------------------------------------------------------
+// #761: gas estimation
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_estimate_release_escrow_cost_is_nonzero_and_view_only() {
+    let f = TestFixture::setup_with_fee(500);
+    let id = f.create_escrow_at(1_000, 0, "GAS1");
+
+    let estimate = f.client().estimate_release_escrow_cost(&id);
+    assert!(estimate.base_instructions > 0);
+    assert!(estimate.storage_reads > 0);
+    assert!(estimate.storage_writes > 0);
+    assert!(estimate.cross_contract_calls > 0);
+
+    // View-only: escrow is still Active, so a real release still succeeds.
+    f.client().release_funds(&f.learner, &id);
+    assert_eq!(f.client().get_escrow(&id).status, EscrowStatus::Released);
+}
+
+#[test]
+fn test_estimate_release_escrow_cost_accounts_for_fee_transfer() {
+    let f_with_fee = TestFixture::setup_with_fee(500);
+    let id_with_fee = f_with_fee.create_escrow_at(1_000, 0, "GAS2");
+    let with_fee = f_with_fee.client().estimate_release_escrow_cost(&id_with_fee);
+
+    let f_no_fee = TestFixture::setup_with_fee(0);
+    let id_no_fee = f_no_fee.create_escrow_at(1_000, 0, "GAS3");
+    let no_fee = f_no_fee.client().estimate_release_escrow_cost(&id_no_fee);
+
+    // A non-zero platform fee means an extra treasury transfer.
+    assert!(with_fee.cross_contract_calls > no_fee.cross_contract_calls);
+    assert!(with_fee.base_instructions > no_fee.base_instructions);
+}
+
+#[test]
+fn test_estimate_release_escrow_cost_within_tolerance_of_actual() {
+    let f = TestFixture::setup_with_fee(500);
+    let id = f.create_escrow_at(1_000, 0, "GAS4");
+
+    let estimate = f.client().estimate_release_escrow_cost(&id);
+
+    f.env.budget().reset_default();
+    f.client().release_funds(&f.learner, &id);
+    let actual = f.env.budget().cpu_instruction_cost();
+
+    let diff = if actual > estimate.base_instructions {
+        actual - estimate.base_instructions
+    } else {
+        estimate.base_instructions - actual
+    };
+    let tolerance = actual / 5; // 20%
+    assert!(
+        diff <= tolerance,
+        "estimate {} vs actual {} exceeds 20% tolerance",
+        estimate.base_instructions,
+        actual
+    );
+}
+
 extern crate alloc;

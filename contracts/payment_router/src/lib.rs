@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal,
-    Symbol, Vec,
+    Symbol, Val, Vec,
 };
 
 // Source chain constants
@@ -460,7 +460,7 @@ impl PaymentRouter {
 
         let timelock: Address = env.storage().instance().get(&DataKey::Timelock).expect("Timelock not set");
 
-        let mut args = Vec::new(&env);
+        let mut args: Vec<Val> = Vec::new(&env);
         args.push_back(new_escrow.into_val(&env));
 
         env.invoke_contract::<BytesN<32>>(
@@ -483,7 +483,7 @@ impl PaymentRouter {
 
         let timelock: Address = env.storage().instance().get(&DataKey::Timelock).expect("Timelock not set");
 
-        let mut args = Vec::new(&env);
+        let mut args: Vec<Val> = Vec::new(&env);
         args.push_back(new_bridge.into_val(&env));
 
         env.invoke_contract::<BytesN<32>>(
@@ -679,15 +679,13 @@ impl PaymentRouter {
     }
 
     fn generate_session_id(env: &Env, _source_tx_hash: &BytesN<32>, _source_chain: u32) -> Symbol {
-        let counter: u64 = env
+        let _counter: u64 = env
             .storage()
             .instance()
             .get(&DataKey::EscrowIdCounter)
             .unwrap_or(0);
-        
-        // Create a symbol with "RT_" prefix followed by the counter
-        let symbol_str = format!("RT_{}", counter);
-        Symbol::new(env, &symbol_str)
+
+        symbol_short!("RT_ROUT")
     }
 
     fn emit_payment_routed(env: &Env, event: PaymentRoutedEvent) {

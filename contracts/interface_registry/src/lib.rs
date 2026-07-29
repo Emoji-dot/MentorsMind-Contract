@@ -8,6 +8,7 @@ pub enum DataKey {
     Admin,
     Interface(Symbol),
     InterfaceIds,
+    InterfaceDescriptor(Symbol),
 }
 
 #[contracttype]
@@ -23,6 +24,12 @@ pub struct InterfaceEntry {
 pub struct InterfaceData {
     pub contract: Address,
     pub version: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterfaceDescriptor {
+    pub functions: Vec<(Symbol, u32)>,
 }
 
 #[contract]
@@ -72,6 +79,17 @@ impl InterfaceRegistryContract {
                 version,
             },
         );
+
+        // Store default empty descriptor if not already present
+        let descriptor_key = DataKey::InterfaceDescriptor(interface_id.clone());
+        if !env.storage().persistent().has(&descriptor_key) {
+            env.storage().persistent().set(
+                &descriptor_key,
+                &InterfaceDescriptor {
+                    functions: Vec::new(&env),
+                },
+            );
+        }
 
         if is_new {
             env.events().publish(
@@ -147,6 +165,49 @@ impl InterfaceRegistryContract {
 
     pub fn get_yield_contract_version(env: Env) -> u32 {
         Self::get_version(env.clone(), Symbol::new(&env, Self::YIELD_INTERFACE))
+    }
+
+    /// Verify that a contract at `address` is registered with the expected interface.
+    pub fn verify(env: Env, address: Address, expected_interface: Symbol) -> bool {
+        let key = DataKey::Interface(expected_interface);
+        match env.storage().persistent().get::<_, InterfaceData>(&key) {
+            Some(data) => data.contract == address,
+            None => false,
+        }
+    }
+
+    /// Panics if the contract at `address` is not registered with the expected interface.
+    pub fn require_interface(env: Env, address: Address, expected_interface: Symbol) {
+        if !Self::verify(env.clone(), address, expected_interface) {
+            panic!("interface mismatch");
+        }
+    }
+
+    /// Store an interface descriptor for a given interface_id.
+    pub fn set_interface_descriptor(
+        env: Env,
+        interface_id: Symbol,
+        descriptor: InterfaceDescriptor,
+    ) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+        let descriptor_key = DataKey::InterfaceDescriptor(interface_id);
+        env.storage().persistent().set(&descriptor_key, &descriptor);
+    }
+
+    /// Get interface descriptor for a given interface_id.
+    pub fn get_interface_descriptor(env: Env, interface_id: Symbol) -> InterfaceDescriptor {
+        let descriptor_key = DataKey::InterfaceDescriptor(interface_id);
+        env.storage()
+            .persistent()
+            .get(&descriptor_key)
+            .unwrap_or(InterfaceDescriptor {
+                functions: Vec::new(&env),
+            })
     }
 }
 
@@ -243,5 +304,24 @@ mod tests {
 
         assert_eq!(registry.get_yield_contract(), yield_contract);
         assert_eq!(registry.get_yield_contract_version(), 3);
+    }
+
+    #[test]
+    fn test_verify_and_require_interface() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (registry, _admin, escrow) = setup(&env);
+        let interface = Symbol::new(&env, "escrow_v1");
+        registry.register_interface(&escrow, &interface, &1);
+        assert!(registry.verify(&escrow, &interface));
+        let other = Address::generate(&env);
+        assert!(!registry.verify(&other, &interface));
+        // require_interface should not panic for correct address
+        registry.require_interface(&escrow, &interface);
+        // require_interface should panic for wrong address
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            registry.require_interface(&other, &interface);
+        }));
+        assert!(result.is_err());
     }
 }

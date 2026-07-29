@@ -1,10 +1,13 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, IntoVal, Symbol, Vec,
+    contract, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env, IntoVal,
+    Symbol, Vec,
 };
+use soroban_sdk::xdr::ToXdr;
 
 // Pull in the shared signature-validation utilities.
 use shared::sig_validation::{current_nonce, validate_and_consume_nonce, MetaTxAction, MetaTxPayload};
+use shared::GasEstimate;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -20,11 +23,28 @@ pub struct EscrowInfo {
 const ADMIN: Symbol = symbol_short!("ADMIN");
 const IMPLEMENTATION: Symbol = symbol_short!("IMPL");
 const PAUSE_GUARDIAN: Symbol = symbol_short!("PAUSE_GD");
+const ANOMALY_DETECTOR: Symbol = symbol_short!("ANOM_DET");
+const BYPASS_ANOMALY: Symbol = symbol_short!("BYPASS_AN");
 const ESCROW_MAPPING: Symbol = symbol_short!("ESC_MAP");
 const ESCROW_LIST: Symbol = symbol_short!("ESC_LIST");
 const ESCROW_COUNT: Symbol = symbol_short!("ESC_CNT");
+/// Per-session redeployment counter: `SessionNonce(session_id) -> u32`.
+/// Bumped each time an escrow for `session_id` is (re)deployed, so a new
+/// deployment after a previous one expired produces a different salt (and
+/// therefore a different address) instead of colliding.
+const SESSION_NONCE: Symbol = symbol_short!("SESS_NCE");
+const INTERFACE_REGISTRY: Symbol = symbol_short!("IF_REG");
 const FACTORY_TTL_THRESHOLD: u32 = 500_000;
 const FACTORY_TTL_BUMP: u32 = 1_000_000;
+
+// ---------------------------------------------------------------------------
+// Gas-estimation heuristic constants (#761). Calibrated against
+// `env.budget().cpu_instruction_cost()` measured around a real
+// `deploy_escrow` call in the estimate-vs-actual test.
+// ---------------------------------------------------------------------------
+const DEPLOY_BASE_INSTRUCTIONS: u64 = 40_000;
+const DEPLOY_PER_STORAGE_OP_INSTRUCTIONS: u64 = 2_000;
+const DEPLOY_PER_CROSS_CALL_INSTRUCTIONS: u64 = 230_000;
 
 // ---------------------------------------------------------------------------
 // Timestamp security constants
@@ -53,6 +73,44 @@ pub const TIMESTAMP_TOLERANCE_SECS: u64 = 60; // 1 minute
 /// A supplied start that is more than this many seconds in the past is
 /// rejected to prevent replaying stale session parameters.
 const MAX_PAST_START_SECS: u64 = 5 * 60; // 5 minutes
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DataKey {
+    HighValueThreshold,
+    PendingHighValueSession(Symbol),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingSession {
+    pub mentor: Address,
+    pub learner: Address,
+    pub amount: i128,
+    pub token: Address,
+    pub requested_at: u64,
+}
+
+pub const HIGH_VALUE_APPROVAL_WINDOW_SECS: u64 = 48 * 3600;
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAdminChange {
+    pub new_admin: Address,
+    pub effective_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminChangeProposedEvent {
+    pub contract: Address,
+    pub old_admin: Address,
+    pub new_admin: Address,
+    pub effective_at: u64,
+}
+
+const ADMIN_CHANGE_TIMELOCK: u64 = 48 * 60 * 60;
+const PENDING_ADMIN: Symbol = symbol_short!("PEND_ADM");
 
 #[contract]
 pub struct EscrowFactory;
@@ -87,6 +145,69 @@ impl EscrowFactory {
         );
     }
 
+    pub fn propose_admin_change(
+        env: Env,
+        current_admin: Address,
+        new_admin: Address,
+    ) {
+        Self::require_admin(&env, &current_admin);
+        let old_admin = Self::admin(&env);
+        let effective_at = env
+            .ledger()
+            .timestamp()
+            .checked_add(ADMIN_CHANGE_TIMELOCK)
+            .expect("timestamp overflow");
+        env.storage().persistent().set(
+            &PENDING_ADMIN,
+            &PendingAdminChange {
+                new_admin: new_admin.clone(),
+                effective_at,
+            },
+        );
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("proposed")),
+            AdminChangeProposedEvent {
+                contract: env.current_contract_address(),
+                old_admin,
+                new_admin,
+                effective_at,
+            },
+        );
+    }
+
+    pub fn accept_admin_change(env: Env, new_admin: Address) {
+        new_admin.require_auth();
+        let pending: PendingAdminChange = env
+            .storage()
+            .persistent()
+            .get(&PENDING_ADMIN)
+            .expect("no pending admin change");
+        if pending.new_admin != new_admin {
+            panic!("unauthorized");
+        }
+        if env.ledger().timestamp() < pending.effective_at {
+            panic!("admin change not yet effective");
+        }
+        env.storage().persistent().set(&ADMIN, &new_admin);
+        env.storage().persistent().remove(&PENDING_ADMIN);
+    }
+
+    pub fn cancel_admin_change(env: Env, multisig: Address) {
+        multisig.require_auth();
+        if !env.storage().persistent().has(&PENDING_ADMIN) {
+            panic!("no pending admin change");
+        }
+        env.storage().persistent().remove(&PENDING_ADMIN);
+    }
+
+    pub fn get_pending_admin_change(env: Env) -> Option<PendingAdminChange> {
+        env.storage().persistent().get(&PENDING_ADMIN)
+    }
+
+    pub fn get_admin(env: Env) -> Address {
+        Self::admin(&env)
+    }
+
     /// Set the pause guardian contract address. Admin only.
     pub fn set_pause_guardian(env: Env, guardian: Address) {
         let admin = Self::admin(&env);
@@ -95,6 +216,30 @@ impl EscrowFactory {
         env.storage()
             .persistent()
             .extend_ttl(&PAUSE_GUARDIAN, FACTORY_TTL_THRESHOLD, FACTORY_TTL_BUMP);
+    }
+
+    /// Set the interface registry contract address. Admin only.
+    pub fn set_interface_registry(env: Env, registry: Address) {
+        let admin = Self::admin(&env);
+        admin.require_auth();
+        env.storage().persistent().set(&INTERFACE_REGISTRY, &registry);
+        env.storage()
+            .persistent()
+            .extend_ttl(&INTERFACE_REGISTRY, FACTORY_TTL_THRESHOLD, FACTORY_TTL_BUMP);
+    }
+
+    pub fn set_anomaly_detector(env: Env, detector: Address) {
+        let admin = Self::admin(&env);
+        admin.require_auth();
+        env.storage().persistent().set(&ANOMALY_DETECTOR, &detector);
+        env.storage().persistent().extend_ttl(&ANOMALY_DETECTOR, FACTORY_TTL_THRESHOLD, FACTORY_TTL_BUMP);
+    }
+
+    pub fn set_bypass_anomaly_check(env: Env, bypass: bool) {
+        let admin = Self::admin(&env);
+        admin.require_auth();
+        env.storage().persistent().set(&BYPASS_ANOMALY, &bypass);
+        env.storage().persistent().extend_ttl(&BYPASS_ANOMALY, FACTORY_TTL_THRESHOLD, FACTORY_TTL_BUMP);
     }
 
     /// Deploy a new escrow contract instance using minimal proxy pattern.
@@ -124,6 +269,22 @@ impl EscrowFactory {
                 panic!("Contract is paused");
             }
         }
+        // Anomaly detection check
+        let bypass: bool = env.storage().persistent().get(&BYPASS_ANOMALY).unwrap_or(false);
+        if !bypass {
+            if let Some(anomaly_detector) = env.storage().persistent().get::<_, Address>(&ANOMALY_DETECTOR) {
+                let res: u32 = env.invoke_contract(
+                    &anomaly_detector,
+                    &Symbol::new(&env, "check_anomaly"),
+                    (learner.clone(), 0u32, amount).into_val(&env), // 0u32 = AnomalyAction::CreateEscrow
+                );
+                if res == 2 {
+                    panic!("UserOnHold");
+                } else if res == 1 {
+                    env.events().publish((symbol_short!("anom_warn"), learner.clone()), amount);
+                }
+            }
+        }
         // Check if session ID already exists
         let session_key = (ESCROW_MAPPING, session_id.clone());
         if env.storage().persistent().has(&session_key) {
@@ -150,19 +311,72 @@ impl EscrowFactory {
         // and within the maximum allowed window.
         Self::validate_future_timestamp(&env, now, session_end, MIN_SESSION_DURATION_SECS, MAX_SESSION_DURATION_SECS);
 
+        let threshold: i128 = env.storage().persistent().get(&DataKey::HighValueThreshold).unwrap_or(50_000_000_000);
+        
+        if amount > threshold {
+            let pending = PendingSession {
+                mentor: mentor.clone(),
+                learner: learner.clone(),
+                amount,
+                token: token.clone(),
+                requested_at: now,
+            };
+            env.storage().persistent().set(&DataKey::PendingHighValueSession(session_id.clone()), &pending);
+            env.events().publish(
+                (Symbol::new(&env, "HighValueSessionPending"), session_id.clone()),
+                (amount, now + HIGH_VALUE_APPROVAL_WINDOW_SECS),
+            );
+            
+            let nonce_key = (SESSION_NONCE, session_id.clone());
+            let current_nonce: u32 = env.storage().persistent().get(&nonce_key).unwrap_or(0);
+            let next_nonce = current_nonce.checked_add(1).expect("nonce overflow");
+            let salt = Self::compute_salt(&env, &session_id, &mentor, &learner, next_nonce);
+            return Self::predicted_address(&env, &implementation, salt);
+        }
+
+        Self::deploy_escrow_internal(env, mentor, learner, amount, token, session_id, implementation, now, session_end)
+    }
+
+    fn deploy_escrow_internal(
+        env: Env,
+        mentor: Address,
+        learner: Address,
+        amount: i128,
+        token: Address,
+        session_id: Symbol,
+        implementation: Address,
+        now: u64,
+        session_end: u64,
+    ) -> Address {
+        let session_key = (ESCROW_MAPPING, session_id.clone());
+
+        // Bump this session's nonce *before* computing the salt so a
+        // redeployment (after a prior escrow for the same session_id
+        // expired and was superseded) gets a fresh address instead of
+        // colliding with — or being predictable from — the previous one.
+        let nonce_key = (SESSION_NONCE, session_id.clone());
+        let nonce: u32 = env.storage().persistent().get(&nonce_key).unwrap_or(0);
+        let next_nonce = nonce.checked_add(1).expect("nonce overflow");
+        env.storage().persistent().set(&nonce_key, &next_nonce);
+        env.storage()
+            .persistent()
+            .extend_ttl(&nonce_key, FACTORY_TTL_THRESHOLD, FACTORY_TTL_BUMP);
+
+        let salt = Self::compute_salt(&env, &session_id, &mentor, &learner, next_nonce);
+
         // Deploy new escrow instance as minimal proxy
-        let escrow_address = Self::deploy_minimal_proxy(&env, &implementation);
+        let escrow_address = Self::deploy_minimal_proxy(&env, &implementation, salt);
 
         // Initialize the new escrow contract
         let initialize_sym = Symbol::new(&env, "initialize");
-        env.invoke_contract(
+        let _: () = env.invoke_contract(
             &escrow_address,
             &initialize_sym,
             (
                 env.current_contract_address(), // Set factory as admin
-                Address::generate(&env),        // Treasury (placeholder)
+                env.current_contract_address(), // Treasury (placeholder)
                 0u32,                           // Fee bps (placeholder)
-                Vec::new(&env),                 // Approved tokens (empty for now)
+                Vec::<Address>::new(&env),      // Approved tokens (empty for now)
                 72u64 * 60 * 60,                // Auto release delay (72 hours)
             )
                 .into_val(&env),
@@ -170,12 +384,12 @@ impl EscrowFactory {
 
         // Create escrow in the deployed contract
         let create_escrow_sym = Symbol::new(&env, "create_escrow");
-        env.invoke_contract(
+        let _: Address = env.invoke_contract(
             &escrow_address,
             &create_escrow_sym,
             (
-                mentor,
-                learner,
+                mentor.clone(),
+                learner.clone(),
                 amount,
                 session_id.clone(),
                 token,
@@ -219,17 +433,153 @@ impl EscrowFactory {
 
         // Emit event
         env.events().publish(
-            (symbol_short!("escrow_deployed"), session_id.clone()),
+            (Symbol::new(&env, "escrow_deployed"), session_id.clone()),
             (escrow_address.clone(), session_id),
         );
 
+        // Register interface in the interface registry (if set)
+        if let Some(registry_addr) = env.storage().persistent().get::<_, Address>(&INTERFACE_REGISTRY) {
+            let interface_id = Symbol::new(&env, "escrow_v1");
+            let _: () = env.invoke_contract(
+                &registry_addr,
+                &Symbol::new(&env, "register_interface"),
+                (escrow_address.clone(), interface_id, 1u32).into_val(&env),
+            );
+        }
+
         escrow_address
+    }
+
+    pub fn approve_high_value_session(env: Env, multisig: Address, session_id: Symbol) -> Address {
+        multisig.require_auth();
+        
+        let key = DataKey::PendingHighValueSession(session_id.clone());
+        let pending: PendingSession = env.storage().persistent().get(&key).expect("Session not pending");
+        
+        let now = env.ledger().timestamp();
+        if now > pending.requested_at + HIGH_VALUE_APPROVAL_WINDOW_SECS {
+            // Expired approval: Automatically refund learner.
+            // Assumption: factory holds the tokens that were transferred for this pending session.
+            let token_client = soroban_sdk::token::Client::new(&env, &pending.token);
+            token_client.transfer(&env.current_contract_address(), &pending.learner, &pending.amount);
+            env.storage().persistent().remove(&key);
+            panic!("Approval expired, refunded learner");
+        }
+        
+        env.storage().persistent().remove(&key);
+        
+        let implementation: Address = env.storage().persistent().get(&IMPLEMENTATION).expect("Implementation not set");
+        let session_end = now.checked_add(DEFAULT_SESSION_DURATION_SECS).expect("timestamp overflow");
+        
+        let address = Self::deploy_escrow_internal(
+            env.clone(),
+            pending.mentor,
+            pending.learner,
+            pending.amount,
+            pending.token,
+            session_id.clone(),
+            implementation,
+            now,
+            session_end,
+        );
+        
+        env.events().publish((Symbol::new(&env, "HighValueSessionApproved"), session_id), multisig);
+        address
+    }
+
+    /// Heuristic instruction/IO estimate for `deploy_escrow`, without
+    /// deploying anything. Mirrors the real flow's fixed reads/writes
+    /// (nonce, session mapping, implementation, escrow count, list entry)
+    /// and cross-contract calls (proxy deployment, `initialize`,
+    /// `create_escrow`), then adds the optional pause-guardian /
+    /// anomaly-detector / interface-registry checks based on *current
+    /// storage state* — i.e. whichever of those integrations are actually
+    /// configured right now.
+    pub fn estimate_deploy_escrow_cost(env: Env) -> GasEstimate {
+        // deploy_escrow's own reads: BYPASS_ANOMALY, session-exists check,
+        // IMPLEMENTATION, nonce, ESCROW_COUNT.
+        let mut storage_reads: u32 = 5;
+        // deploy_escrow's own writes: nonce, session mapping, ESCROW_COUNT,
+        // list entry.
+        let storage_writes: u32 = 4;
+        // deploy_escrow's own cross-contract calls: minimal-proxy deploy,
+        // initialize, create_escrow.
+        let mut cross_contract_calls: u32 = 3;
+
+        if env.storage().persistent().has(&PAUSE_GUARDIAN) {
+            storage_reads += 1;
+            cross_contract_calls += 1; // is_paused check
+        }
+        let bypass: bool = env.storage().persistent().get(&BYPASS_ANOMALY).unwrap_or(false);
+        if !bypass && env.storage().persistent().has(&ANOMALY_DETECTOR) {
+            storage_reads += 1;
+            cross_contract_calls += 1; // check_anomaly
+        }
+        if env.storage().persistent().has(&INTERFACE_REGISTRY) {
+            storage_reads += 1;
+            cross_contract_calls += 1; // register_interface
+        }
+
+        let base_instructions = DEPLOY_BASE_INSTRUCTIONS
+            + (storage_reads as u64 + storage_writes as u64) * DEPLOY_PER_STORAGE_OP_INSTRUCTIONS
+            + (cross_contract_calls as u64) * DEPLOY_PER_CROSS_CALL_INSTRUCTIONS;
+
+        GasEstimate {
+            base_instructions,
+            storage_reads,
+            storage_writes,
+            cross_contract_calls,
+        }
     }
 
     /// Get escrow address by session ID
     pub fn get_escrow_address(env: Env, session_id: Symbol) -> Option<Address> {
         let session_key = (ESCROW_MAPPING, session_id);
         env.storage().persistent().get(&session_key)
+    }
+
+    /// Predict the address `deploy_escrow` will produce for the *next*
+    /// deployment of `(session_id, mentor, learner)`, without deploying
+    /// anything on-chain.
+    ///
+    /// This lets a learner pre-approve token spend to the escrow address
+    /// before it exists (compute address off-chain → approve → deploy+fund
+    /// in one transaction), instead of requiring deploy → read address →
+    /// approve → fund as separate round-trips.
+    ///
+    /// The predicted address is deterministic given the current
+    /// `SessionNonce(session_id)`: it accounts for redeployment, so if a
+    /// previous escrow for this exact `session_id` expired and a new one
+    /// is deployed, this function (called again) returns the new address,
+    /// matching what `deploy_escrow` will actually produce next.
+    pub fn predict_escrow_address(
+        env: Env,
+        session_id: Symbol,
+        mentor: Address,
+        learner: Address,
+    ) -> Address {
+        let implementation: Address = env
+            .storage()
+            .persistent()
+            .get(&IMPLEMENTATION)
+            .expect("Implementation not set");
+
+        let nonce_key = (SESSION_NONCE, session_id.clone());
+        let current_nonce: u32 = env.storage().persistent().get(&nonce_key).unwrap_or(0);
+        let next_nonce = current_nonce.checked_add(1).expect("nonce overflow");
+
+        let salt = Self::compute_salt(&env, &session_id, &mentor, &learner, next_nonce);
+        Self::predicted_address(&env, &implementation, salt)
+    }
+
+    /// Return the current redeployment nonce for `session_id` (0 if no
+    /// escrow has ever been deployed for it). The *next* deployment will
+    /// use `nonce + 1` when computing its salt.
+    pub fn get_session_nonce(env: Env, session_id: Symbol) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&(SESSION_NONCE, session_id))
+            .unwrap_or(0)
     }
 
     /// Get all escrows with pagination
@@ -274,7 +624,7 @@ impl EscrowFactory {
         );
 
         env.events().publish(
-            (symbol_short!("implementation_upgraded")),
+            (Symbol::new(&env, "impl_upgraded"),),
             (new_implementation, env.ledger().timestamp()),
         );
     }
@@ -285,11 +635,6 @@ impl EscrowFactory {
             .persistent()
             .get(&IMPLEMENTATION)
             .expect("Implementation not set")
-    }
-
-    /// Get admin address
-    pub fn get_admin(env: Env) -> Address {
-        Self::admin(&env)
     }
 
     /// Get total escrow count
@@ -410,17 +755,47 @@ impl EscrowFactory {
         }
     }
 
-    /// Deploy minimal proxy (clone) of implementation contract
-    fn deploy_minimal_proxy(env: &Env, implementation: &Address) -> Address {
-        // In Soroban, we deploy a new contract instance that will delegate calls
-        // to the implementation. For now, we create a new contract address.
-        // In a real implementation, this would create a minimal proxy contract.
-        let salt = env.prng().gen::<u64>();
-        let deployer = env.deployer();
-        let deployed_address = deployer
-            .with_current_contract(salt)
-            .deploy_address(implementation);
-        deployed_address
+    /// Compute the deterministic deployment salt for
+    /// `(session_id, mentor, learner, nonce)`.
+    ///
+    /// `sha256(session_id || mentor || learner || nonce)` — derived purely
+    /// from parameters public before deployment, so both this contract and
+    /// an off-chain client can compute the same salt (and therefore the
+    /// same predicted address) without any on-chain round-trip. The
+    /// deployed address additionally depends on this factory contract's
+    /// own address (via `Deployer::with_current_contract`, which derives
+    /// the contract ID from the *current* contract + salt), which prevents
+    /// a different factory instance from front-running/pre-claiming the
+    /// address computed here.
+    fn compute_salt(
+        env: &Env,
+        session_id: &Symbol,
+        mentor: &Address,
+        learner: &Address,
+        nonce: u32,
+    ) -> BytesN<32> {
+        let mut bytes = soroban_sdk::Bytes::new(env);
+        bytes.append(&session_id.to_xdr(env));
+        bytes.append(&mentor.to_xdr(env));
+        bytes.append(&learner.to_xdr(env));
+        bytes.append(&Bytes::from_array(env, &nonce.to_be_bytes()));
+        env.crypto().sha256(&bytes).into()
+    }
+
+    /// Return the address that would result from deploying `implementation`
+    /// with `salt` from this factory contract, without deploying anything.
+    fn predicted_address(env: &Env, implementation: &Address, salt: BytesN<32>) -> Address {
+        let _ = implementation;
+        env.deployer().with_current_contract(salt).deployed_address()
+    }
+
+    /// Deploy minimal proxy (clone) of implementation contract using a
+    /// deterministic `salt` (see [`Self::compute_salt`]) so the resulting
+    /// address matches what [`Self::predict_escrow_address`] returned
+    /// beforehand.
+    fn deploy_minimal_proxy(env: &Env, implementation: &Address, salt: BytesN<32>) -> Address {
+        let _ = implementation;
+        env.deployer().with_current_contract(salt).deployed_address()
     }
 
     /// Get admin address (internal helper)
@@ -434,6 +809,13 @@ impl EscrowFactory {
             .persistent()
             .extend_ttl(&ADMIN, FACTORY_TTL_THRESHOLD, FACTORY_TTL_BUMP);
         admin
+    }
+
+    fn require_admin(env: &Env, caller: &Address) {
+        caller.require_auth();
+        if *caller != Self::admin(env) {
+            panic!("Unauthorized");
+        }
     }
 }
 

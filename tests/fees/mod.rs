@@ -1,6 +1,6 @@
 use soroban_sdk::{testutils::Address as _, Address, Env, Vec};
 use mentorminds_escrow::{EscrowContract, EscrowContractClient};
-use mentorminds_payment_router::{PaymentRouter, PaymentRouterClient};
+use payment_router::{PaymentRouter, PaymentRouterClient};
 
 #[test]
 fn test_fee_calculations() {

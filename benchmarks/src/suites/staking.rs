@@ -8,8 +8,7 @@ use mentorminds_staking::{StakingContract, StakingContractClient};
 use soroban_sdk::{
     contract, contractimpl,
     testutils::{Address as _, Ledger},
-    token::StellarAssetClient,
-    Address, Env, Symbol,
+    Address, Env,
 };
 
 const CONTRACT: &str = "staking";
@@ -89,8 +88,8 @@ impl Fixture {
         let env = Env::default();
         env.mock_all_auths();
 
-        let mnt = env.register_contract(None, MockMntToken);
-        let staking = env.register_contract(None, StakingContract);
+        let mnt = env.register(MockMntToken, ());
+        let staking = env.register(StakingContract, ());
         let admin = Address::generate(&env);
         let mentor = Address::generate(&env);
 

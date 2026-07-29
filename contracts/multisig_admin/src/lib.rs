@@ -1,6 +1,14 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracterror, contracttype, symbol_short, Address, Env, Symbol, TryIntoVal, Val, Vec};
+use shared::{
+    compute_checksum, push_snapshot_index, RollbackProposal, SnapshotMeta, StateVerificationReport,
+    EMERGENCY_THRESHOLD, MAX_SNAPSHOTS,
+};
+use soroban_sdk::{
+    contract, contractimpl, contracterror, contracttype, symbol_short, Address, Bytes, BytesN,
+    Env, Symbol, TryIntoVal, Val, Vec,
+};
+
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -61,6 +69,41 @@ pub enum DataKey {
     Signer(Address),
     Proposal(u32),
     Approval(u32, Address),
+    // -----------------------------------------------------------------------
+    // Disaster-recovery keys
+    // -----------------------------------------------------------------------
+    /// Serialised governance config snapshot for snapshot `n`.
+    GovSnapshot(u32),
+    /// SnapshotMeta for governance snapshot `n`.
+    GovSnapshotMeta(u32),
+    /// Ordered Vec<u32> of retained governance snapshot IDs.
+    GovSnapshotIndex,
+    /// Vec<Address> of up to 7 emergency signers for governance rollback.
+    GovEmergencySigners,
+    /// RollbackProposal for governance rollback proposal `n`.
+    GovRollbackProposal(u32),
+    /// Boolean approval for (proposal_id, signer) governance rollback.
+    GovRollbackApproval(u32, Address),
+    /// Auto-incremented governance rollback proposal counter.
+    GovRollbackProposalCount,
+}
+
+// ---------------------------------------------------------------------------
+// DR-only TTL constants (persistent; 57 day window)
+// ---------------------------------------------------------------------------
+const DR_TTL_THRESHOLD: u32 = 500_000;
+const DR_TTL_BUMP: u32 = 1_000_000;
+
+/// Compact governance config snapshot stored per snapshot_id.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovConfigSnapshot {
+    /// Approval threshold at snapshot time.
+    pub threshold: u32,
+    /// Number of registered signers at snapshot time.
+    pub signer_count: u32,
+    /// Total proposals created at snapshot time.
+    pub proposal_count: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -305,7 +348,474 @@ impl MultisigAdminContract {
             .get(&DataKey::SignerCount)
             .ok_or(Error::NotInitialized)
     }
+
+    // =======================================================================
+    // Disaster Recovery — Governance Contract
+    // =======================================================================
+
+    /// Register emergency signers for governance-level rollback (admin-threshold signers only).
+    ///
+    /// Must provide exactly 7 addresses. A signer added here does not need to
+    /// be a regular multisig signer — they form a separate emergency break-glass
+    /// authority.
+    ///
+    /// # Auth
+    /// Requires that the calling set has already reached the current threshold
+    /// (enforced by requiring a valid threshold-passing proposal to be provided
+    /// or by the caller being among the existing signers with sufficient approvals).
+    /// For simplicity in the DR path, this is callable by any current signer.
+    pub fn set_emergency_signers(
+        env: Env,
+        caller: Address,
+        signers: Vec<Address>,
+    ) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Threshold) {
+            return Err(Error::NotInitialized);
+        }
+        // Caller must be a regular multisig signer to set emergency signers.
+        if !env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Signer(caller.clone()))
+            .unwrap_or(false)
+        {
+            return Err(Error::NotSigner);
+        }
+        caller.require_auth();
+        if signers.len() != shared::EMERGENCY_SIGNERS {
+            return Err(Error::InvalidThreshold);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovEmergencySigners, &signers);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovEmergencySigners,
+            DR_TTL_THRESHOLD,
+            DR_TTL_BUMP,
+        );
+        env.events().publish(
+            (
+                symbol_short!("DR"),
+                symbol_short!("sgn_set"),
+            ),
+            signers.len() as u32,
+        );
+        Ok(())
+    }
+
+    /// Capture a governance config snapshot before an upgrade.
+    ///
+    /// Records `Threshold`, `SignerCount`, `ProposalCount` and associated
+    /// `SnapshotMeta` under `DataKey::GovSnapshot(snapshot_id)`.  Manages
+    /// a rolling window of at most `MAX_SNAPSHOTS` (3); the oldest is evicted
+    /// automatically when a 4th is created.
+    ///
+    /// # Auth
+    /// Caller must be a registered multisig signer.
+    pub fn snapshot_state(
+        env: Env,
+        caller: Address,
+        snapshot_id: u32,
+    ) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Threshold) {
+            return Err(Error::NotInitialized);
+        }
+        if !env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Signer(caller.clone()))
+            .unwrap_or(false)
+        {
+            return Err(Error::NotSigner);
+        }
+        caller.require_auth();
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Threshold)
+            .unwrap_or(0);
+        let signer_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SignerCount)
+            .unwrap_or(0);
+        let proposal_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposalCount)
+            .unwrap_or(0);
+
+        // Compute checksum
+        let mut checksum_input = Bytes::new(&env);
+        for b in threshold.to_be_bytes().iter() {
+            checksum_input.push_back(*b);
+        }
+        for b in signer_count.to_be_bytes().iter() {
+            checksum_input.push_back(*b);
+        }
+        for b in proposal_count.to_be_bytes().iter() {
+            checksum_input.push_back(*b);
+        }
+        let checksum = compute_checksum(&env, &checksum_input);
+
+        // Build config snapshot
+        let config = GovConfigSnapshot {
+            threshold,
+            signer_count,
+            proposal_count,
+        };
+
+        // WASM hash for version tracking
+        let wasm_hash: BytesN<32> = env
+            .deployer()
+            .get_contract_instance_wasm_hash(&env.current_contract_address());
+
+        // Manage rolling window
+        let mut index: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovSnapshotIndex)
+            .unwrap_or(Vec::new(&env));
+        let snapshot_pos = index.len() as u32;
+        let evicted = push_snapshot_index(&mut index, snapshot_id);
+        if let Some(old_id) = evicted {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::GovSnapshot(old_id));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::GovSnapshotMeta(old_id));
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovSnapshotIndex, &index);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovSnapshotIndex,
+            DR_TTL_THRESHOLD,
+            DR_TTL_BUMP,
+        );
+
+        let meta = SnapshotMeta {
+            created_at: env.ledger().timestamp(),
+            block_height: env.ledger().sequence(),
+            contract_version: wasm_hash,
+            admin: caller.clone(),
+            checksum,
+            record_count: signer_count as u64,
+            snapshot_index: snapshot_pos.min(MAX_SNAPSHOTS - 1),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovSnapshot(snapshot_id), &config);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovSnapshot(snapshot_id),
+            DR_TTL_THRESHOLD,
+            DR_TTL_BUMP,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovSnapshotMeta(snapshot_id), &meta);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovSnapshotMeta(snapshot_id),
+            DR_TTL_THRESHOLD,
+            DR_TTL_BUMP,
+        );
+
+        env.events().publish(
+            (symbol_short!("DR"), symbol_short!("gov_snap"), snapshot_id),
+            (signer_count, env.ledger().sequence()),
+        );
+        Ok(())
+    }
+
+    /// Compare governance snapshot against current state.
+    ///
+    /// Checks `Threshold`, `SignerCount`, and `ProposalCount` from the
+    /// snapshot metadata against live instance storage.
+    ///
+    /// # Returns
+    /// A `StateVerificationReport` (mismatches empty = state intact).
+    ///
+    /// # Errors
+    /// `ProposalNotFound` if `snapshot_id` does not exist.
+    pub fn verify_post_upgrade_state(
+        env: Env,
+        snapshot_id: u32,
+    ) -> Result<StateVerificationReport, Error> {
+        let config: GovConfigSnapshot = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovSnapshot(snapshot_id))
+            .ok_or(Error::ProposalNotFound)?;
+
+        let mut mismatches: Vec<soroban_sdk::String> = Vec::new(&env);
+        let mut fields_checked: u32 = 0;
+
+        let cur_threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Threshold)
+            .unwrap_or(0);
+        fields_checked += 1;
+        if cur_threshold != config.threshold {
+            mismatches.push_back(soroban_sdk::String::from_str(&env, "Threshold mismatch"));
+        }
+
+        let cur_signer_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SignerCount)
+            .unwrap_or(0);
+        fields_checked += 1;
+        if cur_signer_count != config.signer_count {
+            mismatches.push_back(soroban_sdk::String::from_str(
+                &env,
+                "SignerCount mismatch",
+            ));
+        }
+
+        let cur_proposal_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposalCount)
+            .unwrap_or(0);
+        fields_checked += 1;
+        if cur_proposal_count != config.proposal_count {
+            mismatches.push_back(soroban_sdk::String::from_str(
+                &env,
+                "ProposalCount mismatch",
+            ));
+        }
+
+        Ok(StateVerificationReport {
+            fields_checked,
+            mismatches,
+        })
+    }
+
+    /// Open an emergency governance rollback proposal.
+    ///
+    /// `proposer` must be a registered governance emergency signer.
+    pub fn propose_emergency_rollback(
+        env: Env,
+        proposer: Address,
+        snapshot_id: u32,
+        old_wasm_hash: BytesN<32>,
+    ) -> Result<u32, Error> {
+        let signers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovEmergencySigners)
+            .ok_or(Error::NotInitialized)?;
+        if !signers.iter().any(|s| s == proposer) {
+            return Err(Error::NotSigner);
+        }
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::GovSnapshotMeta(snapshot_id))
+        {
+            return Err(Error::ProposalNotFound);
+        }
+        proposer.require_auth();
+
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovRollbackProposalCount)
+            .unwrap_or(0);
+        let new_id = count.checked_add(1).expect("Governance rollback count overflow");
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovRollbackProposalCount, &new_id);
+
+        let proposal = RollbackProposal {
+            id: new_id,
+            snapshot_id,
+            old_wasm_hash: old_wasm_hash.clone(),
+            approval_count: 1,
+            executed: false,
+            created_at: env.ledger().timestamp(),
+            proposer: proposer.clone(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovRollbackProposal(new_id), &proposal);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovRollbackProposal(new_id),
+            DR_TTL_THRESHOLD,
+            DR_TTL_BUMP,
+        );
+        env.storage().persistent().set(
+            &DataKey::GovRollbackApproval(new_id, proposer.clone()),
+            &true,
+        );
+
+        env.events().publish(
+            (
+                symbol_short!("DR"),
+                symbol_short!("grb_prop"),
+                new_id,
+            ),
+            (snapshot_id, proposer, old_wasm_hash),
+        );
+        Ok(new_id)
+    }
+
+    /// Cast an approval on an open governance rollback proposal.
+    ///
+    /// `signer` must be a registered governance emergency signer.
+    pub fn approve_emergency_rollback(
+        env: Env,
+        signer: Address,
+        proposal_id: u32,
+    ) -> Result<(), Error> {
+        let signers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovEmergencySigners)
+            .ok_or(Error::NotInitialized)?;
+        if !signers.iter().any(|s| s == signer) {
+            return Err(Error::NotSigner);
+        }
+
+        let mut proposal: RollbackProposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovRollbackProposal(proposal_id))
+            .ok_or(Error::ProposalNotFound)?;
+        if proposal.executed {
+            return Err(Error::AlreadyExecuted);
+        }
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::GovRollbackApproval(proposal_id, signer.clone()))
+            .unwrap_or(false)
+        {
+            return Err(Error::AlreadySigned);
+        }
+        signer.require_auth();
+
+        env.storage().persistent().set(
+            &DataKey::GovRollbackApproval(proposal_id, signer.clone()),
+            &true,
+        );
+        proposal.approval_count = proposal
+            .approval_count
+            .checked_add(1)
+            .expect("Approval count overflow");
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovRollbackProposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (
+                symbol_short!("DR"),
+                symbol_short!("grb_aprv"),
+                proposal_id,
+            ),
+            (signer, proposal.approval_count),
+        );
+        Ok(())
+    }
+
+    /// Execute a governance rollback after 4-of-7 approval.
+    ///
+    /// Restores `Threshold`, `SignerCount`, and `ProposalCount` from the
+    /// snapshot, then re-applies the old WASM binary.
+    ///
+    /// # Pre-conditions
+    /// * Old WASM must be pre-uploaded via `soroban contract install`.
+    /// * `EMERGENCY_THRESHOLD` (4) distinct approvals required.
+    pub fn execute_emergency_rollback(
+        env: Env,
+        proposal_id: u32,
+    ) -> Result<(), Error> {
+        let mut proposal: RollbackProposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovRollbackProposal(proposal_id))
+            .ok_or(Error::ProposalNotFound)?;
+        if proposal.executed {
+            return Err(Error::AlreadyExecuted);
+        }
+        if proposal.approval_count < EMERGENCY_THRESHOLD {
+            return Err(Error::BelowThreshold);
+        }
+
+        let config: GovConfigSnapshot = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovSnapshot(proposal.snapshot_id))
+            .ok_or(Error::ProposalNotFound)?;
+
+        // Restore governance config from snapshot
+        env.storage()
+            .instance()
+            .set(&DataKey::Threshold, &config.threshold);
+        env.storage()
+            .instance()
+            .set(&DataKey::SignerCount, &config.signer_count);
+        env.storage()
+            .instance()
+            .set(&DataKey::ProposalCount, &config.proposal_count);
+
+        // Re-apply old WASM
+        env.deployer()
+            .update_current_contract_wasm(proposal.old_wasm_hash.clone());
+
+        proposal.executed = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovRollbackProposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (
+                symbol_short!("DR"),
+                symbol_short!("grb_exec"),
+                proposal_id,
+            ),
+            (proposal.snapshot_id, proposal.old_wasm_hash),
+        );
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Disaster Recovery — View helpers
+    // -----------------------------------------------------------------------
+
+    /// Return governance snapshot metadata, or `None` if not found.
+    pub fn get_gov_snapshot_meta(
+        env: Env,
+        snapshot_id: u32,
+    ) -> Option<SnapshotMeta> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::GovSnapshotMeta(snapshot_id))
+    }
+
+    /// Return the ordered list of retained governance snapshot IDs.
+    pub fn get_gov_snapshot_index(env: Env) -> Vec<u32> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::GovSnapshotIndex)
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Return a governance rollback proposal by ID.
+    pub fn get_gov_rollback_proposal(
+        env: Env,
+        proposal_id: u32,
+    ) -> Option<RollbackProposal> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::GovRollbackProposal(proposal_id))
+    }
 }
+
 
 // ---------------------------------------------------------------------------
 // Internal helpers

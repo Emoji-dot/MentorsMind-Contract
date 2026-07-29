@@ -50,8 +50,8 @@ impl Fixture {
         env.ledger().with_mut(|li| li.timestamp = 1_000);
 
         let admin = Address::generate(&env);
-        let target = env.register_contract(None, MockTarget);
-        let timelock = env.register_contract(None, TimelockController);
+        let target = env.register(MockTarget, ());
+        let timelock = env.register(TimelockController, ());
 
         TimelockControllerClient::new(&env, &timelock).initialize(&admin);
 
