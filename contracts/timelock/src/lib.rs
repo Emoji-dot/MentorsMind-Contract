@@ -1,7 +1,8 @@
 #![no_std]
+use multisig_admin::MultisigAdminContractClient;
 use shared::events::{
-    emit_timelock_event, evt_timelock_adm_xfr, evt_timelock_cancel, evt_timelock_exec,
-    evt_timelock_init, evt_timelock_sched,
+    emit_timelock_event, evt_timelock_adm_xfr, evt_timelock_cancel, evt_timelock_emerg_cancel,
+    evt_timelock_exec, evt_timelock_guardian_set, evt_timelock_init, evt_timelock_sched,
 };
 use soroban_sdk::{
     contract, contractimpl, contracterror, contracttype, Address, Bytes, BytesN, Env,
@@ -24,6 +25,11 @@ pub enum Error {
     AlreadyDone = 5,
     NotReady = 6,
     InvalidDelay = 7,
+    /// Caller is not the registered guardian multisig (or none is registered).
+    NotGuardian = 8,
+    /// The address proposed as guardian does not meet the minimum
+    /// emergency-multisig configuration (threshold/signer floor).
+    InvalidGuardianConfig = 9,
 }
 
 // ---------------------------------------------------------------------------
@@ -36,6 +42,15 @@ pub const MIN_DELAY: u64 = 48 * 60 * 60;
 pub const MAX_DELAY: u64 = 30 * 24 * 60 * 60;
 pub const OPERATION_EXPIRY_SECS: u64 = 14 * 24 * 60 * 60; // 14 days
 pub const TIMESTAMP_TOLERANCE_SECS: u64 = 60; // 1 minute
+
+/// Minimum approval threshold a guardian multisig must be configured with
+/// (4-of-7) before the timelock will register it. The guardian multisig
+/// itself may be configured with a stricter threshold; this is only a
+/// floor, enforced so a compromised admin can never register a weak
+/// "emergency" multisig it can also unilaterally control.
+pub const MIN_GUARDIAN_THRESHOLD: u32 = 4;
+/// Minimum total signer count a guardian multisig must have (of-7).
+pub const MIN_GUARDIAN_SIGNERS: u32 = 7;
 
 // ---------------------------------------------------------------------------
 // Pure invariant logic
@@ -115,6 +130,9 @@ pub enum DataKey {
     Admin,
     OpCount,
     Op(BytesN<32>),
+    /// Address of a separate `MultisigAdminContract` with emergency powers
+    /// to cancel any pending operation, regardless of proposer.
+    GuardianMultisig,
 }
 
 // ---------------------------------------------------------------------------
@@ -259,6 +277,122 @@ impl TimelockController {
         emit_timelock_event(&env, evt_timelock_cancel(&env), operation_id);
     }
 
+    /// Cancel any pending operation via the guardian multisig, regardless of
+    /// who proposed it or what `admin` currently is.
+    ///
+    /// This exists because a compromised admin that schedules a malicious
+    /// operation is, by definition, unable to be trusted to cancel it via
+    /// `cancel` — the same compromised key is the only thing `cancel` checks.
+    /// `emergency_cancel` instead checks against `DataKey::GuardianMultisig`,
+    /// a higher-authority address (a separate `MultisigAdminContract`
+    /// requiring 4-of-7 approval) that the admin cannot unilaterally control.
+    ///
+    /// The guardian multisig contract is expected to gate its own
+    /// `execute_action` behind its approval threshold before ever reaching
+    /// this call, so authorization here is: the caller must be *the*
+    /// registered guardian address, proven via `require_auth`.
+    pub fn emergency_cancel(
+        env: Env,
+        guardian_multisig: Address,
+        operation_id: BytesN<32>,
+        reason_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        let stored_guardian: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::GuardianMultisig)
+            .ok_or(Error::NotGuardian)?;
+        if guardian_multisig != stored_guardian {
+            return Err(Error::NotGuardian);
+        }
+        guardian_multisig.require_auth();
+
+        let op: Operation = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Op(operation_id.clone()))
+            .ok_or(Error::OperationNotFound)?;
+        if !logic::can_transition(op.done) {
+            return Err(Error::AlreadyDone);
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Op(operation_id.clone()));
+
+        emit_timelock_event(
+            &env,
+            evt_timelock_emerg_cancel(&env),
+            (operation_id, guardian_multisig, reason_hash),
+        );
+        Ok(())
+    }
+
+    /// Register or rotate the guardian multisig.
+    ///
+    /// * Bootstrap: if no guardian is registered yet, the current `admin`
+    ///   may set the first one (there is no existing guardian to ask).
+    /// * Rotation: once a guardian is registered, only that *current*
+    ///   guardian multisig may authorize replacing itself — the admin
+    ///   alone cannot swap out its own emergency overseer.
+    ///
+    /// `new_guardian` must point at a `MultisigAdminContract` (or
+    /// compatible interface) already configured with at least a 4-of-7
+    /// threshold; this is verified via a cross-contract call before the
+    /// registration is accepted.
+    pub fn set_guardian_multisig(
+        env: Env,
+        admin: Address,
+        new_guardian: Address,
+    ) -> Result<(), Error> {
+        match env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::GuardianMultisig)
+        {
+            Some(current_guardian) => {
+                if admin != current_guardian {
+                    return Err(Error::NotGuardian);
+                }
+                admin.require_auth();
+            }
+            None => {
+                let stored_admin: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Admin)
+                    .ok_or(Error::NotInitialized)?;
+                if admin != stored_admin {
+                    return Err(Error::NotAdmin);
+                }
+                admin.require_auth();
+            }
+        }
+
+        let guardian_client = MultisigAdminContractClient::new(&env, &new_guardian);
+        let threshold = guardian_client.get_threshold();
+        let signer_count = guardian_client.get_signer_count();
+        if threshold < MIN_GUARDIAN_THRESHOLD || signer_count < MIN_GUARDIAN_SIGNERS {
+            return Err(Error::InvalidGuardianConfig);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::GuardianMultisig, &new_guardian);
+
+        emit_timelock_event(
+            &env,
+            evt_timelock_guardian_set(&env),
+            (admin, new_guardian),
+        );
+        Ok(())
+    }
+
+    /// Returns the registered guardian multisig address, if any.
+    pub fn get_guardian_multisig(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::GuardianMultisig)
+    }
+
     /// Transfer admin role (requires current admin auth).
     pub fn transfer_admin(env: Env, new_admin: Address) {
         let admin: Address = env
@@ -343,10 +477,27 @@ mod proofs;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use multisig_admin::{MultisigAdminContract, MultisigAdminContractClient};
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
-        Env,
+        Env, IntoVal,
     };
+
+    /// Deploys a `MultisigAdminContract` with `signer_count` signers and the
+    /// given `threshold`, returning its address alongside the signer list.
+    fn deploy_guardian(
+        env: &Env,
+        signer_count: u32,
+        threshold: u32,
+    ) -> (Address, Vec<Address>) {
+        let mut signers = Vec::new(env);
+        for _ in 0..signer_count {
+            signers.push_back(Address::generate(env));
+        }
+        let guardian_id = env.register_contract(None, MultisigAdminContract);
+        MultisigAdminContractClient::new(env, &guardian_id).initialize(&signers, &threshold);
+        (guardian_id, signers)
+    }
 
     #[contract]
     pub struct MockTarget;
@@ -446,5 +597,121 @@ mod tests {
             .schedule(&admin, &target, &function, &args, &MIN_DELAY, &salt_b);
 
         assert_ne!(id_a, id_b, "different salts must yield different op_ids");
+    }
+
+    // -----------------------------------------------------------------------
+    // Guardian multisig emergency cancellation (#745)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_admin_bootstraps_guardian_multisig() {
+        let (env, admin, client) = setup();
+        let (guardian_id, _signers) = deploy_guardian(&env, 7, 4);
+
+        assert_eq!(client.get_guardian_multisig(), None);
+        client.set_guardian_multisig(&admin, &guardian_id);
+        assert_eq!(client.get_guardian_multisig(), Some(guardian_id));
+    }
+
+    #[test]
+    fn test_set_guardian_multisig_rejects_weak_threshold() {
+        let (env, admin, client) = setup();
+        // Only 3-of-7 — below the required 4-of-7 floor.
+        let (weak_guardian, _signers) = deploy_guardian(&env, 7, 3);
+
+        let result = client.try_set_guardian_multisig(&admin, &weak_guardian);
+        assert_eq!(result, Err(Ok(Error::InvalidGuardianConfig)));
+    }
+
+    #[test]
+    fn test_set_guardian_multisig_rejects_too_few_signers() {
+        let (env, admin, client) = setup();
+        // 4-of-5 meets the threshold ratio but not the 7-signer floor.
+        let (weak_guardian, _signers) = deploy_guardian(&env, 5, 4);
+
+        let result = client.try_set_guardian_multisig(&admin, &weak_guardian);
+        assert_eq!(result, Err(Ok(Error::InvalidGuardianConfig)));
+    }
+
+    #[test]
+    fn test_guardian_rotation_requires_current_guardian_not_admin() {
+        let (env, admin, client) = setup();
+        let (guardian_id, _s1) = deploy_guardian(&env, 7, 4);
+        client.set_guardian_multisig(&admin, &guardian_id);
+
+        let (new_guardian, _s2) = deploy_guardian(&env, 7, 5);
+
+        // Admin alone can no longer swap the guardian out.
+        let result = client.try_set_guardian_multisig(&admin, &new_guardian);
+        assert_eq!(result, Err(Ok(Error::NotGuardian)));
+        assert_eq!(client.get_guardian_multisig(), Some(guardian_id.clone()));
+
+        // The current guardian multisig can rotate itself.
+        client.set_guardian_multisig(&guardian_id, &new_guardian);
+        assert_eq!(client.get_guardian_multisig(), Some(new_guardian));
+    }
+
+    /// Integration test per acceptance criteria: admin schedules a malicious
+    /// operation, and the guardian multisig (reaching its 4-of-7 threshold
+    /// independently) cancels it — even though the admin never consents.
+    #[test]
+    fn test_guardian_emergency_cancels_admin_proposed_malicious_operation() {
+        let (env, admin, client) = setup();
+        let (guardian_id, signers) = deploy_guardian(&env, 7, 4);
+        client.set_guardian_multisig(&admin, &guardian_id);
+
+        // Compromised admin schedules a malicious operation.
+        let op_id = schedule_op(&env, &client, &admin);
+        assert!(!client.is_operation_done(&op_id));
+
+        // The guardian multisig reaches 4-of-7 approval to call
+        // `emergency_cancel` on the timelock, bypassing the admin entirely.
+        let guardian_client = MultisigAdminContractClient::new(&env, &guardian_id);
+        let reason_hash = BytesN::from_array(&env, &[7u8; 32]);
+        let mut args: Vec<Val> = Vec::new(&env);
+        args.push_back(guardian_id.clone().into_val(&env));
+        args.push_back(op_id.clone().into_val(&env));
+        args.push_back(reason_hash.clone().into_val(&env));
+
+        let action_id = guardian_client.propose_action(
+            &signers.get(0).unwrap(),
+            &client.address,
+            &Symbol::new(&env, "emergency_cancel"),
+            &args,
+        );
+        guardian_client.sign_action(&signers.get(1).unwrap(), &action_id);
+        guardian_client.sign_action(&signers.get(2).unwrap(), &action_id);
+        guardian_client.sign_action(&signers.get(3).unwrap(), &action_id);
+        guardian_client.execute_action(&action_id);
+
+        // Operation no longer exists — the malicious schedule was cancelled.
+        assert!(client.try_get_operation(&op_id).is_err());
+    }
+
+    #[test]
+    fn test_emergency_cancel_rejects_non_guardian_caller() {
+        let (env, admin, client) = setup();
+        let (guardian_id, _signers) = deploy_guardian(&env, 7, 4);
+        client.set_guardian_multisig(&admin, &guardian_id);
+
+        let op_id = schedule_op(&env, &client, &admin);
+        let reason_hash = BytesN::from_array(&env, &[9u8; 32]);
+
+        // The admin cannot bypass the guardian by calling emergency_cancel
+        // directly with its own address in place of the guardian's.
+        let result = client.try_emergency_cancel(&admin, &op_id, &reason_hash);
+        assert_eq!(result, Err(Ok(Error::NotGuardian)));
+        assert!(!client.is_operation_done(&op_id));
+    }
+
+    #[test]
+    fn test_emergency_cancel_requires_guardian_registered() {
+        let (env, admin, client) = setup();
+        let op_id = schedule_op(&env, &client, &admin);
+        let some_address = Address::generate(&env);
+        let reason_hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        let result = client.try_emergency_cancel(&some_address, &op_id, &reason_hash);
+        assert_eq!(result, Err(Ok(Error::NotGuardian)));
     }
 }
