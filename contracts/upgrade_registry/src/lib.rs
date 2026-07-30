@@ -88,12 +88,21 @@ pub struct UpgradeRecord {
 /// Stored by `schedule_upgrade`; consumed by `execute_pending_upgrade`.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PendingUpgrade {
-    pub new_version: u32,
-    pub changelog_hash: BytesN<32>,
-    /// Earliest ledger timestamp at which execution is allowed.
-    pub execute_after: u64,
-    pub scheduled_by: Address,
+pub struct UpgradeConfig {
+    pub signers: Vec<Address>,
+    pub threshold: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RegistrySnapshot {
+    pub admin: Address,
+    pub upgrade_delay: u64,
+    pub upgrade_config: Option<UpgradeConfig>,
+    pub registered_contracts: Vec<Symbol>,
+    pub contract_versions: Vec<(Symbol, u32)>,
+    pub history_counts: Vec<(Symbol, u32)>,
+    pub history_items: Vec<(Symbol, u32, UpgradeRecord)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -126,8 +135,6 @@ pub struct PendingUpgrade {
 #[derive(Clone)]
 pub enum DataKey {
     Admin,
-    /// Minimum seconds between schedule and execute.
-    UpgradeDelay,
     UpgradeHistory(Symbol),
     LatestVersion(Symbol),
     Subscribers(Symbol),
@@ -149,6 +156,16 @@ pub enum DataKey {
     ValidationCacheTime(Vec<Address>),
     /// Source commit hash (first 32 bytes of SHA256) for a specific contract+version.
     SourceCommit(Symbol),
+
+    // === DISASTER RECOVERY ===
+    RegisteredContracts,
+    Snapshot(u32),
+    SnapshotMetadata(u32),
+    SnapshotIndex,
+    EmergencySigners,
+    RollbackProposal(u32),
+    RollbackApproval(u32, Address),
+    RollbackProposalCount,
 }
 
 /// Default upgrade timelock: 48 hours.
@@ -180,9 +197,6 @@ pub struct UpgradeRegistryContract;
 #[contractimpl]
 impl UpgradeRegistryContract {
     /// Initialize the upgrade registry.
-    ///
-    /// `upgrade_delay` — minimum seconds that must elapse between scheduling
-    /// and executing an upgrade (timelock).  Pass `0` to disable (testing only).
     pub fn initialize(env: Env, admin: Address, upgrade_delay: u64) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
@@ -194,35 +208,36 @@ impl UpgradeRegistryContract {
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // PATH A — Two-step upgrade (RECOMMENDED)
-    // -----------------------------------------------------------------------
+    pub fn set_upgrade_delay(env: Env, delay_secs: u64) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        let min = 3_600_u64;       // 1 hour
+        let max = 30 * 24 * 3_600_u64; // 30 days
+        if delay_secs < min || delay_secs > max {
+            panic!("upgrade delay out of range [1h, 30d]");
+        }
+        env.storage().instance().set(&DataKey::UpgradeDelay, &delay_secs);
+        Ok(())
+    }
 
-    /// Schedule an upgrade for `contract_name` to `new_version`.
-    ///
-    /// Enforces:
-    /// - Admin auth
-    /// - `new_version > current_version` (VersionNotMonotonic)
-    ///
-    /// # Safety guards
-    /// - Re-initialization is prevented: `initialize` checks storage before
-    ///   writing, so calling it again is a no-op error.
-    /// - Version monotonicity: `new_version` must be strictly greater than the
-    ///   current latest version for `contract_name`.
-    /// - Timelock: the upgrade cannot execute until the delay has elapsed.
-    /// - WASM validation: new WASM must export all required functions.
+    pub fn get_upgrade_delay(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::UpgradeDelay)
+            .unwrap_or(DEFAULT_UPGRADE_DELAY)
+    }
+
     pub fn schedule_upgrade(
         env: Env,
+        new_wasm_hash: BytesN<32>,
         contract_name: Symbol,
         new_version: u32,
         changelog_hash: BytesN<32>,
+        approvers: Vec<Address>,
     ) -> Result<(), Error> {
-        let approved_signers = require_upgrade_approvals(&env, approvers)?;
+        let approved_signers = require_upgrade_approvals_cached(&env, approvers)?;
 
-        // Guard: validate WASM before scheduling (prevents bricking).
         validate_wasm_exports(&env, &new_wasm_hash)?;
 
-        // Guard: only one pending upgrade at a time.
         if env.storage().instance().has(&DataKey::PendingUpgrade) {
             return Err(Error::UpgradePending);
         }
@@ -232,24 +247,40 @@ impl UpgradeRegistryContract {
             return Err(Error::VersionNotMonotonic);
         }
 
-        let upgrade_delay: u64 = env
+        let upgrade_delay = env
             .storage()
             .instance()
             .get(&DataKey::UpgradeDelay)
             .unwrap_or(0);
 
-        let execute_after = env.ledger().timestamp().saturating_add(upgrade_delay);
+        let now = env.ledger().timestamp();
+        let execute_after = now.saturating_add(upgrade_delay);
 
         let pending = PendingUpgrade {
+            new_wasm_hash: new_wasm_hash.clone(),
+            contract_name: contract_name.clone(),
             new_version,
             changelog_hash: changelog_hash.clone(),
-            execute_after,
-            scheduled_by: admin.clone(),
+            scheduled_at: now,
+            executable_after: execute_after,
+            admin: approved_signers.get(0).ok_or(Error::BelowThreshold)?.clone(),
+            approved_signers: approved_signers.clone(),
         };
 
         env.storage()
+            .instance()
+            .set(&DataKey::PendingUpgrade, &pending);
+
+        // Track registered contracts
+        let mut registered: Vec<Symbol> = env
+            .storage()
             .persistent()
-            .set(&DataKey::PendingUpgrade(contract_name.clone()), &pending);
+            .get(&DataKey::RegisteredContracts)
+            .unwrap_or(Vec::new(&env));
+        if !registered.iter().any(|c| c == contract_name) {
+            registered.push_back(contract_name.clone());
+            env.storage().persistent().set(&DataKey::RegisteredContracts, &registered);
+        }
 
         env.events().publish(
             (
@@ -257,39 +288,25 @@ impl UpgradeRegistryContract {
                 symbol_short!("sched"),
                 contract_name,
             ),
-            (new_version, changelog_hash, execute_after),
+            (new_version, execute_after, new_wasm_hash, approved_signers),
         );
 
         Ok(())
     }
 
-    /// Execute a previously-scheduled upgrade for `contract_name`.
-    ///
-    /// Enforces:
-    /// - Admin auth
-    /// - Pending upgrade exists (NoPendingUpgrade)
-    /// - Timelock has elapsed (TimelockNotElapsed)
-    pub fn execute_pending_upgrade(
-        env: Env,
-        contract_name: Symbol,
-    ) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
-
+    pub fn execute_pending_upgrade(env: Env, approvers: Vec<Address>) -> Result<(), Error> {
         let pending: PendingUpgrade = env
             .storage()
-            .persistent()
-            .get(&DataKey::PendingUpgrade(contract_name.clone()))
+            .instance()
+            .get(&DataKey::PendingUpgrade)
             .ok_or(Error::NoPendingUpgrade)?;
 
-        // === OPTIMIZATION: Use cached validation if available ===
         let approved_signers = require_upgrade_approvals_cached(&env, approvers)?;
 
-        // Guard: timelock must have elapsed.
         if env.ledger().timestamp() < pending.executable_after {
             return Err(Error::TimelockNotElapsed);
         }
 
-        // === OPTIMIZATION: Batch storage reads for version ===
         let old_version: u32 = env
             .storage()
             .persistent()
@@ -297,21 +314,19 @@ impl UpgradeRegistryContract {
             .unwrap_or(0);
 
         let record = UpgradeRecord {
-            old_version: current,
+            old_version,
             new_version: pending.new_version,
             changelog_hash: pending.changelog_hash.clone(),
             timestamp: env.ledger().timestamp(),
-            admin: admin.clone(),
+            admin: approved_signers.get(0).ok_or(Error::BelowThreshold)?.clone(),
         };
 
-        // === OPTIMIZATION: Use append-only pattern instead of vector manipulation ===
         let count: u32 = env
             .storage()
             .persistent()
             .get(&DataKey::UpgradeHistoryCount(pending.contract_name.clone()))
             .unwrap_or(0);
 
-        // Store new record and update counters atomically
         env.storage().persistent().set(
             &DataKey::UpgradeHistoryItem(pending.contract_name.clone(), count),
             &record,
@@ -325,40 +340,30 @@ impl UpgradeRegistryContract {
             &pending.new_version,
         );
 
-        // Clear pending slot
         env.storage()
-            .persistent()
-            .remove(&DataKey::PendingUpgrade(contract_name.clone()));
+            .instance()
+            .remove(&DataKey::PendingUpgrade);
 
         env.events().publish(
             (
                 symbol_short!("upgrade"),
                 symbol_short!("exec"),
-                contract_name,
+                pending.contract_name.clone(),
             ),
-            (current, pending.new_version, pending.changelog_hash),
+            (
+                old_version,
+                pending.new_version,
+                pending.new_wasm_hash.clone(),
+                approved_signers,
+            ),
         );
+
+        env.deployer()
+            .update_current_contract_wasm(pending.new_wasm_hash);
 
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // PATH B — Direct UUPS (DEPRECATED — migrate to PATH A)
-    // -----------------------------------------------------------------------
-
-    /// Register a contract upgrade directly.
-    ///
-    /// **DEPRECATED** — use `schedule_upgrade` + `execute_pending_upgrade` instead.
-    ///
-    /// This function is retained for backward-compatibility only.  It enforces
-    /// identical security guarantees to PATH A:
-    /// - VersionNotMonotonic: `new_version` must exceed the stored version.
-    /// - TimelockNotElapsed: the configured `upgrade_delay` must have elapsed
-    ///   since the last upgrade timestamp for this contract.
-    ///
-    /// Migration note: replace calls to `register_upgrade(name, old, new, hash)`
-    /// with `schedule_upgrade(name, new, hash)` followed by
-    /// `execute_pending_upgrade(name)` after the delay expires.
     #[allow(deprecated)]
     pub fn register_upgrade(
         env: Env,
@@ -367,15 +372,13 @@ impl UpgradeRegistryContract {
         new_version: u32,
         changelog_hash: BytesN<32>,
     ) -> Result<(), Error> {
-        let approved_signers = require_upgrade_approvals_cached(&env, approvers)?;
+        let admin = Self::require_admin(&env)?;
 
-        // Guard 1: monotonic version
         let current = Self::get_latest_version(env.clone(), contract_name.clone());
         if new_version <= current {
             return Err(Error::VersionNotMonotonic);
         }
 
-        // === OPTIMIZATION: Use append-only pattern instead of vector manipulation ===
         let record = UpgradeRecord {
             old_version,
             new_version,
@@ -384,20 +387,16 @@ impl UpgradeRegistryContract {
             admin: admin.clone(),
         };
 
-        // Get current count and append new record
         let count: u32 = env
             .storage()
             .persistent()
             .get(&DataKey::UpgradeHistoryCount(contract_name.clone()))
             .unwrap_or(0);
 
-        // Store the new record at the next index
         env.storage().persistent().set(
             &DataKey::UpgradeHistoryItem(contract_name.clone(), count),
             &record,
         );
-
-        // Update count and version in batch
         env.storage().persistent().set(
             &DataKey::UpgradeHistoryCount(contract_name.clone()),
             &(count + 1),
@@ -405,6 +404,16 @@ impl UpgradeRegistryContract {
         env.storage()
             .persistent()
             .set(&DataKey::LatestVersion(contract_name.clone()), &new_version);
+
+        let mut registered: Vec<Symbol> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RegisteredContracts)
+            .unwrap_or(Vec::new(&env));
+        if !registered.iter().any(|c| c == contract_name) {
+            registered.push_back(contract_name.clone());
+            env.storage().persistent().set(&DataKey::RegisteredContracts, &registered);
+        }
 
         env.events().publish(
             (
@@ -417,54 +426,43 @@ impl UpgradeRegistryContract {
         Ok(())
     }
 
-    /// Perform a direct UUPS-style upgrade.
-    ///
-    /// **DEPRECATED** — use `schedule_upgrade` + `execute_pending_upgrade` instead.
-    ///
-    /// Enforces:
-    /// - Admin auth
-    /// - VersionNotMonotonic: `new_version > current_version`
-    /// - TimelockNotElapsed: `upgrade_delay` seconds must have elapsed since
-    ///   the last recorded upgrade for this contract (or since initialization
-    ///   if no prior upgrade exists).
-    ///
-    /// Migration note: replace `upgrade_contract(name, new_version, hash)` with
-    /// the two-step path described in the module-level RFC comment.
     pub fn upgrade_contract(
         env: Env,
+        new_wasm_hash: BytesN<32>,
         contract_name: Symbol,
         new_version: u32,
         changelog_hash: BytesN<32>,
+        approvers: Vec<Address>,
     ) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
+        let approved_signers = require_upgrade_approvals_cached(&env, approvers)?;
 
         let current = Self::get_latest_version(env.clone(), contract_name.clone());
-
-        // Guard 1: monotonic version check (#619)
         if new_version <= current {
             return Err(Error::VersionNotMonotonic);
         }
 
-        // Guard 2: timelock check (#619)
-        // Compare against the timestamp of the most recent upgrade record for
-        // this contract, falling back to 0 (epoch) if none exists.
-        let upgrade_delay: u64 = env
+        let upgrade_delay = env
             .storage()
             .instance()
             .get(&DataKey::UpgradeDelay)
             .unwrap_or(0);
 
         if upgrade_delay > 0 {
-            let history: Vec<UpgradeRecord> = env
+            let count: u32 = env
                 .storage()
                 .persistent()
-                .get(&DataKey::UpgradeHistory(contract_name.clone()))
-                .unwrap_or(Vec::new(&env));
+                .get(&DataKey::UpgradeHistoryCount(contract_name.clone()))
+                .unwrap_or(0);
 
-            let last_upgrade_ts = if history.is_empty() {
+            let last_upgrade_ts = if count == 0 {
                 0u64
             } else {
-                history.get(history.len() - 1).unwrap().timestamp
+                let last_record: UpgradeRecord = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::UpgradeHistoryItem(contract_name.clone(), count - 1))
+                    .unwrap();
+                last_record.timestamp
             };
 
             let earliest_allowed = last_upgrade_ts.saturating_add(upgrade_delay);
@@ -478,24 +476,34 @@ impl UpgradeRegistryContract {
             new_version,
             changelog_hash: changelog_hash.clone(),
             timestamp: env.ledger().timestamp(),
-            admin: admin.clone(),
+            admin: approved_signers.get(0).ok_or(Error::BelowThreshold)?.clone(),
         };
 
-        let mut history: Vec<UpgradeRecord> = env
+        let count: u32 = env
             .storage()
             .persistent()
-            .get(&DataKey::UpgradeHistory(contract_name.clone()))
-            .unwrap_or(Vec::new(&env));
-
-        history.push_back(record);
+            .get(&DataKey::UpgradeHistoryCount(contract_name.clone()))
+            .unwrap_or(0);
 
         env.storage()
             .persistent()
-            .set(&DataKey::UpgradeHistory(contract_name.clone()), &history);
-
+            .set(&DataKey::UpgradeHistoryItem(contract_name.clone(), count), &record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::UpgradeHistoryCount(contract_name.clone()), &(count + 1));
         env.storage()
             .persistent()
             .set(&DataKey::LatestVersion(contract_name.clone()), &new_version);
+
+        let mut registered: Vec<Symbol> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RegisteredContracts)
+            .unwrap_or(Vec::new(&env));
+        if !registered.iter().any(|c| c == contract_name) {
+            registered.push_back(contract_name.clone());
+            env.storage().persistent().set(&DataKey::RegisteredContracts, &registered);
+        }
 
         env.events().publish(
             (
@@ -503,15 +511,58 @@ impl UpgradeRegistryContract {
                 symbol_short!("direct"),
                 contract_name,
             ),
-            (current, new_version, changelog_hash),
+            (current, new_version, changelog_hash, approved_signers),
         );
+
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash);
 
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // Subscriptions
-    // -----------------------------------------------------------------------
+    pub fn set_upgrade_signers(
+        env: Env,
+        signers: Vec<Address>,
+        threshold: u32,
+        approvers: Vec<Address>,
+    ) -> Result<(), Error> {
+        let approved_signers = require_upgrade_approvals(&env, approvers)?;
+        validate_upgrade_config(&signers, threshold)?;
+
+        let config = UpgradeConfig {
+            signers: signers.clone(),
+            threshold,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::UpgradeConfig, &config);
+        env.events().publish(
+            (symbol_short!("upgrade"), symbol_short!("signers")),
+            (signers, threshold, approved_signers),
+        );
+        Ok(())
+    }
+
+    pub fn set_admin(env: Env, new_admin: Address, approvers: Vec<Address>) -> Result<(), Error> {
+        let approved_signers = require_upgrade_approvals(&env, approvers)?;
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.events().publish(
+            (symbol_short!("upgrade"), symbol_short!("admin")),
+            (new_admin, approved_signers),
+        );
+        Ok(())
+    }
+
+    pub fn cancel_pending_upgrade(env: Env) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        if !env.storage().instance().has(&DataKey::PendingUpgrade) {
+            return Err(Error::NoPendingUpgrade);
+        }
+        env.storage().instance().remove(&DataKey::PendingUpgrade);
+        env.events()
+            .publish((symbol_short!("upgrade"), symbol_short!("cancel")), ());
+        Ok(())
+    }
 
     pub fn subscribe(env: Env, subscriber: Address, contract_name: Symbol) -> Result<(), Error> {
         subscriber.require_auth();
@@ -528,8 +579,6 @@ impl UpgradeRegistryContract {
             }
         }
 
-        // Keep the subscriber list unique so the same address does not receive
-        // duplicate upgrade notifications.
         subscribers.push_back(subscriber.clone());
         env.storage()
             .persistent()
@@ -565,8 +614,6 @@ impl UpgradeRegistryContract {
             return Err(Error::NotSubscribed);
         }
 
-        // Rebuild the list instead of mutating in place; the intent is clearer
-        // and the resulting state stays deterministic.
         env.storage().persistent().set(
             &DataKey::Subscribers(contract_name.clone()),
             &new_subscribers,
@@ -583,12 +630,7 @@ impl UpgradeRegistryContract {
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // Queries
-    // -----------------------------------------------------------------------
-
     pub fn get_upgrade_history(env: Env, contract_name: Symbol) -> Vec<UpgradeRecord> {
-        // === OPTIMIZATION: Use append-only pattern for better performance ===
         let count: u32 = env
             .storage()
             .persistent()
@@ -622,29 +664,14 @@ impl UpgradeRegistryContract {
             .unwrap_or(Vec::new(&env))
     }
 
-    pub fn get_pending_upgrade(env: Env, contract_name: Symbol) -> Option<PendingUpgrade> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::LatestVersion(contract_name))
-            .unwrap_or(0u32);
-        latest >= min_version
+    pub fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
+        env.storage().instance().get(&DataKey::PendingUpgrade)
     }
 
-    /// Returns the registry contract's own version constant.
     pub fn registry_version(_env: Env) -> u32 {
         1
     }
 
-    // ─── Source commit verification ─────────────────────────────────────
-
-    /// Register the git commit hash that produced the WASM for a given
-    /// contract at a specific version.
-    ///
-    /// The `commit_hash` must be the first 32 bytes of a SHA-256 hash of the
-    /// git commit (or a truncated git SHA-1 zero-padded to 32 bytes).
-    ///
-    /// Admin only. Fails if a commit hash is already registered for the same
-    /// `(contract_name, version)` pair.
     pub fn register_source_commit(
         env: Env,
         admin: Address,
@@ -652,23 +679,12 @@ impl UpgradeRegistryContract {
         version: u32,
         commit_hash: BytesN<32>,
     ) -> Result<(), Error> {
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        admin.require_auth();
+        let stored_admin = Self::require_admin(&env)?;
         if admin != stored_admin {
             return Err(Error::NotAdmin);
         }
 
-        // Build composite key: contract_name + version to allow per-version tracking
         let key = DataKey::SourceCommit(contract_name.clone());
-
-        // Check if already registered for this contract (any version).
-        // If a per-version approach is preferred, we'd use a tuple key, but for
-        // simplicity we store the latest commit hash keyed by contract name.
-        // The version parameter is recorded for audit purposes.
         if env.storage().persistent().has(&key) {
             return Err(Error::SourceCommitAlreadyRegistered);
         }
@@ -687,12 +703,363 @@ impl UpgradeRegistryContract {
         Ok(())
     }
 
-    /// Get the registered source commit hash for a contract.
-    /// Returns `None` if no commit hash has been registered.
     pub fn get_source_commit(env: Env, contract_name: Symbol, _version: u32) -> Option<BytesN<32>> {
         env.storage()
             .persistent()
             .get(&DataKey::SourceCommit(contract_name))
+    }
+
+    pub fn get_admin(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized")
+    }
+
+    pub fn get_upgrade_config(env: Env) -> Result<UpgradeConfig, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::UpgradeConfig)
+            .ok_or(Error::NotInitialized)
+    }
+
+    pub fn require_admin(env: &Env) -> Result<Address, Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        Ok(admin)
+    }
+
+    pub fn check_min_version(env: Env, contract_name: Symbol, min_version: u32) -> bool {
+        let latest = Self::get_latest_version(env, contract_name);
+        latest >= min_version
+    }
+
+    // === DISASTER RECOVERY ===
+
+    pub fn set_emergency_signers(
+        env: Env,
+        admin: Address,
+        signers: Vec<Address>,
+    ) -> Result<(), Error> {
+        let stored_admin = Self::require_admin(&env)?;
+        if admin != stored_admin {
+            return Err(Error::NotAdmin);
+        }
+        if signers.len() != shared::disaster_recovery::EMERGENCY_SIGNERS {
+            panic!("Must provide exactly 7 emergency signers");
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::EmergencySigners, &signers);
+        env.events().publish(
+            (Symbol::new(&env, "DR"), Symbol::new(&env, "signers_set")),
+            signers.len() as u32,
+        );
+        Ok(())
+    }
+
+    pub fn snapshot_state(env: Env, admin: Address, snapshot_id: u32) -> Result<(), Error> {
+        let stored_admin = Self::require_admin(&env)?;
+        if admin != stored_admin {
+            return Err(Error::NotAdmin);
+        }
+
+        let upgrade_delay = Self::get_upgrade_delay(env.clone());
+        let upgrade_config = Self::get_upgrade_config(env.clone()).ok();
+        let registered_contracts = Self::get_registered_contracts(env.clone());
+
+        let mut contract_versions = Vec::new(&env);
+        let mut history_counts = Vec::new(&env);
+        let mut history_items = Vec::new(&env);
+
+        for contract_name in registered_contracts.iter() {
+            let version = Self::get_latest_version(env.clone(), contract_name.clone());
+            contract_versions.push_back((contract_name.clone(), version));
+
+            let count: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::UpgradeHistoryCount(contract_name.clone()))
+                .unwrap_or(0);
+            history_counts.push_back((contract_name.clone(), count));
+
+            for i in 0..count {
+                if let Some(record) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, UpgradeRecord>(&DataKey::UpgradeHistoryItem(contract_name.clone(), i))
+                {
+                    history_items.push_back((contract_name.clone(), i, record));
+                }
+            }
+        }
+
+        let snapshot = RegistrySnapshot {
+            admin: admin.clone(),
+            upgrade_delay,
+            upgrade_config,
+            registered_contracts,
+            contract_versions,
+            history_counts,
+            history_items,
+        };
+
+        let serialized = snapshot.clone().to_xdr(&env);
+        let checksum = shared::disaster_recovery::compute_checksum(&env, &serialized);
+        let wasm_hash = BytesN::from_array(&env, &[0; 32]);
+
+        let mut index: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SnapshotIndex)
+            .unwrap_or(Vec::new(&env));
+        let snapshot_index_pos = index.len() as u32;
+
+        let evicted = shared::disaster_recovery::push_snapshot_index(&mut index, snapshot_id);
+        if let Some(old_id) = evicted {
+            env.storage().persistent().remove(&DataKey::Snapshot(old_id));
+            env.storage().persistent().remove(&DataKey::SnapshotMetadata(old_id));
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::SnapshotIndex, &index);
+
+        let meta = shared::disaster_recovery::SnapshotMeta {
+            created_at: env.ledger().timestamp(),
+            block_height: env.ledger().sequence(),
+            contract_version: wasm_hash,
+            admin,
+            checksum,
+            record_count: snapshot.history_items.len() as u64,
+            snapshot_index: snapshot_index_pos.min(shared::disaster_recovery::MAX_SNAPSHOTS - 1),
+        };
+
+        env.storage().persistent().set(&DataKey::Snapshot(snapshot_id), &snapshot);
+        env.storage().persistent().set(&DataKey::SnapshotMetadata(snapshot_id), &meta);
+
+        Ok(())
+    }
+
+    pub fn propose_rollback(
+        env: Env,
+        proposer: Address,
+        snapshot_id: u32,
+        old_wasm_hash: BytesN<32>,
+    ) -> Result<u32, Error> {
+        if !env.storage().persistent().has(&DataKey::SnapshotMetadata(snapshot_id)) {
+            panic!("Snapshot not found");
+        }
+        proposer.require_auth();
+
+        let proposal_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RollbackProposalCount)
+            .unwrap_or(0);
+        let new_id = proposal_count.checked_add(1).expect("Overflow");
+
+        env.storage().persistent().set(&DataKey::RollbackProposalCount, &new_id);
+
+        let proposal = shared::disaster_recovery::RollbackProposal {
+            id: new_id,
+            snapshot_id,
+            old_wasm_hash: old_wasm_hash.clone(),
+            approval_count: 1,
+            executed: false,
+            created_at: env.ledger().timestamp(),
+            proposer: proposer.clone(),
+        };
+
+        env.storage().persistent().set(&DataKey::RollbackProposal(new_id), &proposal);
+        env.storage().persistent().set(&DataKey::RollbackApproval(new_id, proposer.clone()), &true);
+
+        env.events().publish(
+            (Symbol::new(&env, "DR"), Symbol::new(&env, "rb_proposed"), new_id),
+            (snapshot_id, proposer, old_wasm_hash),
+        );
+
+        Ok(new_id)
+    }
+
+    pub fn approve_rollback(env: Env, signer: Address, proposal_id: u32) -> Result<(), Error> {
+        let signers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmergencySigners)
+            .expect("Emergency signers not configured");
+        if !signers.iter().any(|s| s == signer) {
+            panic!("Signer is not an emergency signer");
+        }
+
+        let mut proposal: shared::disaster_recovery::RollbackProposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RollbackProposal(proposal_id))
+            .expect("Rollback proposal not found");
+
+        if proposal.executed {
+            panic!("Rollback already executed");
+        }
+        if env.storage().persistent().get::<_, bool>(&DataKey::RollbackApproval(proposal_id, signer.clone())).unwrap_or(false) {
+            panic!("Already approved");
+        }
+
+        signer.require_auth();
+        env.storage().persistent().set(&DataKey::RollbackApproval(proposal_id, signer.clone()), &true);
+        proposal.approval_count = proposal.approval_count.checked_add(1).expect("Overflow");
+        env.storage().persistent().set(&DataKey::RollbackProposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "DR"), Symbol::new(&env, "rb_approved"), proposal_id),
+            (signer, proposal.approval_count),
+        );
+
+        Ok(())
+    }
+
+    pub fn rollback_to_snapshot(env: Env, proposal_id: u32) -> Result<(), Error> {
+        let mut proposal: shared::disaster_recovery::RollbackProposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RollbackProposal(proposal_id))
+            .expect("Rollback proposal not found");
+
+        if proposal.executed {
+            panic!("Rollback already executed");
+        }
+        if proposal.approval_count < shared::disaster_recovery::EMERGENCY_THRESHOLD {
+            panic!("Insufficient approvals");
+        }
+
+        let snapshot_id = proposal.snapshot_id;
+        let snapshot: RegistrySnapshot = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Snapshot(snapshot_id))
+            .expect("Snapshot data not found");
+
+        env.storage().instance().set(&DataKey::Admin, &snapshot.admin);
+        env.storage().instance().set(&DataKey::UpgradeDelay, &snapshot.upgrade_delay);
+        if let Some(ref config) = snapshot.upgrade_config {
+            env.storage().instance().set(&DataKey::UpgradeConfig, config);
+        } else {
+            env.storage().instance().remove(&DataKey::UpgradeConfig);
+        }
+
+        // Clean existing registry bookkeeping
+        let current_registered = Self::get_registered_contracts(env.clone());
+        for contract_name in current_registered.iter() {
+            let count: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::UpgradeHistoryCount(contract_name.clone()))
+                .unwrap_or(0);
+            for i in 0..count {
+                env.storage().persistent().remove(&DataKey::UpgradeHistoryItem(contract_name.clone(), i));
+            }
+            env.storage().persistent().remove(&DataKey::UpgradeHistoryCount(contract_name.clone()));
+            env.storage().persistent().remove(&DataKey::LatestVersion(contract_name.clone()));
+        }
+
+        // Restore snapshot bookkeeping
+        env.storage().persistent().set(&DataKey::RegisteredContracts, &snapshot.registered_contracts);
+        for (contract_name, version) in snapshot.contract_versions.iter() {
+            env.storage().persistent().set(&DataKey::LatestVersion(contract_name), &version);
+        }
+        for (contract_name, count) in snapshot.history_counts.iter() {
+            env.storage().persistent().set(&DataKey::UpgradeHistoryCount(contract_name), &count);
+        }
+        for (contract_name, i, record) in snapshot.history_items.iter() {
+            env.storage().persistent().set(&DataKey::UpgradeHistoryItem(contract_name, i), &record);
+        }
+
+        env.deployer().update_current_contract_wasm(proposal.old_wasm_hash.clone());
+
+        proposal.executed = true;
+        env.storage().persistent().set(&DataKey::RollbackProposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "DR"), Symbol::new(&env, "rb_executed"), proposal_id),
+            (snapshot_id, proposal.old_wasm_hash, snapshot.history_items.len() as u32),
+        );
+
+        Ok(())
+    }
+
+    pub fn get_snapshot_metadata(env: Env, snapshot_id: u32) -> Option<shared::disaster_recovery::SnapshotMeta> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SnapshotMetadata(snapshot_id))
+    }
+
+    pub fn get_snapshot_index(env: Env) -> Vec<u32> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SnapshotIndex)
+            .unwrap_or(Vec::new(&env))
+    }
+
+    pub fn get_rollback_proposal(env: Env, proposal_id: u32) -> Option<shared::disaster_recovery::RollbackProposal> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RollbackProposal(proposal_id))
+    }
+
+    pub fn get_registered_contracts(env: Env) -> Vec<Symbol> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RegisteredContracts)
+            .unwrap_or(Vec::new(&env))
+    }
+
+    pub fn verify_post_upgrade_state(
+        env: Env,
+        snapshot_id: u32,
+    ) -> Result<shared::disaster_recovery::StateVerificationReport, Error> {
+        let snapshot: RegistrySnapshot = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Snapshot(snapshot_id))
+            .ok_or(Error::NotInitialized)?;
+
+        let mut mismatches: Vec<soroban_sdk::String> = Vec::new(&env);
+        let mut fields_checked = 0u32;
+
+        let current_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        fields_checked += 1;
+        if current_admin != snapshot.admin {
+            mismatches.push_back(soroban_sdk::String::from_str(&env, "admin mismatch"));
+        }
+
+        let current_delay: u64 = env.storage().instance().get(&DataKey::UpgradeDelay).unwrap_or(0);
+        fields_checked += 1;
+        if current_delay != snapshot.upgrade_delay {
+            mismatches.push_back(soroban_sdk::String::from_str(&env, "delay mismatch"));
+        }
+
+        let current_config: Option<UpgradeConfig> = env.storage().instance().get(&DataKey::UpgradeConfig);
+        fields_checked += 1;
+        if current_config != snapshot.upgrade_config {
+            mismatches.push_back(soroban_sdk::String::from_str(&env, "upgrade config mismatch"));
+        }
+
+        for (contract_name, expected_version) in snapshot.contract_versions.iter() {
+            fields_checked += 1;
+            let current_version = Self::get_latest_version(env.clone(), contract_name.clone());
+            if current_version != expected_version {
+                mismatches.push_back(soroban_sdk::String::from_str(&env, "version mismatch"));
+            }
+        }
+
+        Ok(shared::disaster_recovery::StateVerificationReport {
+            fields_checked,
+            mismatches,
+        })
     }
 }
 
@@ -825,19 +1192,43 @@ fn validate_approval_set(config: &UpgradeConfig, approvers: &Vec<Address>) -> Re
         return Err(Error::BelowThreshold);
     }
 
-    // -----------------------------------------------------------------------
-    // Internal
-    // -----------------------------------------------------------------------
-
-    fn require_admin(env: &Env) -> Result<Address, Error> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        admin.require_auth();
-        Ok(admin)
+    let mut valid_count = 0u32;
+    for i in 0..approvers.len() {
+        let approver = approvers.get(i).ok_or(Error::NotSigner)?;
+        for j in (i + 1)..approvers.len() {
+            if approver == approvers.get(j).ok_or(Error::NotSigner)? {
+                return Err(Error::DuplicateSigner);
+            }
+        }
+        if !is_config_signer(config, &approver) {
+            return Err(Error::NotSigner);
+        }
+        valid_count = valid_count.checked_add(1).expect("approval count overflow");
     }
+
+    if valid_count < config.threshold {
+        return Err(Error::BelowThreshold);
+    }
+    Ok(())
+}
+
+fn is_config_signer(config: &UpgradeConfig, candidate: &Address) -> bool {
+    for signer in config.signers.iter() {
+        if signer == *candidate {
+            return true;
+        }
+    }
+    false
+}
+
+fn require_admin(env: &Env) -> Result<Address, Error> {
+    let admin: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::Admin)
+        .ok_or(Error::NotInitialized)?;
+    admin.require_auth();
+    Ok(admin)
 }
 
 // ---------------------------------------------------------------------------

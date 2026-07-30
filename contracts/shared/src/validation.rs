@@ -40,14 +40,14 @@ impl<'a> Validator<'a> {
     pub fn new(env: &'a Env) -> Self {
         Self {
             env,
-            errors: Vec::new(),
+            errors: Vec::new(env),
         }
     }
 
     /// Assert that `value` is strictly positive (> 0).
     pub fn require_positive(mut self, value: i128, field: &str) -> Self {
         if value <= 0 {
-            self.errors.push(ValidationError {
+            self.errors.push_back(ValidationError {
                 field: Symbol::new(self.env, field),
                 constraint: Symbol::new(self.env, "positive"),
                 value_provided: value,
@@ -59,7 +59,7 @@ impl<'a> Validator<'a> {
     /// Assert that `value` is non-negative (>= 0).
     pub fn require_non_negative(mut self, value: i128, field: &str) -> Self {
         if value < 0 {
-            self.errors.push(ValidationError {
+            self.errors.push_back(ValidationError {
                 field: Symbol::new(self.env, field),
                 constraint: Symbol::new(self.env, "non_negative"),
                 value_provided: value,
@@ -72,7 +72,7 @@ impl<'a> Validator<'a> {
     pub fn require_future_timestamp(mut self, timestamp: u64, field: &str) -> Self {
         let now = self.env.ledger().timestamp();
         if timestamp <= now {
-            self.errors.push(ValidationError {
+            self.errors.push_back(ValidationError {
                 field: Symbol::new(self.env, field),
                 constraint: Symbol::new(self.env, "future"),
                 value_provided: timestamp as i128,
@@ -84,7 +84,7 @@ impl<'a> Validator<'a> {
     /// Assert that `value` is within `[min, max]` (inclusive).
     pub fn require_range(mut self, value: i128, min: i128, max: i128, field: &str) -> Self {
         if value < min || value > max {
-            self.errors.push(ValidationError {
+            self.errors.push_back(ValidationError {
                 field: Symbol::new(self.env, field),
                 constraint: Symbol::new(self.env, "range"),
                 value_provided: value,
@@ -96,7 +96,7 @@ impl<'a> Validator<'a> {
     /// Assert that `value` is non-zero (for addresses, hashes, etc.).
     pub fn require_nonzero(mut self, value: i128, field: &str) -> Self {
         if value == 0 {
-            self.errors.push(ValidationError {
+            self.errors.push_back(ValidationError {
                 field: Symbol::new(self.env, field),
                 constraint: Symbol::new(self.env, "nonzero"),
                 value_provided: 0,
@@ -108,7 +108,7 @@ impl<'a> Validator<'a> {
     /// Consume the builder and return `Ok(())` if all rules passed, or
     /// `Err(ValidationError)` with the first failure.
     pub fn validate(self) -> Result<(), ValidationError> {
-        match self.errors.into_iter().next() {
+        match self.errors.iter().next() {
             Some(err) => Err(err),
             None => Ok(()),
         }
