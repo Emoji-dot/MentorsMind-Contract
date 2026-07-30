@@ -51,6 +51,10 @@ path = "fuzz_targets/fuzz_timelock_schedule_exec.rs"
 name = "fuzz_stateful_harness"
 path = "fuzz_targets/fuzz_stateful_harness.rs"
 
+[[test]]
+name = "fuzz_staking_rewards"
+path = "fuzz_targets/fuzz_staking_rewards.rs"
+
 [profile.release]
 opt-level = 3
 debug = 1

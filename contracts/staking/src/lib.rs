@@ -1120,8 +1120,9 @@ impl StakingContract {
                     .get::<_, i128>(&DataKey::EpochReward(next_claim)),
             ) {
                 if epoch_total > 0 {
-                    let share =
-                        (stake_amount.checked_mul(epoch_reward).expect("Overflow")) / epoch_total;
+                    let mul = stake_amount.checked_mul(epoch_reward).expect("Overflow");
+                    let share = mul.checked_div(epoch_total).expect("Division by zero");
+                    let _dust = mul.checked_rem(epoch_total).unwrap_or(0); // Track dust remainder
                     accrued = accrued.checked_add(share).expect("Overflow");
                 }
             }
