@@ -42,6 +42,8 @@ pub enum Error {
     NothingToClaim = 5,
     ScheduleNotFound = 6,
     InsufficientBalance = 7,
+    AlreadyClaimed = 8,
+    InvalidProof = 9,
 }
 
 #[contracttype]
@@ -92,6 +94,8 @@ pub enum DataKey {
     BeneficiarySchedules(Address),
     Balance(Address),
     TotalSupply,
+    MerkleRoot,
+    ClaimedMerkleLeaf(BytesN<32>),
 }
 
 #[contract]
@@ -450,6 +454,111 @@ impl VestingContract {
             .persistent()
             .get(&DataKey::Schedule(schedule_id))
             .expect("Schedule not found")
+    }
+
+    pub fn set_merkle_root(env: Env, merkle_root: BytesN<32>) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+        env.storage().persistent().set(&DataKey::MerkleRoot, &merkle_root);
+    }
+
+    pub fn claim_vesting_merkle(
+        env: Env,
+        beneficiary: Address,
+        total_amount: i128,
+        cliff_seconds: u64,
+        vesting_seconds: u64,
+        start: u64,
+        proof: Vec<BytesN<32>>,
+    ) -> u32 {
+        beneficiary.require_auth();
+
+        let merkle_root: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerkleRoot)
+            .expect("Merkle root not set");
+
+        // Compute leaf hash
+        let mut leaf_data = soroban_sdk::Bytes::new(&env);
+        leaf_data.append(&beneficiary.to_xdr(&env));
+        leaf_data.append(&total_amount.to_xdr(&env));
+        leaf_data.append(&cliff_seconds.to_xdr(&env));
+        leaf_data.append(&vesting_seconds.to_xdr(&env));
+        leaf_data.append(&start.to_xdr(&env));
+        let leaf = env.crypto().sha256(&leaf_data);
+
+        // Verify already claimed
+        if env.storage().persistent().has(&DataKey::ClaimedMerkleLeaf(leaf.clone())) {
+            panic!("Merkle leaf already claimed");
+        }
+
+        // Verify Merkle proof
+        let mut current = leaf.clone();
+        for node in proof.iter() {
+            let mut concat = soroban_sdk::Bytes::new(&env);
+            if current < node {
+                concat.append(&current.clone().into());
+                concat.append(&node.clone().into());
+            } else {
+                concat.append(&node.clone().into());
+                concat.append(&current.clone().into());
+            }
+            current = env.crypto().sha256(&concat);
+        }
+
+        if current != merkle_root {
+            panic!("Invalid Merkle proof");
+        }
+
+        // Mark as claimed
+        env.storage().persistent().set(&DataKey::ClaimedMerkleLeaf(leaf.clone()), &true);
+
+        // Internal call or logic to create schedule
+        let schedule_id: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextScheduleId)
+            .unwrap_or(0);
+
+        let next_id = schedule_id.checked_add(1).expect("Overflow");
+        env.storage()
+            .persistent()
+            .set(&DataKey::NextScheduleId, &next_id);
+
+        let now = env.ledger().timestamp();
+        let actual_start = if start == 0 { now } else { start };
+        let cliff_end = actual_start.saturating_add(cliff_seconds);
+        let vesting_end = actual_start.saturating_add(vesting_seconds);
+
+        let schedule = VestingSchedule {
+            beneficiary: beneficiary.clone(),
+            total: total_amount,
+            claimed: 0,
+            cliff_end,
+            vesting_end,
+            start: actual_start,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Schedule(schedule_id), &schedule);
+
+        let mut schedules: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BeneficiarySchedules(beneficiary.clone()))
+            .unwrap_or(Vec::new(&env));
+        schedules.push_back(schedule_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::BeneficiarySchedules(beneficiary.clone()), &schedules);
+
+        schedule_id
     }
 }
 
