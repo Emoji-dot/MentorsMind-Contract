@@ -3,7 +3,7 @@
 use soroban_sdk::token::TokenInterface;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String, Symbol,
-    IntoVal,
+    IntoVal, MuxedAddress,
 };
 use soroban_token_sdk::metadata::TokenMetadata;
 
@@ -290,7 +290,7 @@ impl TokenInterface for MNTToken {
     /// - Caller fails authorization check
     /// - Amount is not positive
     /// - Insufficient balance
-    fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+    fn transfer(env: Env, from: Address, to: MuxedAddress, amount: i128) {
         from.require_auth();
         Self::assert_not_paused(&env);
         if amount <= 0 {
@@ -302,14 +302,15 @@ impl TokenInterface for MNTToken {
             panic!("Insufficient balance");
         }
 
-        let to_balance = Self::balance(env.clone(), to.clone());
+        let to_addr = to.address();
+        let to_balance = Self::balance(env.clone(), to_addr.clone());
 
         env.storage()
             .persistent()
             .set(&DataKey::Balance(from.clone()), &(from_balance - amount));
         env.storage()
             .persistent()
-            .set(&DataKey::Balance(to.clone()), &(to_balance + amount));
+            .set(&DataKey::Balance(to_addr.clone()), &(to_balance + amount));
 
         env.events().publish(
             (
@@ -317,7 +318,7 @@ impl TokenInterface for MNTToken {
                 Symbol::new(&env, "Transfer"),
                 from.clone(),
             ),
-            TransferEventData { to, amount },
+            TransferEventData { to: to_addr, amount },
         );
     }
 
