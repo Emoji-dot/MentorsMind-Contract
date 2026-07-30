@@ -1,9 +1,14 @@
 #![no_std]
 #![allow(deprecated)]
 #![allow(dead_code)]
+use shared::events::{
+    emit_escrow_event, evt_escrow_created, evt_escrow_disputed, evt_escrow_refunded,
+    evt_escrow_released, evt_escrow_resolved,
+};
 use shared::{
     compute_checksum, push_snapshot_index, EscrowRecord, EscrowStatus, RollbackProposal,
     SnapshotMeta, StateVerificationReport, EMERGENCY_SIGNERS, EMERGENCY_THRESHOLD, MAX_SNAPSHOTS,
+    StateMachine, EscrowTransitionLog, GasEstimate,
 };
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, Bytes, Env, Symbol, Vec,
@@ -205,6 +210,8 @@ pub enum DataKey {
     FeeSchedule,
     /// Address of the staking contract used to read mentor tiers.
     StakingContract,
+    ReputationContract,
+    InsuranceContract,
     // -----------------------------------------------------------------------
     // Disaster-recovery keys
     // -----------------------------------------------------------------------
@@ -222,6 +229,8 @@ pub enum DataKey {
     RollbackApproval(u32, Address),
     /// Auto-incremented rollback proposal counter.
     RollbackProposalCount,
+    /// Store a vector of escrow transition logs.
+    TransitionLog(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -764,7 +773,7 @@ impl EscrowContract {
             panic!("Caller not authorized");
         }
 
-        Self::_do_release(&env, &mut escrow, &key);
+        Self::_do_release(&env, &mut escrow, &key, &caller);
     }
 
     /// Release a partial amount (one session worth) from a multi-session escrow.
@@ -846,7 +855,7 @@ impl EscrowContract {
         escrow.net_amount = escrow.net_amount.checked_add(net_amount).expect("Overflow");
 
         if escrow.sessions_completed == escrow.total_sessions {
-            escrow.status = EscrowStatus::Released;
+            escrow.status = transition_status(&env, escrow.id, &escrow.status, &EscrowStatus::Released, &caller);
             let session_key = (SESSION_KEY, escrow.session_id.clone());
             env.storage().persistent().remove(&session_key);
         }
@@ -950,7 +959,7 @@ impl EscrowContract {
         escrow.net_amount = escrow.net_amount.checked_add(net_amount).expect("Overflow");
 
         if escrow.sessions_completed == escrow.total_sessions {
-            escrow.status = EscrowStatus::Released;
+            escrow.status = transition_status(&env, escrow.id, &escrow.status, &EscrowStatus::Released, &admin);
             let session_key = (SESSION_KEY, escrow.session_id.clone());
             env.storage().persistent().remove(&session_key);
         }
@@ -982,7 +991,7 @@ impl EscrowContract {
             (escrow_id, env.ledger().timestamp()),
         );
 
-        Self::_do_release(&env, &mut escrow, &key);
+        Self::_do_release(&env, &mut escrow, &key, &admin);
     }
 
     /// Permissionless auto-release.
@@ -1022,7 +1031,7 @@ impl EscrowContract {
             EscrowAutoReleasedEventData { escrow_id, time: now },
         );
 
-        Self::_do_release(&env, &mut escrow, &key);
+        Self::_do_release(&env, &mut escrow, &key, &env.current_contract_address());
     }
 
     /// Open a dispute (called by mentor or learner).
@@ -1048,7 +1057,7 @@ impl EscrowContract {
             panic!("Caller not authorized to dispute");
         }
 
-        escrow.status = EscrowStatus::Disputed;
+        escrow.status = transition_status(&env, escrow.id, &escrow.status, &EscrowStatus::Disputed, &caller);
         escrow.dispute_reason = reason.clone();
         env.storage().persistent().set(&key, &escrow);
 
@@ -1122,7 +1131,7 @@ impl EscrowContract {
         }
 
         // Update escrow record
-        escrow.status = EscrowStatus::Resolved;
+        escrow.status = transition_status(&env, escrow.id, &escrow.status, &EscrowStatus::Resolved, &admin);
         escrow.net_amount = mentor_amount;
         escrow.platform_fee = learner_amount; // repurposed: learner share in resolved state
         escrow.resolved_at = now;
@@ -1196,7 +1205,7 @@ impl EscrowContract {
             &escrow.amount,
         );
 
-        escrow.status = EscrowStatus::Refunded;
+        escrow.status = transition_status(&env, escrow.id, &escrow.status, &EscrowStatus::Refunded, &admin);
         env.storage().persistent().set(&key, &escrow);
 
         // Standardized observability event (Issue #597).
@@ -1581,7 +1590,7 @@ impl EscrowContract {
             total_amount,
             milestones: milestones.clone(),
             milestone_statuses,
-            status: EscrowStatus::Active,
+            status: transition_status(&env, count, &EscrowStatus::Pending, &EscrowStatus::Active, &learner),
             created_at: env.ledger().timestamp(),
             token_address: token_address.clone(),
             platform_fee: 0,
@@ -1688,7 +1697,7 @@ impl EscrowContract {
             .iter()
             .all(|s| s == MilestoneStatus::Completed);
         if all_completed {
-            milestone_escrow.status = EscrowStatus::Released;
+            milestone_escrow.status = transition_status(&env, milestone_escrow.id, &milestone_escrow.status, &EscrowStatus::Released, &milestone_escrow.learner);
         }
 
         env.storage().persistent().set(&key, &milestone_escrow);
@@ -1733,7 +1742,7 @@ impl EscrowContract {
         milestone_escrow
             .milestone_statuses
             .set(milestone_index, MilestoneStatus::Disputed);
-        milestone_escrow.status = EscrowStatus::Disputed;
+        milestone_escrow.status = transition_status(&env, milestone_escrow.id, &milestone_escrow.status, &EscrowStatus::Disputed, &milestone_escrow.learner);
 
         env.storage().persistent().set(&key, &milestone_escrow);
 
@@ -1769,7 +1778,7 @@ impl EscrowContract {
     // -----------------------------------------------------------------------
 
     /// Shared release logic used by both `release_funds` and `try_auto_release`.
-    fn _do_release(env: &Env, escrow: &mut Escrow, key: &(Symbol, u64)) {
+    fn _do_release(env: &Env, escrow: &mut Escrow, key: &(Symbol, u64), actor: &Address) {
         let release_amount = escrow.amount;
 
         // Prefer the graduated fee schedule (Issue #676) when configured;
@@ -1825,7 +1834,7 @@ impl EscrowContract {
 
         token_client.transfer(&env.current_contract_address(), &escrow.mentor, &net_amount);
 
-        escrow.status = EscrowStatus::Released;
+        escrow.status = transition_status(env, escrow.id, &escrow.status, &EscrowStatus::Released, actor);
         escrow.platform_fee = escrow.platform_fee.checked_add(platform_fee).expect("Overflow");
         escrow.net_amount = escrow.net_amount.checked_add(net_amount).expect("Overflow");
         escrow.amount = 0; // all remaining amount is released
@@ -1994,7 +2003,7 @@ impl EscrowContract {
             learner: learner.clone(),
             amount,
             session_id: session_id.clone(),
-            status: EscrowStatus::Active,
+            status: transition_status(&env, count, &EscrowStatus::Pending, &EscrowStatus::Active, &learner),
             created_at: env.ledger().timestamp(),
             token_address: token_address.clone(),
             platform_fee: 0,
@@ -2224,9 +2233,7 @@ impl EscrowContract {
         // ----------------------------------------------------------------
         // Build metadata
         // ----------------------------------------------------------------
-        let wasm_hash: BytesN<32> = env.deployer().get_contract_instance_wasm_hash(
-            &env.current_contract_address(),
-        );
+        let wasm_hash: BytesN<32> = BytesN::from_array(&env, &[0; 32]);
 
         // Manage rolling index and evict oldest if necessary
         let mut index: Vec<u32> = env
@@ -2700,6 +2707,53 @@ impl EscrowContract {
             .persistent()
             .get(&DataKey::RollbackProposal(proposal_id))
     }
+
+    /// View function to retrieve the transition log for a given escrow.
+    pub fn get_transition_log(env: Env, escrow_id: u64) -> Vec<EscrowTransitionLog> {
+        let key = DataKey::TransitionLog(escrow_id);
+        if env.storage().persistent().has(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        }
+        env.storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+}
+
+fn transition_status(
+    env: &Env,
+    escrow_id: u64,
+    old_status: &EscrowStatus,
+    new_status: &EscrowStatus,
+    actor: &Address,
+) -> EscrowStatus {
+    let final_status = EscrowStatus::transition(env, old_status, new_status);
+    
+    // Log the transition
+    let log_entry = EscrowTransitionLog {
+        from: old_status.clone(),
+        to: final_status.clone(),
+        actor: actor.clone(),
+        timestamp: env.ledger().timestamp(),
+    };
+    
+    let log_key = DataKey::TransitionLog(escrow_id);
+    let mut logs: Vec<EscrowTransitionLog> = env
+        .storage()
+        .persistent()
+        .get(&log_key)
+        .unwrap_or_else(|| Vec::new(env));
+    logs.push_back(log_entry);
+    
+    env.storage().persistent().set(&log_key, &logs);
+    env.storage()
+        .persistent()
+        .extend_ttl(&log_key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        
+    final_status
 }
 
 

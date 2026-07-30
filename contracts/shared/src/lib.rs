@@ -25,7 +25,7 @@ pub use disaster_recovery::{
     compute_checksum, push_snapshot_index, RollbackApproval, RollbackProposal, SnapshotMeta,
     StateVerificationReport, EMERGENCY_SIGNERS, EMERGENCY_THRESHOLD, MAX_SNAPSHOTS,
 };
-pub use escrow::{EscrowRecord, EscrowStatus};
+pub use escrow::{EscrowRecord, EscrowStatus, EscrowTransitionLog};
 pub use gas_estimation::GasEstimate;
 pub use pause_guard::{ContractPaused, is_paused, require_not_paused};
 pub use reentrancy_guard::ReentrancyGuard;
