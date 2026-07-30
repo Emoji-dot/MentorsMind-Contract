@@ -242,6 +242,8 @@ pub fn evt_timelock_sched(env: &Env)    -> Symbol { Symbol::new(env, "scheduled"
 pub fn evt_timelock_exec(env: &Env)     -> Symbol { Symbol::new(env, "executed") }
 pub fn evt_timelock_cancel(env: &Env)   -> Symbol { Symbol::new(env, "cancelled") }
 pub fn evt_timelock_adm_xfr(env: &Env)  -> Symbol { Symbol::new(env, "admin_xfr") }
+pub fn evt_timelock_emerg_cancel(env: &Env) -> Symbol { Symbol::new(env, "em_cancel") }
+pub fn evt_timelock_guardian_set(env: &Env) -> Symbol { Symbol::new(env, "guard_set") }
 
 // --- bounty ---
 pub fn evt_bounty_posted(env: &Env)    -> Symbol { Symbol::new(env, "posted") }
