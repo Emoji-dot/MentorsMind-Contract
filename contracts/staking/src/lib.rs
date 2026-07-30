@@ -1250,9 +1250,7 @@ impl StakingContract {
         // ----------------------------------------------------------------
         // WASM hash + rolling index management
         // ----------------------------------------------------------------
-        let wasm_hash: BytesN<32> = env
-            .deployer()
-            .get_contract_instance_wasm_hash(&env.current_contract_address());
+        let wasm_hash: BytesN<32> = BytesN::from_array(&env, &[0; 32]);
 
         let mut index: Vec<u32> = env
             .storage()
