@@ -1,4 +1,5 @@
-use soroban_sdk::{contracttype, Address, Symbol};
+use soroban_sdk::{contracttype, Address, Symbol, Env};
+use crate::state_machine::StateMachine;
 
 /// Shared escrow status enum used across escrow and reputation contracts.
 #[contracttype]
@@ -12,6 +13,37 @@ pub enum EscrowStatus {
     Refunded,
     /// Dispute was resolved by admin arbitration via `resolve_dispute`.
     Resolved,
+}
+
+impl StateMachine for EscrowStatus {
+    type State = Self;
+
+    fn is_valid_transition(_env: &Env, from: &Self::State, to: &Self::State) -> bool {
+        matches!(
+            (from, to),
+            // Funding path
+            (EscrowStatus::Pending,  EscrowStatus::Active)
+            // Normal release
+            | (EscrowStatus::Active,   EscrowStatus::Released)
+            // Dispute flow
+            | (EscrowStatus::Active,   EscrowStatus::Disputed)
+            | (EscrowStatus::Disputed, EscrowStatus::Resolved)
+            | (EscrowStatus::Disputed, EscrowStatus::Refunded)
+            // Admin refund from active
+            | (EscrowStatus::Active,   EscrowStatus::Refunded)
+            // Pending cancellation before funding
+            | (EscrowStatus::Pending,  EscrowStatus::Refunded)
+        )
+    }
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowTransitionLog {
+    pub from: EscrowStatus,
+    pub to: EscrowStatus,
+    pub actor: Address,
+    pub timestamp: u64,
 }
 
 /// Shared escrow record structure used across escrow and reputation contracts.
