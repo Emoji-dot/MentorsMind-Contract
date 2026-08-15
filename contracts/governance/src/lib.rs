@@ -3,9 +3,10 @@
 use shared::events::{
     emit_governance_event, evt_gov_appeal_resolved, evt_gov_appeal_submitted,
     evt_gov_arb_registered, evt_gov_arb_unregistered, evt_gov_call_allowed,
-    evt_gov_proposal_cancelled, evt_gov_proposal_created, evt_gov_proposal_executed,
-    evt_gov_proposal_failed, evt_gov_proposal_passed, evt_gov_proposal_queued,
-    evt_gov_timelock_set, evt_gov_vote_cast,
+    evt_gov_proposal_cancelled, evt_gov_proposal_cancelled_w_cooldown,
+    evt_gov_proposal_created, evt_gov_proposal_executed, evt_gov_proposal_failed,
+    evt_gov_proposal_passed, evt_gov_proposal_queued, evt_gov_timelock_set,
+    evt_gov_vote_cast,
 };
 use shared::{GasEstimate, StateMachine};
 use soroban_sdk::{
@@ -28,6 +29,10 @@ const DEFAULT_VOTING_PERIOD_SECS: u64 = 7 * 24 * 60 * 60;
 const DEFAULT_QUORUM_BPS: u32 = 1_000; // 10%
 const CUSTOM_PROPOSAL_QUORUM_BPS: u32 = 3_000; // 30%
 const EXECUTE_CALL_TIMELOCK_SECS: u64 = 7 * 24 * 60 * 60; // 7-day mandatory delay
+
+const CANCEL_COOLDOWN_SECS: u64 = 7 * 24 * 60 * 60; // 7-day cancel cooldown per (admin, action_type)
+const CANCEL_ESCALATION_WINDOW_SECS: u64 = 30 * 24 * 60 * 60; // 30-day window for multi-sig escalation
+const CANCEL_ESCALATION_THRESHOLD: u32 = 3; // > 3 cancels in 30 days triggers multi-sig
 
 // ---------------------------------------------------------------------------
 // Gas-estimation heuristic constants (#761). Calibrated against
@@ -76,6 +81,32 @@ pub struct AdminChangeProposedEvent {
     pub old_admin: Address,
     pub new_admin: Address,
     pub effective_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalCancelledWithCooldown {
+    pub admin: Address,
+    pub action_type: ProposalAction,
+    pub cooldown_expires: u64,
+    pub total_cancels: u32,
+}
+
+/// Local mirror of `multisig_admin::ProposalRecord` used for cross-contract
+/// validation during cancel escalation. Field order MUST match the multisig
+/// definition for correct SCV serialization.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultisigProposalInfo {
+    pub id: u32,
+    pub proposer: Address,
+    pub target: Address,
+    pub function: Symbol,
+    pub args: Vec<soroban_sdk::Val>,
+    pub approval_count: u32,
+    pub expiry: u64,
+    pub executed: bool,
+    pub cancelled: bool,
 }
 
 const ADMIN_CHANGE_TIMELOCK: u64 = 48 * 60 * 60;
@@ -170,6 +201,16 @@ pub enum DataKey {
     /// Multiplier applied to a specific voter's vote (in bps)
     VoteWeightMultiplier(u32, Address),
     DelegationContract,
+    /// Per-address delegate config (used by gas-estimate heuristic)
+    Delegate(Address),
+    /// Last cancel timestamp per (admin, action_type) pair for 7-day cooldown
+    CancelCooldown(Address, ProposalAction),
+    /// Lifetime total cancellations per admin (for transparency / events)
+    CancelCount(Address),
+    /// Individual cancel timestamps per admin (for 30-day escalation window)
+    CancelTimestamps(Address),
+    /// MultisigAdmin contract address for post-escalation cancellations
+    MultisigAdmin,
 }
 
 #[contracttype]
@@ -364,6 +405,53 @@ impl GovernanceContract {
         env.storage()
             .persistent()
             .set(&TEMPLATES, &templates_contract);
+    }
+
+    /// Set the MultisigAdmin contract address used for cancel escalation
+    /// after an admin exceeds 3 cancellations in 30 days.
+    pub fn set_multisig_admin(env: Env, admin: Address, multisig_admin: Address) {
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .persistent()
+            .set(&DataKey::MultisigAdmin, &multisig_admin);
+    }
+
+    /// Count how many times `admin` has cancelled proposals within the
+    /// last `CANCEL_ESCALATION_WINDOW_SECS` (30 days).
+    fn count_recent_cancels(env: &Env, admin: &Address, now: u64) -> u32 {
+        let timestamps: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CancelTimestamps(admin.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+        let cutoff = now.saturating_sub(CANCEL_ESCALATION_WINDOW_SECS);
+        let mut count = 0u32;
+        for ts in timestamps.iter() {
+            if ts > cutoff {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Prune cancel timestamps older than 30 days and append the new one.
+    fn record_cancel_timestamp(env: &Env, admin: &Address, now: u64) {
+        let cutoff = now.saturating_sub(CANCEL_ESCALATION_WINDOW_SECS);
+        let old: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CancelTimestamps(admin.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+        let mut pruned = Vec::new(env);
+        for ts in old.iter() {
+            if ts > cutoff {
+                pruned.push_back(ts);
+            }
+        }
+        pruned.push_back(now);
+        env.storage()
+            .persistent()
+            .set(&DataKey::CancelTimestamps(admin.clone()), &pruned);
     }
 
     pub fn create_proposal(
@@ -822,7 +910,24 @@ impl GovernanceContract {
         emit_governance_event(&env, evt_gov_proposal_executed(&env), true);
     }
 
-    pub fn cancel_proposal(env: Env, proposal_id: u32) {
+    /// Cancel a non-executed proposal.
+    ///
+    /// # Anti-griefing protections
+    ///
+    /// 1. **7-day cooldown**: An admin cannot cancel two proposals of the
+    ///    same `ProposalAction` variant within `CANCEL_COOLDOWN_SECS`.
+    /// 2. **Multi-sig escalation**: If the same admin cancels more than
+    ///    `CANCEL_ESCALATION_THRESHOLD` proposals in 30 days, further
+    ///    cancellations require a pre-approved `multisig_action_id` from
+    ///    the configured `MultisigAdmin` contract.
+    ///
+    /// # Arguments
+    ///
+    /// * `proposal_id` – id of the proposal to cancel.
+    /// * `multisig_action_id` – optional `MultisigAdmin` action id that
+    ///   has already met its approval threshold. Required once the admin
+    ///   has exceeded their 30-day cancel budget.
+    pub fn cancel_proposal(env: Env, proposal_id: u32, multisig_action_id: Option<u32>) {
         let admin: Address = env
             .storage()
             .instance()
@@ -830,6 +935,7 @@ impl GovernanceContract {
             .expect("not initialized");
         admin.require_auth();
 
+        let now = env.ledger().timestamp();
         let mut proposal = Self::get_proposal(env.clone(), proposal_id);
 
         match proposal.status {
@@ -839,15 +945,110 @@ impl GovernanceContract {
             _ => {}
         }
 
+        // ── 1. 7-day cooldown per (admin, action_type) ──────────────────
+        let action_type = proposal.action.clone();
+        let cooldown_key = DataKey::CancelCooldown(admin.clone(), action_type.clone());
+        if let Some(last_cancel_ts) = env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&cooldown_key)
+        {
+            let cooldown_allowed_at = last_cancel_ts
+                .checked_add(CANCEL_COOLDOWN_SECS)
+                .expect("cooldown overflow");
+            if now < cooldown_allowed_at {
+                panic!(
+                    "cancel cooldown active for this action type: {}s remaining",
+                    cooldown_allowed_at - now
+                );
+            }
+        }
+
+        // ── 2. 30-day escalation window (>3 cancels → multi-sig) ───────
+        let recent = Self::count_recent_cancels(&env, &admin, now);
+        if recent >= CANCEL_ESCALATION_THRESHOLD {
+            let multisig: Address = env
+                .storage()
+                .persistent()
+                .get(&DataKey::MultisigAdmin)
+                .expect("multisig admin contract not set for escalation");
+            let action_id = multisig_action_id.expect("multisig action id required after 3 cancels in 30 days");
+            let record: MultisigProposalInfo = env
+                .invoke_contract(
+                    &multisig,
+                    &Symbol::new(&env, "get_proposal"),
+                    (action_id,).into_val(&env),
+                );
+            if record.executed {
+                panic!("multisig action already executed");
+            }
+            if record.cancelled {
+                panic!("multisig action cancelled");
+            }
+            if now > record.expiry {
+                panic!("multisig action expired");
+            }
+            let threshold: u32 = env.invoke_contract(
+                &multisig,
+                &Symbol::new(&env, "get_threshold"),
+                ().into_val(&env),
+            );
+            if record.approval_count < threshold {
+                panic!("multisig action below threshold");
+            }
+            // Mark the multisig action as executed so it cannot be replayed.
+            env.invoke_contract::<()>(
+                &multisig,
+                &Symbol::new(&env, "execute_action"),
+                (action_id,).into_val(&env),
+            );
+        }
+
+        // ── 3. Record state changes ────────────────────────────────────
         proposal.status = ProposalStatus::Cancelled;
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
 
+        // Update cooldown timestamp for (admin, action_type)
+        env.storage()
+            .persistent()
+            .set(&cooldown_key, &now);
+
+        // Update lifetime cancel count (transparency)
+        let lifetime_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CancelCount(admin.clone()))
+            .unwrap_or(0u32)
+            .checked_add(1u32)
+            .expect("cancel count overflow");
+        env.storage()
+            .persistent()
+            .set(&DataKey::CancelCount(admin.clone()), &lifetime_count);
+
+        // Update rolling 30-day timestamp list
+        Self::record_cancel_timestamp(&env, &admin, now);
+
+        // ── 4. Emit events ─────────────────────────────────────────────
         emit_governance_event(
             &env,
             evt_gov_proposal_cancelled(&env),
             proposal.proposer.clone(),
+        );
+
+        let cooldown_expires = now
+            .checked_add(CANCEL_COOLDOWN_SECS)
+            .expect("cooldown expires overflow");
+        emit_governance_event(
+            &env,
+            evt_gov_proposal_cancelled_w_cooldown(&env),
+            ProposalCancelledWithCooldown {
+                admin: admin.clone(),
+                action_type,
+                cooldown_expires,
+                total_cancels: lifetime_count,
+            },
         );
     }
 
@@ -1239,7 +1440,8 @@ mod tests {
     extern crate std;
 
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Ledger};
+    use soroban_sdk::testutils::{Address as _, Events, Ledger};
+    use soroban_sdk::TryIntoVal;
 
     #[contract]
     pub struct MockMntToken;
@@ -1931,7 +2133,7 @@ mod tests {
         gov.execute_proposal(&proposal_id);
         let proposal = gov.get_proposal(&proposal_id);
         assert_eq!(proposal.status, ProposalStatus::Failed);
-        gov.cancel_proposal(&proposal_id);
+        gov.cancel_proposal(&proposal_id, &None);
     }
 
     #[test]
@@ -1948,11 +2150,435 @@ mod tests {
             &ProposalAction::UpdateFee(300),
         );
 
-        gov.cancel_proposal(&proposal_id);
+        gov.cancel_proposal(&proposal_id, &None);
         let proposal = gov.get_proposal(&proposal_id);
         assert_eq!(proposal.status, ProposalStatus::Cancelled);
 
-        gov.cancel_proposal(&proposal_id);
+        gov.cancel_proposal(&proposal_id, &None);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Cancel cooldown + multi-sig escalation tests
+    // ═════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_first_cancel_sets_cooldown_and_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (gov, admin, voter, _, _) = setup(&env);
+        let proposal_id = gov.create_proposal(
+            &voter,
+            &Bytes::from_slice(&env, b"Update fee"),
+            &BytesN::from_array(&env, &[10u8; 32]),
+            &ProposalAction::UpdateFee(300),
+        );
+
+        gov.cancel_proposal(&proposal_id, &None);
+        let proposal = gov.get_proposal(&proposal_id);
+        assert_eq!(proposal.status, ProposalStatus::Cancelled);
+
+        // Verify CancelCount incremented
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CancelCount(admin.clone()))
+            .unwrap_or(0);
+        assert_eq!(count, 1);
+
+        // Verify cooldown timestamp stored
+        let now = env.ledger().timestamp();
+        let cooldown_ts: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CancelCooldown(admin, ProposalAction::UpdateFee(300)))
+            .expect("cooldown should be set");
+        assert_eq!(cooldown_ts, now);
+    }
+
+    #[test]
+    #[should_panic(expected = "cancel cooldown active for this action type")]
+    fn test_same_action_cancel_within_cooldown_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (gov, _admin, voter, _, _) = setup(&env);
+
+        // Create + cancel first UpdateFee proposal
+        let p1 = gov.create_proposal(
+            &voter,
+            &Bytes::from_slice(&env, b"Update fee #1"),
+            &BytesN::from_array(&env, &[20u8; 32]),
+            &ProposalAction::UpdateFee(300),
+        );
+        gov.cancel_proposal(&p1, &None);
+
+        // Advance clock by 1 day (still within 7-day cooldown)
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 24 * 60 * 60);
+
+        // Proposer resubmits same UpdateFee action
+        let p2 = gov.create_proposal(
+            &voter,
+            &Bytes::from_slice(&env, b"Update fee #2"),
+            &BytesN::from_array(&env, &[21u8; 32]),
+            &ProposalAction::UpdateFee(500),
+        );
+        // Same admin cancelling same action variant (UpdateFee) within cooldown → REJECTED
+        gov.cancel_proposal(&p2, &None);
+    }
+
+    #[test]
+    fn test_same_action_cancel_after_cooldown_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (gov, admin, voter, _, _) = setup(&env);
+
+        let p1 = gov.create_proposal(
+            &voter,
+            &Bytes::from_slice(&env, b"Update fee #1"),
+            &BytesN::from_array(&env, &[22u8; 32]),
+            &ProposalAction::UpdateFee(300),
+        );
+        gov.cancel_proposal(&p1, &None);
+
+        // Advance clock by 7 days + 1 second (cooldown expired)
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 7 * 24 * 60 * 60 + 1);
+
+        let p2 = gov.create_proposal(
+            &voter,
+            &Bytes::from_slice(&env, b"Update fee #2"),
+            &BytesN::from_array(&env, &[23u8; 32]),
+            &ProposalAction::UpdateFee(500),
+        );
+        // Should succeed: cooldown has expired
+        gov.cancel_proposal(&p2, &None);
+
+        let proposal = gov.get_proposal(&p2);
+        assert_eq!(proposal.status, ProposalStatus::Cancelled);
+
+        // Lifetime count should be 2
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CancelCount(admin))
+            .unwrap_or(0);
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_different_action_within_cooldown_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (gov, _admin, voter, _, _) = setup(&env);
+
+        // Cancel an UpdateFee proposal
+        let p1 = gov.create_proposal(
+            &voter,
+            &Bytes::from_slice(&env, b"Update fee"),
+            &BytesN::from_array(&env, &[24u8; 32]),
+            &ProposalAction::UpdateFee(300),
+        );
+        gov.cancel_proposal(&p1, &None);
+
+        // Advance clock by 1 day (within cooldown for UpdateFee)
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 24 * 60 * 60);
+
+        // But cancelling a DIFFERENT action type should work
+        let p2 = gov.create_proposal(
+            &voter,
+            &Bytes::from_slice(&env, b"Add asset"),
+            &BytesN::from_array(&env, &[25u8; 32]),
+            &ProposalAction::AddAsset(Address::generate(&env)),
+        );
+        gov.cancel_proposal(&p2, &None);
+
+        let proposal = gov.get_proposal(&p2);
+        assert_eq!(proposal.status, ProposalStatus::Cancelled);
+    }
+
+    #[test]
+    fn test_different_admin_same_action_within_cooldown_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let gov_id = env.register_contract(None, GovernanceContract);
+        let token_id = env.register_contract(None, MockMntToken);
+        let snapshot_id = env.register_contract(None, MockSnapshot);
+        let delegation_id = env.register_contract(None, MockDelegation);
+        let gov = GovernanceContractClient::new(&env, &gov_id);
+        let token = MockMntTokenClient::new(&env, &token_id);
+        let snapshot = MockSnapshotClient::new(&env, &snapshot_id);
+        snapshot.set_token(&token_id);
+
+        let admin1 = Address::generate(&env);
+        let admin2 = Address::generate(&env);
+        let voter = Address::generate(&env);
+
+        gov.initialize(
+            &admin1,
+            &token_id,
+            &snapshot_id,
+            &delegation_id,
+            &Some(10u64),
+            &Some(1_000u32),
+        );
+        token.set_total_supply(&1_000i128);
+        token.set_balance(&voter, &600i128);
+
+        // admin1 cancels an UpdateFee proposal
+        let p1 = gov.create_proposal(
+            &voter,
+            &Bytes::from_slice(&env, b"Update fee #1"),
+            &BytesN::from_array(&env, &[26u8; 32]),
+            &ProposalAction::UpdateFee(300),
+        );
+        gov.cancel_proposal(&p1, &None);
+
+        // Change admin to admin2 via storage (simulate an admin transition)
+        env.storage().instance().set(&ADMIN, &admin2);
+        env.storage().persistent().set(&ADMIN, &admin2);
+
+        // Now admin2 cancels a re-submitted UpdateFee proposal within the
+        // same 7-day window. This should succeed because the cooldown is
+        // per-(admin, action_type) pair.
+        let p2 = gov.create_proposal(
+            &voter,
+            &Bytes::from_slice(&env, b"Update fee #2"),
+            &BytesN::from_array(&env, &[27u8; 32]),
+            &ProposalAction::UpdateFee(500),
+        );
+        gov.cancel_proposal(&p2, &None);
+
+        let proposal = gov.get_proposal(&p2);
+        assert_eq!(proposal.status, ProposalStatus::Cancelled);
+
+        // admin2's cancel count should be 1 (separate from admin1's)
+        let count2: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CancelCount(admin2))
+            .unwrap_or(0);
+        assert_eq!(count2, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "multisig action id required after 3 cancels in 30 days")]
+    fn test_fourth_cancel_without_multisig_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (gov, _admin, voter, _, _) = setup(&env);
+
+        // Cancel 3 different action types (no cooldown collision), all
+        // within the 30-day escalation window.
+        let actions: [ProposalAction; 4] = [
+            ProposalAction::UpdateFee(300),
+            ProposalAction::UpdateAutoRelease(86400),
+            ProposalAction::AddAsset(Address::generate(&env)),
+            ProposalAction::UpdateAdmin(Address::generate(&env)),
+        ];
+
+        let titles: [&[u8]; 3] = [b"cancel #1", b"cancel #2", b"cancel #3"];
+        for (i, action) in actions[0..3].iter().enumerate() {
+            let p = gov.create_proposal(
+                &voter,
+                &Bytes::from_slice(&env, titles[i]),
+                &BytesN::from_array(&env, &[(i + 40) as u8; 32]),
+                &action.clone(),
+            );
+            // Advance 1 day between cancels (still within 30 days)
+            env.ledger()
+                .set_timestamp(env.ledger().timestamp() + 24 * 60 * 60);
+            gov.cancel_proposal(&p, &None);
+        }
+
+        // 4th cancel within 30 days: should panic — multisig_action_id required
+        let p4 = gov.create_proposal(
+            &voter,
+            &Bytes::from_slice(&env, b"cancel #4"),
+            &BytesN::from_array(&env, &[44u8; 32]),
+            &actions[3].clone(),
+        );
+        gov.cancel_proposal(&p4, &None);
+    }
+
+    #[test]
+    fn test_fourth_cancel_with_multisig_approval_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        // ── Setup: governance, no-op target, multisig ────────────────
+        let (gov, admin, voter, _, _) = setup(&env);
+
+        // No-op target: multisig execute_action calls this harmlessly
+        let noop_id = env.register_contract(None, MockNoOp);
+
+        // Register and initialize multisig (2-of-3) with local MockMultisig
+        let multisig_id = env.register_contract(None, MockMultisig);
+        let ms_client = MockMultisigClient::new(&env, &multisig_id);
+        let signers = [
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+        ];
+        ms_client.initialize(
+            &vec![
+                &env,
+                signers[0].clone(),
+                signers[1].clone(),
+                signers[2].clone(),
+            ],
+            &2u32,
+        );
+        gov.set_multisig_admin(&admin, &multisig_id);
+
+        // ── 3 cancels to trigger escalation ──────────────────────────
+        let actions: [ProposalAction; 4] = [
+            ProposalAction::UpdateFee(300),
+            ProposalAction::UpdateAutoRelease(86400),
+            ProposalAction::AddAsset(Address::generate(&env)),
+            ProposalAction::UpdateAdmin(Address::generate(&env)),
+        ];
+
+        let titles_ms: [&[u8]; 3] = [b"cancel_ms#1", b"cancel_ms#2", b"cancel_ms#3"];
+        for (i, action) in actions[0..3].iter().enumerate() {
+            let p = gov.create_proposal(
+                &voter,
+                &Bytes::from_slice(&env, titles_ms[i]),
+                &BytesN::from_array(&env, &[(i + 50) as u8; 32]),
+                &action.clone(),
+            );
+            env.ledger()
+                .set_timestamp(env.ledger().timestamp() + 24 * 60 * 60);
+            gov.cancel_proposal(&p, &None);
+        }
+
+        // ── Prepare multisig-approved action for 4th cancel ──────────
+        // Target the MockNoOp contract's `no_op` function so that when
+        // cancel_proposal invokes multisig.execute_action() it triggers
+        // a harmless call instead of infinite recursion.
+        let fn_name = Symbol::new(&env, "no_op");
+        let ms_args = vec![&env];
+        let ms_id = ms_client.propose_action(
+            &signers[0],
+            &noop_id,
+            &fn_name,
+            &ms_args,
+        );
+        // Second signer approves → threshold met (2-of-3)
+        ms_client.sign_action(&signers[1], &ms_id);
+
+        // ── 4th cancel WITH multisig action id → should succeed ─────
+        let p4 = gov.create_proposal(
+            &voter,
+            &Bytes::from_slice(&env, b"cancel #4"),
+            &BytesN::from_array(&env, &[54u8; 32]),
+            &actions[3].clone(),
+        );
+        gov.cancel_proposal(&p4, &Some(ms_id));
+
+        let proposal = gov.get_proposal(&p4);
+        assert_eq!(proposal.status, ProposalStatus::Cancelled);
+
+        // Multisig action should be marked as executed to prevent replay
+        let spent = ms_client.get_proposal(&ms_id);
+        assert!(spent.executed, "multisig action should be consumed after use");
+    }
+
+    #[test]
+    fn test_escalation_window_resets_after_30_days() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (gov, admin, voter, _, _) = setup(&env);
+
+        // Cancel 3 times over 3 days (within 30-day window)
+        let actions = [
+            ProposalAction::UpdateFee(300),
+            ProposalAction::UpdateAutoRelease(86400),
+            ProposalAction::AddAsset(Address::generate(&env)),
+        ];
+        let titles_30d: [&[u8]; 3] = [b"old cancel #1", b"old cancel #2", b"old cancel #3"];
+        for (i, action) in actions.iter().enumerate() {
+            let p = gov.create_proposal(
+                &voter,
+                &Bytes::from_slice(&env, titles_30d[i]),
+                &BytesN::from_array(&env, &[(i + 60) as u8; 32]),
+                &action.clone(),
+            );
+            env.ledger()
+                .set_timestamp(env.ledger().timestamp() + 24 * 60 * 60);
+            gov.cancel_proposal(&p, &None);
+        }
+
+        // Advance 31 days — all 3 prior cancels fall outside the 30-day
+        // window, so the admin's budget is replenished.
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 31 * 24 * 60 * 60);
+
+        // 4th proposal of a new action — should succeed without multisig
+        let p4 = gov.create_proposal(
+            &voter,
+            &Bytes::from_slice(&env, b"new cycle cancel"),
+            &BytesN::from_array(&env, &[64u8; 32]),
+            &ProposalAction::UpdateAdmin(Address::generate(&env)),
+        );
+        gov.cancel_proposal(&p4, &None);
+
+        let proposal = gov.get_proposal(&p4);
+        assert_eq!(proposal.status, ProposalStatus::Cancelled);
+
+        // Lifetime count should be 4
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CancelCount(admin))
+            .unwrap_or(0);
+        assert_eq!(count, 4);
+    }
+
+    #[test]
+    fn test_cancel_cooldown_event_contains_all_fields() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (gov, admin, voter, _, _) = setup(&env);
+        let action = ProposalAction::UpdateFee(300);
+        let proposal_id = gov.create_proposal(
+            &voter,
+            &Bytes::from_slice(&env, b"Cooldown event test"),
+            &BytesN::from_array(&env, &[70u8; 32]),
+            &action.clone(),
+        );
+
+        gov.cancel_proposal(&proposal_id, &None);
+        let events = env.events().all();
+        // cancel_proposal emits 2 events: original prop_cxl FIRST, cooldown event LAST
+        let last_event = events.last().unwrap();
+
+        // event = (contract_id, topics_tuple_val, data_val)
+        // topics = (contract: Symbol, version: u32, event_type: Symbol)
+        let (_contract, _version, evt_sym): (Symbol, u32, Symbol) =
+            last_event.1.try_into_val(&env).unwrap();
+        assert_eq!(evt_sym, Symbol::new(&env, "prop_cxl_cd"));
+
+        let payload: ProposalCancelledWithCooldown =
+            last_event.2.try_into_val(&env).unwrap();
+        assert_eq!(payload.admin, admin);
+        assert_eq!(payload.action_type, action);
+        assert_eq!(payload.total_cancels, 1);
+        // Cooldown expiry should be now + 7 days
+        let expected_expiry = env
+            .ledger()
+            .timestamp()
+            .checked_add(7 * 24 * 60 * 60)
+            .unwrap();
+        assert_eq!(payload.cooldown_expires, expected_expiry);
     }
 
     #[contract]
@@ -1969,6 +2595,145 @@ mod tests {
             _delay: u64,
         ) -> BytesN<32> {
             BytesN::from_array(&env, &[7u8; 32])
+        }
+    }
+
+    #[contract]
+    pub struct MockNoOp;
+
+    #[contractimpl]
+    impl MockNoOp {
+        pub fn no_op(_env: Env) {}
+    }
+
+    const MS_EXPIRY: u64 = 7 * 24 * 60 * 60;
+
+    #[contract]
+    pub struct MockMultisig;
+
+    #[contractimpl]
+    impl MockMultisig {
+        pub fn initialize(env: Env, signers: Vec<Address>, threshold: u32) {
+            env.storage()
+                .instance()
+                .set(&symbol_short!("THRESH"), &threshold);
+            env.storage()
+                .instance()
+                .set(&symbol_short!("S_CNT"), &(signers.len() as u32));
+            for s in signers.iter() {
+                env.storage()
+                    .persistent()
+                    .set(&(symbol_short!("SIGN"), s.clone()), &true);
+            }
+            env.storage()
+                .instance()
+                .set(&symbol_short!("P_CNT"), &0u32);
+        }
+
+        pub fn get_threshold(env: Env) -> u32 {
+            env.storage().instance().get(&symbol_short!("THRESH")).unwrap()
+        }
+
+        pub fn propose_action(
+            env: Env,
+            proposer: Address,
+            target: Address,
+            function: Symbol,
+            args: Vec<soroban_sdk::Val>,
+        ) -> u32 {
+            assert!(
+                env.storage()
+                    .persistent()
+                    .get::<_, bool>(&(symbol_short!("SIGN"), proposer.clone()))
+                    .unwrap_or(false),
+                "not signer"
+            );
+            let mut cnt: u32 = env
+                .storage()
+                .instance()
+                .get(&symbol_short!("P_CNT"))
+                .unwrap_or(0);
+            cnt += 1;
+            env.storage().instance().set(&symbol_short!("P_CNT"), &cnt);
+            let now = env.ledger().timestamp();
+            let rec = MultisigProposalInfo {
+                id: cnt,
+                proposer: proposer.clone(),
+                target,
+                function,
+                args,
+                approval_count: 1,
+                expiry: now.checked_add(MS_EXPIRY).unwrap(),
+                executed: false,
+                cancelled: false,
+            };
+            env.storage()
+                .persistent()
+                .set(&(symbol_short!("PROP"), cnt), &rec);
+            env.storage().persistent().set(
+                &(symbol_short!("APPR"), cnt, proposer.clone()),
+                &true,
+            );
+            cnt
+        }
+
+        pub fn sign_action(env: Env, signer: Address, action_id: u32) {
+            assert!(
+                env.storage()
+                    .persistent()
+                    .get::<_, bool>(&(symbol_short!("SIGN"), signer.clone()))
+                    .unwrap_or(false),
+                "not signer"
+            );
+            let mut rec: MultisigProposalInfo = env
+                .storage()
+                .persistent()
+                .get(&(symbol_short!("PROP"), action_id))
+                .expect("no prop");
+            assert!(!rec.executed, "executed");
+            assert!(!rec.cancelled, "cancelled");
+            let ap_key = (symbol_short!("APPR"), action_id, signer.clone());
+            if !env.storage().persistent().has(&ap_key) {
+                env.storage().persistent().set(&ap_key, &true);
+                rec.approval_count += 1;
+                env.storage()
+                    .persistent()
+                    .set(&(symbol_short!("PROP"), action_id), &rec);
+            }
+        }
+
+        pub fn get_proposal(env: Env, action_id: u32) -> MultisigProposalInfo {
+            env.storage()
+                .persistent()
+                .get(&(symbol_short!("PROP"), action_id))
+                .expect("no prop")
+        }
+
+        pub fn execute_action(env: Env, action_id: u32) {
+            let mut rec: MultisigProposalInfo = env
+                .storage()
+                .persistent()
+                .get(&(symbol_short!("PROP"), action_id))
+                .expect("no prop");
+            assert!(!rec.executed, "already executed");
+            assert!(!rec.cancelled, "cancelled");
+            let threshold: u32 = env
+                .storage()
+                .instance()
+                .get(&symbol_short!("THRESH"))
+                .unwrap();
+            assert!(rec.approval_count >= threshold, "below threshold");
+            rec.executed = true;
+            env.storage()
+                .persistent()
+                .set(&(symbol_short!("PROP"), action_id), &rec);
+            if rec.target != env.current_contract_address() {
+                let _ = env.invoke_contract::<soroban_sdk::Val>(
+                    &rec.target,
+                    &rec.function,
+                    rec.args.clone(),
+                );
+            }
         }
     }
 

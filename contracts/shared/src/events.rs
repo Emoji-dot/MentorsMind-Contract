@@ -225,6 +225,7 @@ pub fn evt_gov_proposal_failed(env: &Env)   -> Symbol { Symbol::new(env, "prop_f
 pub fn evt_gov_proposal_queued(env: &Env)   -> Symbol { Symbol::new(env, "prop_queued") }
 pub fn evt_gov_proposal_executed(env: &Env) -> Symbol { Symbol::new(env, "prop_executed") }
 pub fn evt_gov_proposal_cancelled(env: &Env)-> Symbol { Symbol::new(env, "prop_cancelled") }
+pub fn evt_gov_proposal_cancelled_w_cooldown(env: &Env) -> Symbol { Symbol::new(env, "prop_cxl_cd") }
 pub fn evt_gov_timelock_set(env: &Env)      -> Symbol { Symbol::new(env, "timelock_set") }
 pub fn evt_gov_call_allowed(env: &Env)      -> Symbol { Symbol::new(env, "call_allowed") }
 pub fn evt_gov_arb_registered(env: &Env)    -> Symbol { Symbol::new(env, "arb_registered") }
