@@ -2,8 +2,8 @@
 #![allow(deprecated)]
 #![allow(dead_code)]
 use shared::events::{
-    emit_escrow_event, evt_escrow_created, evt_escrow_disputed, evt_escrow_refunded,
-    evt_escrow_released, evt_escrow_resolved,
+    emit_escrow_event, evt_escrow_created, evt_escrow_disputed, evt_escrow_emergency_release,
+    evt_escrow_refunded, evt_escrow_released, evt_escrow_resolved, evt_escrow_stuck_reported,
 };
 use shared::{
     compute_checksum, push_snapshot_index, EscrowRecord, EscrowStatus, RollbackProposal,
@@ -154,6 +154,24 @@ pub struct TokenApprovalEventData {
     pub approved: bool,
 }
 
+/// Event data emitted when an escrow is reported as stuck after the grace period.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowStuckReportedEventData {
+    pub escrow_id: u64,
+    pub reporter: Address,
+    pub stuck_since: u64,
+}
+
+/// Event data emitted when an emergency release is executed via multi-sig admin.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmergencyReleaseExecutedEventData {
+    pub escrow_id: u64,
+    pub admin: Address,
+    pub reason_hash: BytesN<32>,
+}
+
 // ---------------------------------------------------------------------------
 // Graduated fee schedule (Issue #676)
 // ---------------------------------------------------------------------------
@@ -192,6 +210,31 @@ pub trait StakingTierTrait {
     fn get_tier(env: Env, mentor: Address) -> u32;
 }
 
+/// Cross-contract client for the MultisigAdmin contract used to validate
+/// emergency release approvals (2-of-3 minimum threshold).
+#[soroban_sdk::contractclient(name = "MultisigClient")]
+pub trait MultisigAdminTrait {
+    fn get_proposal(env: Env, action_id: u32) -> ProposalRecordMirror;
+    fn get_threshold(env: Env) -> u32;
+}
+
+/// Local mirror of `multisig_admin::ProposalRecord` used for cross-contract
+/// validation of emergency release approvals. Field order MUST match the
+/// multisig definition for correct SCV serialization.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalRecordMirror {
+    pub id: u32,
+    pub proposer: Address,
+    pub target: Address,
+    pub function: Symbol,
+    pub args: Vec<soroban_sdk::Val>,
+    pub approval_count: u32,
+    pub expiry: u64,
+    pub executed: bool,
+    pub cancelled: bool,
+}
+
 // ---------------------------------------------------------------------------
 // DataKey enum — typed storage key for all persistent state
 // ---------------------------------------------------------------------------
@@ -212,6 +255,12 @@ pub enum DataKey {
     StakingContract,
     ReputationContract,
     InsuranceContract,
+    /// Address of the MultisigAdmin contract used for emergency release approvals.
+    MultisigAdmin,
+    /// Count of failed auto-release attempts for a given escrow_id.
+    AutoReleaseAttempts(u64),
+    /// Watchlist of escrow IDs reported as stuck (after grace period elapsed).
+    StuckEscrows,
     // -----------------------------------------------------------------------
     // Disaster-recovery keys
     // -----------------------------------------------------------------------
@@ -253,6 +302,19 @@ const MAX_FEE_BPS: u32 = 1_000;
 
 /// Default auto-release delay: 72 hours in seconds.
 const DEFAULT_AUTO_RELEASE_DELAY: u64 = 72 * 60 * 60;
+
+/// Maximum number of failed auto-release attempts before the emergency
+/// release path is enabled. After this many failures, any admin with
+/// multi-sig approval can bypass cross-contract checks and force-release.
+const MAX_FAILED_ATTEMPTS: u32 = 3;
+
+/// Grace period (in seconds) after `session_end_time + auto_release_delay`
+/// before an escrow can be reported as "stuck" by any caller. This gives
+/// legitimate auto-release retries a chance to succeed before the watchlist
+/// flags the escrow for manual intervention.
+///
+/// Default: 7 days (7 * 24 * 60 * 60).
+const GRACE_PERIOD_SECS: u64 = 7 * 24 * 60 * 60;
 
 // Approved token registry key prefix: ("APRV_TOK", address → bool
 const APPROVED_TOKEN_KEY: Symbol = symbol_short!("APRV_TOK");
@@ -613,6 +675,60 @@ impl EscrowContract {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::StakingContract, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+    }
+
+    /// Set the reputation contract address used for on_session_released hooks
+    /// (admin only).  Configuring it enables the reputation-update cross-call
+    /// on the happy-path release flow; absent config means the call is
+    /// skipped so tests/early deployments work without a reputation contract.
+    pub fn set_reputation_contract(env: Env, admin: Address, reputation: Address) {
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Admin, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("Caller not authorized");
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ReputationContract, &reputation);
+        env.storage().persistent().extend_ttl(
+            &DataKey::ReputationContract,
+            ESCROW_TTL_THRESHOLD,
+            ESCROW_TTL_BUMP,
+        );
+    }
+
+    /// Set the insurance contract address used for verify_coverage_on_release
+    /// checks (admin only).
+    pub fn set_insurance_contract(env: Env, admin: Address, insurance: Address) {
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Admin, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("Caller not authorized");
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::InsuranceContract, &insurance);
+        env.storage().persistent().extend_ttl(
+            &DataKey::InsuranceContract,
+            ESCROW_TTL_THRESHOLD,
+            ESCROW_TTL_BUMP,
+        );
     }
 
     /// Read the mentor's staking tier via a cross-contract call. Returns 0 when
@@ -999,6 +1115,15 @@ impl EscrowContract {
     /// Anyone may call this once `env.ledger().timestamp() >=
     /// escrow.session_end_time + escrow.auto_release_delay` and the escrow is
     /// still `Active`.
+    ///
+    /// # Failure Recovery
+    ///
+    /// If cross-contract prechecks (reputation update, insurance check, fee
+    /// calculation) fail, the failure is counted against
+    /// `MAX_FAILED_ATTEMPTS` (3).  After 3 consecutive failures the
+    /// auto-release path is permanently disabled for this escrow, and the
+    /// `emergency_release` (multi-sig admin bypass) must be used to unlock
+    /// the funds.
     pub fn try_auto_release(env: Env, escrow_id: u64) {
         let key = (symbol_short!("ESCROW"), escrow_id);
         env.storage()
@@ -1025,6 +1150,34 @@ impl EscrowContract {
             panic!("Auto-release window has not elapsed");
         }
 
+        // ---- Failure-recovery gate ----
+        let attempts = Self::_get_auto_release_attempts(&env, escrow_id);
+        if attempts >= MAX_FAILED_ATTEMPTS {
+            panic!(
+                "Auto-release disabled: {} failed attempts; use emergency_release",
+                attempts
+            );
+        }
+
+        // ---- Cross-contract prechecks wrapped in try_invoke ----
+        //
+        // These calls (reputation update, insurance check) are external
+        // dependencies that can panic for non-deterministic reasons.  We
+        // use `try_invoke_contract` so that we can count the failure and
+        // keep a recovery path via `emergency_release` after 3 strikes.
+        let prechecks_ok = Self::_try_run_auto_release_prechecks(&env, &escrow);
+        if !prechecks_ok {
+            let new_attempts = Self::_increment_auto_release_attempts(&env, escrow_id);
+            if new_attempts >= MAX_FAILED_ATTEMPTS {
+                panic!(
+                    "Auto-release prechecks failed ({} attempts); emergency_release required",
+                    new_attempts
+                );
+            } else {
+                panic!("Auto-release prechecks failed (attempt {}/{})", new_attempts, MAX_FAILED_ATTEMPTS);
+            }
+        }
+
         // Emit a dedicated `auto_released` event before the internal release
         env.events().publish(
             (Symbol::new(&env, "Escrow"), Symbol::new(&env, "AutoReleased"), escrow_id),
@@ -1032,6 +1185,132 @@ impl EscrowContract {
         );
 
         Self::_do_release(&env, &mut escrow, &key, &env.current_contract_address());
+
+        // Success: reset the failure counter so transient errors don't
+        // permanently disable the escrow.
+        env.storage()
+            .persistent()
+            .remove(&DataKey::AutoReleaseAttempts(escrow_id));
+    }
+
+    // -----------------------------------------------------------------------
+    // Auto-release failure recovery helpers
+    // -----------------------------------------------------------------------
+
+    /// Run the cross-contract prechecks for auto-release inside a
+    /// `try_invoke_contract` guard.  Returns `true` if all prechecks
+    /// completed successfully, `false` if any call trapped / panicked.
+    ///
+    /// Prechecks executed (when the corresponding contract is configured):
+    /// 1. Reputation contract — session completion hook
+    /// 2. Insurance contract  — coverage verification
+    /// 3. Fee calculation     — graduated-fee cross-contract tier lookup
+    fn _try_run_auto_release_prechecks(env: &Env, escrow: &Escrow) -> bool {
+        // ---- 1. Reputation contract integration ----
+        if let Some(reputation) = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::ReputationContract)
+        {
+            let result = env.try_invoke_contract::<(), soroban_sdk::Error>(
+                &reputation,
+                &Symbol::new(env, "on_session_released"),
+                (
+                    escrow.id,
+                    escrow.mentor.clone(),
+                    escrow.learner.clone(),
+                    escrow.amount,
+                )
+                    .into_val(env),
+            );
+            // try_invoke_contract returns Result<Result<R, InvokeError>, _>
+            // "double Result"; flatten both to check all-Ok.
+            let ok = match result {
+                Ok(inner_result) => inner_result.is_ok(),
+                Err(_) => false,
+            };
+            if !ok {
+                return false;
+            }
+        }
+
+        // ---- 2. Insurance contract integration ----
+        if let Some(insurance) = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::InsuranceContract)
+        {
+            let result = env.try_invoke_contract::<(), soroban_sdk::Error>(
+                &insurance,
+                &Symbol::new(env, "verify_coverage_on_release"),
+                (
+                    escrow.id,
+                    escrow.mentor.clone(),
+                    escrow.amount,
+                )
+                    .into_val(env),
+            );
+            let ok = match result {
+                Ok(inner_result) => inner_result.is_ok(),
+                Err(_) => false,
+            };
+            if !ok {
+                return false;
+            }
+        }
+
+        // ---- 3. Fee schedule / staking tier lookup ----
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::FeeSchedule)
+        {
+            if let Some(staking) = env
+                .storage()
+                .persistent()
+                .get::<_, Address>(&DataKey::StakingContract)
+            {
+                let result = env.try_invoke_contract::<u32, soroban_sdk::Error>(
+                    &staking,
+                    &Symbol::new(env, "get_tier"),
+                    (escrow.mentor.clone(),).into_val(env),
+                );
+                let ok = match result {
+                    Ok(inner_result) => inner_result.is_ok(),
+                    Err(_) => false,
+                };
+                if !ok {
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
+
+    /// Read the current auto-release failure count for `escrow_id`.
+    fn _get_auto_release_attempts(env: &Env, escrow_id: u64) -> u32 {
+        env.storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::AutoReleaseAttempts(escrow_id))
+            .unwrap_or(0)
+    }
+
+    /// Atomically increment the auto-release failure count for `escrow_id`
+    /// and return the new count.
+    fn _increment_auto_release_attempts(env: &Env, escrow_id: u64) -> u32 {
+        let key = DataKey::AutoReleaseAttempts(escrow_id);
+        let current = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&key)
+            .unwrap_or(0);
+        let new_count = current.saturating_add(1);
+        env.storage().persistent().set(&key, &new_count);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        new_count
     }
 
     /// Open a dispute (called by mentor or learner).
@@ -1232,8 +1511,416 @@ impl EscrowContract {
     }
 
     // -----------------------------------------------------------------------
+    // Escrow Stuck Reporting & Watchlist
+    // -----------------------------------------------------------------------
+
+    /// Report an escrow as "stuck" and add it to the watchlist.
+    ///
+    /// **Permissionless** — anyone may call this.  The call is only accepted
+    /// once:
+    ///
+    /// ```text
+    /// now >= session_end_time + auto_release_delay + GRACE_PERIOD_SECS
+    /// ```
+    ///
+    /// which defaults to `session_end + 72h + 7d`.  An escrow that reaches
+    /// this point has far exceeded every reasonable retry window and
+    /// qualifies for admin intervention via `emergency_release`.
+    ///
+    /// # Events
+    /// Emits `EscrowStuckReported` with the escrow ID, reporter, and the
+    /// timestamp at which the escrow first became eligible for reporting.
+    pub fn report_stuck_escrow(env: Env, reporter: Address, escrow_id: u64) {
+        reporter.require_auth();
+
+        let key = (symbol_short!("ESCROW"), escrow_id);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+
+        let escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("Escrow not found");
+
+        // Verify the escrow is still active (not released/refunded/resolved)
+        if escrow.status != EscrowStatus::Active {
+            panic!("Escrow is not active; cannot be reported as stuck");
+        }
+
+        // Verify grace period has fully elapsed:
+        //   stuck_since = session_end_time + auto_release_delay
+        //   reportable  = stuck_since + GRACE_PERIOD_SECS
+        let stuck_since = escrow
+            .session_end_time
+            .checked_add(escrow.auto_release_delay)
+            .expect("Timestamp overflow");
+        let reportable_after = stuck_since
+            .checked_add(GRACE_PERIOD_SECS)
+            .expect("Timestamp overflow");
+
+        let now = env.ledger().timestamp();
+        if now < reportable_after {
+            panic!(
+                "Stuck-report grace period not elapsed: {} < {}",
+                now, reportable_after
+            );
+        }
+
+        // ---- Append to StuckEscrows watchlist (deduplicated) ----
+        let mut watchlist: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StuckEscrows)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let already_listed = watchlist.iter().any(|id| id == escrow_id);
+        if !already_listed {
+            watchlist.push_back(escrow_id);
+            env.storage()
+                .persistent()
+                .set(&DataKey::StuckEscrows, &watchlist);
+            env.storage().persistent().extend_ttl(
+                &DataKey::StuckEscrows,
+                ESCROW_TTL_THRESHOLD,
+                ESCROW_TTL_BUMP,
+            );
+        }
+
+        // ---- Standardized observability event ----
+        emit_escrow_event(
+            &env,
+            evt_escrow_stuck_reported(&env),
+            EscrowStuckReportedEventData {
+                escrow_id,
+                reporter: reporter.clone(),
+                stuck_since,
+            },
+        );
+        // Legacy ad-hoc event retained for backward compatibility.
+        env.events().publish(
+            (
+                Symbol::new(&env, "Escrow"),
+                Symbol::new(&env, "StuckReported"),
+                escrow_id,
+            ),
+            EscrowStuckReportedEventData {
+                escrow_id,
+                reporter,
+                stuck_since,
+            },
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Emergency Release (Multi-sig Admin Bypass)
+    // -----------------------------------------------------------------------
+
+    /// Set the MultisigAdmin contract address used for emergency release
+    /// approvals.  Admin only.
+    pub fn set_multisig_admin(env: Env, admin: Address, multisig_admin: Address) {
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Admin, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("Caller not authorized");
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MultisigAdmin, &multisig_admin);
+        env.storage().persistent().extend_ttl(
+            &DataKey::MultisigAdmin,
+            ESCROW_TTL_THRESHOLD,
+            ESCROW_TTL_BUMP,
+        );
+    }
+
+    /// Execute an emergency release, bypassing all cross-contract checks
+    /// (reputation, insurance, graduated-fee tier lookup).
+    ///
+    /// This is the **last-resort** recovery path for escrows whose
+    /// `try_auto_release` has been permanently disabled after
+    /// `MAX_FAILED_ATTEMPTS` (3) consecutive failures.
+    ///
+    /// # Requirements
+    /// 1. The escrow must have **at least** `MAX_FAILED_ATTEMPTS` failed
+    ///    auto-release attempts recorded in `DataKey::AutoReleaseAttempts`.
+    /// 2. A valid, threshold-passing proposal from the `MultisigAdmin`
+    ///    contract must be supplied.  The minimum effective threshold is
+    ///    **2-of-3 signers**; the multisig contract's own threshold is
+    ///    used (and must be ≥ 2).
+    /// 3. The proposal's `target` must equal this contract's address,
+    ///    its `function` must be `"emergency_release"`, and its first
+    ///    argument must equal `escrow_id`.
+    ///
+    /// # Bypassed checks
+    /// * Reputation `on_session_released` cross-contract call
+    /// * Insurance `verify_coverage_on_release` cross-contract call
+    /// * Graduated-fee staking-tier lookup (falls back to flat `FeeBps`)
+    ///
+    /// # Fee handling
+    /// Uses the flat `FeeBps` rate (or `DEFAULT_FEE_BPS` if unset) so the
+    /// release cannot be blocked by a fee-schedule arithmetic overflow.
+    pub fn emergency_release(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        reason_hash: BytesN<32>,
+        multisig_action_id: u32,
+    ) {
+        caller.require_auth();
+
+        // ---- 1. Attempt-count gate: must have reached MAX_FAILED_ATTEMPTS ----
+        let attempts = Self::_get_auto_release_attempts(&env, escrow_id);
+        if attempts < MAX_FAILED_ATTEMPTS {
+            panic!(
+                "Emergency release requires {} failed attempts; have {}",
+                MAX_FAILED_ATTEMPTS, attempts
+            );
+        }
+
+        // ---- 2. Multi-sig approval verification ----
+        let multisig_addr: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultisigAdmin)
+            .expect("MultisigAdmin not configured");
+
+        let proposal: ProposalRecordMirror = MultisigClient::new(&env, &multisig_addr)
+            .get_proposal(&multisig_action_id);
+
+        // Validate proposal state
+        if proposal.cancelled {
+            panic!("Multisig proposal has been cancelled");
+        }
+        if proposal.executed {
+            panic!("Multisig proposal has already been executed");
+        }
+        let now = env.ledger().timestamp();
+        if now > proposal.expiry {
+            panic!("Multisig proposal has expired");
+        }
+
+        // Validate target + function match this invocation
+        if proposal.target != env.current_contract_address() {
+            panic!("Multisig proposal target does not match escrow contract");
+        }
+        if proposal.function != Symbol::new(&env, "emergency_release") {
+            panic!("Multisig proposal function is not emergency_release");
+        }
+
+        // Validate first arg is the escrow_id being released.
+        // Val does not implement PartialEq directly, so we compare the
+        // decoded u64 payload (both args are known to be u64 encoded).
+        use soroban_sdk::TryFromVal;
+        let first_arg_matches = proposal
+            .args
+            .get(0)
+            .and_then(|raw_val| {
+                let decoded = u64::try_from_val(&env, &raw_val).ok()?;
+                Some(decoded == escrow_id)
+            })
+            .unwrap_or(false);
+        if !first_arg_matches {
+            panic!("Multisig proposal escrow_id mismatch");
+        }
+
+        // Enforce minimum 2-of-3 threshold: the effective approval count
+        // must be ≥ 2 regardless of what the multisig threshold says.
+        // The multisig contract's own threshold is also checked via
+        // `get_threshold` and must be satisfied.
+        let multisig_threshold: u32 =
+            MultisigClient::new(&env, &multisig_addr).get_threshold();
+        let effective_threshold = multisig_threshold.max(2u32);
+        if proposal.approval_count < effective_threshold {
+            panic!(
+                "Insufficient multi-sig approvals: have {}, need {}",
+                proposal.approval_count, effective_threshold
+            );
+        }
+        if proposal.approval_count < multisig_threshold {
+            panic!(
+                "Multisig threshold not met: have {}, need {}",
+                proposal.approval_count, multisig_threshold
+            );
+        }
+
+        // ---- 3. Load escrow & release (no cross-contract prechecks) ----
+        let key = (symbol_short!("ESCROW"), escrow_id);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("Escrow not found");
+
+        if escrow.status != EscrowStatus::Active {
+            panic!("Escrow not active");
+        }
+
+        // Use flat-fee fallback to avoid any fee-schedule / tier-lookup
+        // failures that might have contributed to the escrow getting
+        // stuck in the first place.
+        Self::_do_release_simple(&env, &mut escrow, &key, &caller);
+
+        // ---- 4. Clean up recovery state & emit audit event ----
+        env.storage()
+            .persistent()
+            .remove(&DataKey::AutoReleaseAttempts(escrow_id));
+        Self::_remove_from_stuck_watchlist(&env, escrow_id);
+
+        let event_payload = EmergencyReleaseExecutedEventData {
+            escrow_id,
+            admin: caller.clone(),
+            reason_hash: reason_hash.clone(),
+        };
+
+        emit_escrow_event(
+            &env,
+            evt_escrow_emergency_release(&env),
+            event_payload.clone(),
+        );
+        env.events().publish(
+            (
+                Symbol::new(&env, "Escrow"),
+                Symbol::new(&env, "EmergencyReleased"),
+                escrow_id,
+            ),
+            event_payload,
+        );
+    }
+
+    /// Simplified release path used by `emergency_release`.  Skips all
+    /// cross-contract integrations and always uses the flat `FeeBps`
+    /// rate so arithmetic cannot trap on schedule/tier lookups.
+    fn _do_release_simple(
+        env: &Env,
+        escrow: &mut Escrow,
+        key: &(Symbol, u64),
+        actor: &Address,
+    ) {
+        let release_amount = escrow.amount;
+
+        let fee_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FeeBps)
+            .unwrap_or(DEFAULT_FEE_BPS);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::FeeBps, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+
+        let platform_fee = release_amount
+            .checked_mul(fee_bps as i128)
+            .expect("Overflow")
+            .checked_div(10_000)
+            .expect("Division error");
+        let net_amount: i128 = release_amount
+            .checked_sub(platform_fee)
+            .expect("Underflow");
+
+        let treasury: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Treasury)
+            .expect("Treasury not found");
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Treasury, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+
+        let token_client = soroban_sdk::token::Client::new(env, &escrow.token_address);
+
+        if platform_fee > 0 {
+            token_client.transfer(&env.current_contract_address(), &treasury, &platform_fee);
+        }
+        token_client.transfer(&env.current_contract_address(), &escrow.mentor, &net_amount);
+
+        escrow.status = transition_status(env, escrow.id, &escrow.status, &EscrowStatus::Released, actor);
+        escrow.platform_fee = escrow.platform_fee.checked_add(platform_fee).expect("Overflow");
+        escrow.net_amount = escrow.net_amount.checked_add(net_amount).expect("Overflow");
+        escrow.amount = 0;
+        env.storage().persistent().set(key, escrow);
+
+        // Standardized release event (same as the normal path so off-chain
+        // indexers don't need a special case for emergency releases).
+        emit_escrow_event(
+            env,
+            evt_escrow_released(env),
+            EscrowReleasedEventData {
+                escrow_id: escrow.id,
+                mentor: escrow.mentor.clone(),
+                amount: release_amount,
+                net_amount,
+                platform_fee,
+                token_address: escrow.token_address.clone(),
+            },
+        );
+        env.events().publish(
+            (Symbol::new(env, "Escrow"), Symbol::new(env, "Released"), escrow.id),
+            EscrowReleasedEventData {
+                escrow_id: escrow.id,
+                mentor: escrow.mentor.clone(),
+                amount: release_amount,
+                net_amount,
+                platform_fee,
+                token_address: escrow.token_address.clone(),
+            },
+        );
+    }
+
+    /// Remove an escrow_id from the stuck watchlist (if present).
+    fn _remove_from_stuck_watchlist(env: &Env, escrow_id: u64) {
+        let watchlist_opt: Option<Vec<u64>> =
+            env.storage().persistent().get(&DataKey::StuckEscrows);
+        if let Some(watchlist) = watchlist_opt {
+            let mut filtered = Vec::new(env);
+            for id in watchlist.iter() {
+                if id != escrow_id {
+                    filtered.push_back(id);
+                }
+            }
+            env.storage()
+                .persistent()
+                .set(&DataKey::StuckEscrows, &filtered);
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Queries
     // -----------------------------------------------------------------------
+
+    /// Return the number of failed auto-release attempts recorded for
+    /// `escrow_id`.  Returns `0` if no attempts have been made.
+    pub fn get_auto_release_attempts(env: Env, escrow_id: u64) -> u32 {
+        Self::_get_auto_release_attempts(&env, escrow_id)
+    }
+
+    /// Return the current stuck-escrows watchlist as a `Vec<u64>` of
+    /// escrow IDs.
+    pub fn get_stuck_escrows(env: Env) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::StuckEscrows)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Return the MultisigAdmin contract address, or `None` if unset.
+    pub fn get_multisig_admin(env: Env) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MultisigAdmin)
+    }
 
     pub fn get_escrow(env: Env, escrow_id: u64) -> Escrow {
         let key = (symbol_short!("ESCROW"), escrow_id);

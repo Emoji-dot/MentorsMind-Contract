@@ -214,6 +214,8 @@ pub fn evt_escrow_resolved(env: &Env)     -> Symbol { Symbol::new(env, "resolved
 pub fn evt_escrow_refunded(env: &Env)     -> Symbol { Symbol::new(env, "refunded") }
 pub fn evt_escrow_partial(env: &Env)      -> Symbol { Symbol::new(env, "partial_rel") }
 pub fn evt_escrow_adm_release(env: &Env)  -> Symbol { Symbol::new(env, "admin_rel") }
+pub fn evt_escrow_stuck_reported(env: &Env) -> Symbol { Symbol::new(env, "stuck_reported") }
+pub fn evt_escrow_emergency_release(env: &Env) -> Symbol { Symbol::new(env, "emergency_release") }
 pub fn evt_token_approved(env: &Env)      -> Symbol { Symbol::new(env, "tok_approved") }
 pub fn evt_fee_distributed(env: &Env)     -> Symbol { Symbol::new(env, "fee_distrib") }
 
