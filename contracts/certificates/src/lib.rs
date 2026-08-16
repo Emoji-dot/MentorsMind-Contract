@@ -249,7 +249,10 @@ mod test {
         let backend = Address::generate(env);
         let learner = Address::generate(env);
         let mentor = Address::generate(env);
-        c.initialize(&admin, &backend);
+        let escrow_contract = Address::generate(env);
+        let reputation_contract = Address::generate(env);
+        let session_registry = Address::generate(env);
+        c.initialize(&admin, &backend, &escrow_contract, &reputation_contract, &session_registry);
         (c, admin, backend, learner, mentor)
     }
 

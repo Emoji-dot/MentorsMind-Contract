@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "contracts/admin_rotation_coordinator",
     "contracts/allowance",
     "contracts/anomaly_detector",
     "contracts/badges",
@@ -13,9 +14,11 @@ members = [
     "contracts/delegation",
     "contracts/dispute_evidence",
     "contracts/endorsements",
+    "escrow",
     "contracts/escrow_factory",
     "contracts/forum",
     "contracts/governance",
+    "contracts/grants",
     "contracts/health_dashboard",
     "contracts/insurance",
     "contracts/interface_registry",
@@ -51,10 +54,12 @@ members = [
     "contracts/subscription",
     "contracts/subscription_analytics",
     "contracts/timelock",
-    "contracts/payment_router",
-    "contracts/dispute_evidence",
-    "contracts/lending_pool",
-    "contracts/credit_score",
+    "contracts/treasury",
+    "contracts/treasury_analytics",
+    "contracts/upgrade_registry",
+    "contracts/velocity_limits",
+    "contracts/verification",
+    "contracts/vesting",
     "tests",
 ]
 

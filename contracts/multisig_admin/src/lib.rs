@@ -828,8 +828,6 @@ fn apply_add_signer(env: &Env, new_signer: Address) -> Result<(), Error> {
     let new_count = count.checked_add(1).expect("Signer count overflow");
     env.storage().instance().set(&DataKey::SignerCount, &new_count);
     env.events().publish(
-        (symbol_short!("multisig"), symbol_short!("sgn_add"), new_signer),
-        count + 1,
         (symbol_short!("multisig"), symbol_short!("sgn_added"), new_signer),
         new_count,
     );
@@ -849,8 +847,6 @@ fn apply_remove_signer(env: &Env, signer: Address) -> Result<(), Error> {
     env.storage().persistent().remove(&DataKey::Signer(signer.clone()));
     env.storage().instance().set(&DataKey::SignerCount, &new_count);
     env.events().publish(
-        (symbol_short!("multisig"), symbol_short!("sgn_rm"), signer),
-        count - 1,
         (symbol_short!("multisig"), symbol_short!("sgn_rmvd"), signer),
         new_count,
     );

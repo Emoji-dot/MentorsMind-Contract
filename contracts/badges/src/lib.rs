@@ -320,6 +320,7 @@ mod test {
     }
 
     #[test]
+    #[should_panic(expected = "nullifier already used")]
     fn test_duplicate_nullifier_prevented() {
         let env = Env::default();
         env.mock_all_auths();
@@ -331,9 +332,7 @@ mod test {
 
         c.mint_badge_anonymous(&admin, &nullifier, &bth);
 
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            c.mint_badge_anonymous(&admin, &nullifier, &bth);
-        }));
-        assert!(result.is_err());
+        // This should panic with "nullifier already used"
+        c.mint_badge_anonymous(&admin, &nullifier, &bth);
     }
 }

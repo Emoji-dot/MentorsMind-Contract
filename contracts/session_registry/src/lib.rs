@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec};
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
 const BACKEND: Symbol = symbol_short!("BACKEND");
@@ -10,10 +10,6 @@ const TTL_BUMP: u32 = 1_000_000;
 const SLOT_SIZE_SECS: u64 = 1_800;
 /// Minimum free time required between consecutive sessions on the same mentor.
 const SCHEDULING_BUFFER_SECS: u64 = 900;
-
-// ── Scheduling constants ──────────────────────────────────────────────────────
-const SLOT_SIZE_SECS: u64 = 1800; // 30-minute slots
-const SCHEDULING_BUFFER_SECS: u64 = 900; // 15-minute buffer between sessions
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 #[contracttype]
@@ -43,17 +39,21 @@ pub struct SessionRecord {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Session(Symbol),
-    /// Deprecated: kept for backward compat, no longer written to
+    /// Deprecated: kept for backward compat, no longer written to.
+    /// Use `MentorSessionAt` / `MentorSessionCount` for all new reads/writes.
     MentorSessions(Address),
-    /// Deprecated: kept for backward compat, no longer written to
+    /// Deprecated: kept for backward compat, no longer written to.
+    /// Use `LearnerSessionAt` / `LearnerSessionCount` for all new reads/writes.
     LearnerSessions(Address),
     MentorSessionCount(Address),
     MentorSessionAt(Address, u32),
     LearnerSessionCount(Address),
     LearnerSessionAt(Address, u32),
+    /// Maps `(mentor_address, time_bucket_index)` → `session_id`.
+    /// A time bucket covers `SLOT_SIZE_SECS` seconds.
+    MentorScheduleSlot(Address, u64),
     SessionOracle,
     SessionMetadata(Symbol),
-    SessionOracle,
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -220,18 +220,17 @@ impl SessionRegistry {
         if to <= from {
             return result;
         }
-        let mut bucket = from / SLOT_SIZE_SECS;
+        let start_bucket = from / SLOT_SIZE_SECS;
         let end_bucket = (to + SLOT_SIZE_SECS - 1) / SLOT_SIZE_SECS;
+        let mut bucket = start_bucket;
         while bucket < end_bucket {
             let slot_start = bucket * SLOT_SIZE_SECS;
             if slot_start >= to {
                 break;
             }
-            if slot_start >= from {
-                let key = DataKey::MentorScheduleSlot(mentor.clone(), bucket);
-                let is_available = !env.storage().persistent().has(&key);
-                result.push_back((slot_start, is_available));
-            }
+            let key = DataKey::MentorScheduleSlot(mentor.clone(), bucket);
+            let is_available = !env.storage().persistent().has(&key);
+            result.push_back((slot_start, is_available));
             bucket = bucket.saturating_add(1);
         }
         result
@@ -272,7 +271,7 @@ impl SessionRegistry {
         if matches!(status, SessionStatus::Cancelled)
             && !matches!(old_status, SessionStatus::Cancelled)
         {
-            Self::release_schedule_slots(
+            Self::release_time_buckets(
                 &env,
                 &record.mentor,
                 record.scheduled_at,
@@ -408,12 +407,12 @@ impl SessionRegistry {
     }
 
     /// Check for scheduling conflicts and buffer enforcement.
-    /// Panics with "SessionConflict" if an overlap is detected.
+    /// Panics with "SessionConflict" if an overlap (including 15-min buffer) is detected.
     fn check_scheduling_conflicts(env: &Env, mentor: &Address, scheduled_at: u64, duration_mins: u32) {
         let session_duration_secs = (duration_mins as u64) * 60;
         let session_end = scheduled_at + session_duration_secs;
 
-        // Check time buckets covered by the session including buffers
+        // Expand check window by buffer on both sides
         let check_start = if scheduled_at > SCHEDULING_BUFFER_SECS {
             scheduled_at - SCHEDULING_BUFFER_SECS
         } else {
@@ -427,7 +426,6 @@ impl SessionRegistry {
         for bucket in start_bucket..end_bucket {
             let slot_key = DataKey::MentorScheduleSlot(mentor.clone(), bucket);
             if env.storage().persistent().has(&slot_key) {
-                let conflicting_id: Symbol = env.storage().persistent().get(&slot_key).unwrap();
                 panic!("SessionConflict");
             }
         }
@@ -477,26 +475,45 @@ impl SessionRegistry {
         env.storage().persistent().get(&key).unwrap_or(Vec::new(&env))
     }
     
+    /// Returns all session IDs where `participant` is either the mentor or the learner.
+    /// Uses the indexed storage (MentorSessionAt / LearnerSessionAt) — not the deprecated Vec keys.
     pub fn get_sessions_by_participant(env: Env, participant: Address) -> soroban_sdk::Vec<Symbol> {
         let mut result = Vec::new(&env);
-        let mentor_sessions: Vec<Symbol> = env
+
+        // Mentor sessions
+        let mentor_count: u32 = env
             .storage()
             .persistent()
-            .get(&DataKey::MentorSessions(participant.clone()))
-            .unwrap_or(Vec::new(&env));
-        for s in mentor_sessions.iter() {
-            result.push_back(s);
-        }
-        let learner_sessions: Vec<Symbol> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::LearnerSessions(participant.clone()))
-            .unwrap_or(Vec::new(&env));
-        for s in learner_sessions.iter() {
-            if !result.contains(&s) {
-                result.push_back(s);
+            .get(&DataKey::MentorSessionCount(participant.clone()))
+            .unwrap_or(0);
+        for i in 0..mentor_count {
+            if let Some(sid) = env
+                .storage()
+                .persistent()
+                .get::<_, Symbol>(&DataKey::MentorSessionAt(participant.clone(), i))
+            {
+                result.push_back(sid);
             }
         }
+
+        // Learner sessions — deduplicate against mentor sessions already collected
+        let learner_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LearnerSessionCount(participant.clone()))
+            .unwrap_or(0);
+        for i in 0..learner_count {
+            if let Some(sid) = env
+                .storage()
+                .persistent()
+                .get::<_, Symbol>(&DataKey::LearnerSessionAt(participant.clone(), i))
+            {
+                if !result.contains(&sid) {
+                    result.push_back(sid);
+                }
+            }
+        }
+
         result
     }
 

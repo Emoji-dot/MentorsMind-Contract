@@ -2,8 +2,9 @@
 
 use shared::events::{emit_staking_event, evt_staking_staked, evt_staking_unstaked};
 use shared::{
-    compute_checksum, push_snapshot_index, ReentrancyGuard, RollbackProposal, SnapshotMeta,
-    StakeRecord, StakedEventData, StateVerificationReport, EMERGENCY_THRESHOLD, MAX_SNAPSHOTS,
+    compute_checksum, push_snapshot_index, require_not_paused, ReentrancyGuard, RollbackProposal,
+    SnapshotMeta, StakeRecord, StakedEventData, StateVerificationReport, EMERGENCY_THRESHOLD,
+    MAX_SNAPSHOTS,
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
@@ -107,6 +108,12 @@ pub enum DataKey {
     PendingAdmin,
     LiquidityProviderRecord(Address),
     LPRewardPool,
+    /// Address of the `reputation` contract used by `compute_tier`.
+    ReputationContract,
+    /// Address of the `session_registry` contract used by `compute_tier`.
+    SessionRegistryContract,
+    /// Configurable tier thresholds (stake / rating / session requirements).
+    TierRequirements,
     // -----------------------------------------------------------------------
     // Disaster-recovery keys
     // -----------------------------------------------------------------------
