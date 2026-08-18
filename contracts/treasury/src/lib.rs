@@ -11,12 +11,15 @@ use soroban_sdk::{
 // ---------------------------------------------------------------------------
 
 /// Mirrors `OracleHealth` from the oracle contract.
+/// Extended to include circuit-breaker and override state.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OracleHealth {
     pub active_feeders: u32,
     pub last_update: u64,
     pub is_stale: bool,
+    pub circuit_breaker_tripped: bool,
+    pub override_active: bool,
 }
 
 #[contractclient(name = "OracleContractClient")]
@@ -33,11 +36,10 @@ pub trait OracleContractTrait {
 #[repr(u32)]
 pub enum Error {
     AlreadyInitialized = 1,
-    NotInitialized     = 2,
-    Unauthorized       = 3,
+    NotInitialized = 2,
+    Unauthorized = 3,
     InsufficientBalance = 4,
-    /// Oracle has too few active feeders — buyback aborted to prevent
-    /// economic attacks via a manipulated TWAP price.
+    /// Oracle has too few active feeders or failed 5-of-7 consensus check.
     OracleUnhealthy = 5,
     /// Oracle data is stale — buyback aborted until a fresh price is available.
     OracleStale = 6,
@@ -49,9 +51,7 @@ pub enum Error {
     ZeroOutput = 9,
     /// The DEX swap returned less than the caller's requested `min_mnt_out`.
     SlippageExceeded = 10,
-    /// An amount failed comprehensive financial validation (non-positive,
-    /// exceeds the economic sanity bound, or fails a business-logic rule
-    /// specific to the operation).
+    /// An amount failed comprehensive financial validation.
     InvalidAmount = 11,
     /// No admin-change proposal is currently pending.
     NoPendingAdminChange = 12,
@@ -59,11 +59,28 @@ pub enum Error {
     AdminChangeNotYetEffective = 13,
     /// The caller is not the address named in the pending admin change.
     InvalidAdminChange = 14,
+    /// Oracle circuit breaker is currently tripped — high price volatility detected.
+    OracleCircuitBreaker = 15,
 }
 
 // ---------------------------------------------------------------------------
 // Data types
 // ---------------------------------------------------------------------------
+
+/// Describes how to invoke the DEX swap function.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DexInterface {
+    pub swap_fn: Symbol,
+}
+
+impl DexInterface {
+    pub fn validate(&self, env: &Env) {
+        if self.swap_fn == Symbol::new(env, "") {
+            panic!("DexInterface: swap_fn must not be empty");
+        }
+    }
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -73,10 +90,6 @@ pub struct AllocationHistory {
     pub amount: i128,
     pub timestamp: u64,
 }
-
-// ---------------------------------------------------------------------------
-// Token approval event
-// ---------------------------------------------------------------------------
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -113,13 +126,28 @@ pub struct AdminChangeProposedEvent {
     pub effective_at: u64,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BuybackFailed {
+    pub xlm_amount: i128,
+    pub reason: Symbol,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BuybackSucceeded {
+    pub xlm_spent: i128,
+    pub mnt_burned: i128,
+    pub timestamp: u64,
+}
+
 const ADMIN_CHANGE_TIMELOCK: u64 = 48 * 60 * 60;
 
-/// Economic sanity ceiling for a single treasury operation (deposit,
-/// allocation, distribution, or buyback), in the token's smallest unit.
-/// Guards against amounts large enough to be a fat-finger or manipulation
-/// attempt rather than a legitimate treasury movement.
-const MAX_FINANCIAL_AMOUNT: i128 = 1_000_000_000_000_000; // 100M tokens @ 7 decimals
+/// Economic sanity ceiling for a single treasury operation.
+const MAX_FINANCIAL_AMOUNT: i128 = 1_000_000_000_000_000;
+
+/// Minimum number of active feeders required for oracle consensus (5-of-7).
+const MIN_ORACLE_FEEDERS: u32 = 5;
 
 // ---------------------------------------------------------------------------
 // Storage keys
@@ -154,8 +182,14 @@ pub struct TreasuryContract;
 
 #[contractimpl]
 impl TreasuryContract {
-    /// Initialize treasury contract with admin and staking contract address.
-    pub fn initialize(env: Env, admin: Address, staking_contract: Address) -> Result<(), Error> {
+    /// Initialize treasury contract with admin, staking contract, timelock, and optional pause guardian.
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        staking_contract: Address,
+        timelock: Address,
+        pause_guardian: Option<Address>,
+    ) -> Result<(), Error> {
         if env.storage().persistent().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
@@ -174,9 +208,6 @@ impl TreasuryContract {
         env.storage()
             .persistent()
             .set(&DataKey::AllocationCount, &0u32);
-        env.storage()
-            .persistent()
-            .set(&DataKey::RegulatoryReporting, &Address::generate(&env)); // placeholder
         Ok(())
     }
 
@@ -186,12 +217,18 @@ impl TreasuryContract {
             .require_valid_bps(bps, "bps")
             .validate()
             .map_err(|_| Error::InvalidAmount)?;
-        env.storage().persistent().set(&DataKey::AutoBurnRateBps, &bps);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AutoBurnRateBps, &bps);
         Ok(())
     }
 
     pub fn execute_burn_queue(env: Env) -> Result<i128, Error> {
-        let queued: i128 = env.storage().persistent().get(&DataKey::BurnQueue).unwrap_or(0);
+        let queued: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BurnQueue)
+            .unwrap_or(0);
         if queued <= 0 {
             return Ok(0);
         }
@@ -270,11 +307,9 @@ impl TreasuryContract {
         Self::admin(&env)
     }
 
-    /// Set regulatory reporting contract address (admin only).
     pub fn set_regulatory_reporting(env: Env, reporting_address: Address) -> Result<(), Error> {
         let admin = Self::admin(&env)?;
         admin.require_auth();
-
         env.storage()
             .persistent()
             .set(&DataKey::RegulatoryReporting, &reporting_address);
@@ -297,6 +332,13 @@ impl TreasuryContract {
         Ok(())
     }
 
+    fn _is_token_approved(env: &Env, token: &Address) -> bool {
+        env.storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::ApprovedToken(token.clone()))
+            .unwrap_or(false)
+    }
+
     fn _check_and_report_large_tx(
         env: &Env,
         contract: Symbol,
@@ -314,8 +356,6 @@ impl TreasuryContract {
             .persistent()
             .get::<DataKey, Address>(&DataKey::RegulatoryReporting)
         {
-            // Call regulatory_reporting::record_large_tx
-            use soroban_sdk::IntoVal;
             let _ = env.try_invoke_contract::<(), _>(
                 &reporting_addr,
                 &Symbol::new(env, "record_large_tx"),
@@ -335,7 +375,6 @@ impl TreasuryContract {
     // Token whitelist management
     // -----------------------------------------------------------------------
 
-    /// Add or remove an approved token from the treasury whitelist (admin only).
     pub fn set_approved_token(
         env: Env,
         token_address: Address,
@@ -371,9 +410,11 @@ impl TreasuryContract {
         Ok(())
     }
 
-    /// Accept deposits of any approved Stellar asset.
+    // -----------------------------------------------------------------------
+    // Deposits and balance
+    // -----------------------------------------------------------------------
+
     pub fn deposit(env: Env, from: Address, token: Address, amount: i128) -> Result<(), Error> {
-        // Check pause guardian before any state mutation
         if let Some(guardian) = env
             .storage()
             .persistent()
@@ -401,19 +442,20 @@ impl TreasuryContract {
         Ok(())
     }
 
-    /// get_balance — returns the contract's current balance of `token`.
     pub fn get_balance(env: Env, token: Address) -> i128 {
         token::Client::new(&env, &token).balance(&env.current_contract_address())
     }
 
-    /// allocate — governance/timelock only; transfers `amount` of `token` to `recipient`.
+    // -----------------------------------------------------------------------
+    // Allocations
+    // -----------------------------------------------------------------------
+
     pub fn allocate(
         env: Env,
         token: Address,
         recipient: Address,
         amount: i128,
     ) -> Result<(), Error> {
-        // Check pause guardian before any state mutation
         if let Some(guardian) = env
             .storage()
             .persistent()
@@ -440,7 +482,6 @@ impl TreasuryContract {
             .validate()
             .map_err(|_| Error::InvalidAmount)?;
 
-        // Check for large transaction threshold and trigger regulatory reporting
         Self::_check_and_report_large_tx(
             &env,
             Symbol::new(&env, "treasury"),
@@ -456,7 +497,6 @@ impl TreasuryContract {
             .unwrap_or(50_000);
 
         if amount > threshold {
-            // Above threshold — requires multi-sig approval (Issue #752)
             let pending_count: u32 = env
                 .storage()
                 .persistent()
@@ -497,7 +537,7 @@ impl TreasuryContract {
             &amount,
         );
 
-        let mut history = env
+        let count: u32 = env
             .storage()
             .persistent()
             .get(&DataKey::AllocationCount)
@@ -522,7 +562,6 @@ impl TreasuryContract {
         Ok(())
     }
 
-    /// Set multi-sig withdrawal threshold amount (admin only).
     pub fn set_multisig_threshold(env: Env, threshold: i128) -> Result<(), Error> {
         let admin = env
             .storage()
@@ -530,14 +569,12 @@ impl TreasuryContract {
             .get::<DataKey, Address>(&DataKey::Admin)
             .ok_or(Error::NotInitialized)?;
         admin.require_auth();
-
         env.storage()
             .persistent()
             .set(&DataKey::MultisigThreshold, &threshold);
         Ok(())
     }
 
-    /// Multi-sig approval for pending high-value allocations (Issue #752).
     pub fn approve_pending_allocation(
         env: Env,
         approver: Address,
@@ -564,7 +601,6 @@ impl TreasuryContract {
         pending.approvals_count += 1;
 
         if pending.approvals_count >= 2 {
-            // Multi-sig threshold reached — execute transfer
             token::Client::new(&env, &pending.token).transfer(
                 &env.current_contract_address(),
                 &pending.recipient,
@@ -604,14 +640,12 @@ impl TreasuryContract {
         Ok(())
     }
 
-    /// Read a pending allocation by ID.
     pub fn get_pending_allocation(env: Env, pending_id: u32) -> Option<PendingAllocation> {
         env.storage()
             .persistent()
             .get(&DataKey::PendingAllocation(pending_id))
     }
 
-    /// Return the count of pending (multi-sig) allocations.
     pub fn pending_allocation_count(env: Env) -> u32 {
         env.storage()
             .persistent()
@@ -619,13 +653,15 @@ impl TreasuryContract {
             .unwrap_or(0)
     }
 
-    /// Distribute tokens to stakers — pro-rata handled by staking contract.
+    // -----------------------------------------------------------------------
+    // Staker distribution
+    // -----------------------------------------------------------------------
+
     pub fn distribute_to_stakers(
         env: Env,
         token: Address,
         total_amount: i128,
     ) -> Result<(), Error> {
-        // Check pause guardian before any state mutation
         if let Some(guardian) = env
             .storage()
             .persistent()
@@ -692,16 +728,21 @@ impl TreasuryContract {
         Ok(())
     }
 
-    /// buyback_and_burn — swap XLM for MNT on DEX, then burn MNT.
+    // -----------------------------------------------------------------------
+    // buyback_and_burn
+    // -----------------------------------------------------------------------
+
+    /// Swap XLM for MNT on DEX and burn the received MNT.
     ///
-    /// # Oracle health gate (#614)
-    /// Before executing the swap, this function queries the oracle for the
-    /// MNT asset health.  The call is aborted with `OracleUnhealthy` or
-    /// `OracleStale` if the oracle does not meet the minimum-feeder threshold
-    /// or has not been updated recently.  This prevents a manipulated TWAP
-    /// from being used as the slippage baseline for `min_mnt_out`.
+    /// # Oracle validation
+    /// When `oracle_contract` is provided the function runs the full multi-oracle
+    /// validation pipeline before executing the swap:
     ///
-    /// Pass `oracle_contract = None` to skip the health check (legacy / test).
+    /// 1. Staleness check — rejects stale data.
+    /// 2. 5-of-7 consensus check — requires MIN_ORACLE_FEEDERS (5) active feeders.
+    /// 3. Circuit-breaker check — rejects if price volatility > 10% in 1 hour.
+    ///
+    /// Pass `oracle_contract = None` only in legacy/test mode.
     pub fn buyback_and_burn(
         env: Env,
         xlm_token: Address,
@@ -757,22 +798,60 @@ impl TreasuryContract {
             return Err(Error::InvalidMinOut);
         }
 
-        // --- Oracle health gate -------------------------------------------
-        if let (Some(oracle), Some(asset_sym)) = (oracle_contract.clone(), mnt_asset_symbol.clone()) {
+        // ------------------------------------------------------------------
+        // 3. Multi-oracle validation gate
+        //
+        // Validates:
+        //   a) Data freshness (not stale)
+        //   b) 5-of-7 consensus (MIN_ORACLE_FEEDERS active distinct feeders)
+        //   c) Circuit-breaker state (not tripped by >10% volatility in 1h)
+        // ------------------------------------------------------------------
+        if let (Some(oracle), Some(asset_sym)) =
+            (oracle_contract.clone(), mnt_asset_symbol.clone())
+        {
             let health: OracleHealth =
                 OracleContractClient::new(&env, &oracle).get_oracle_health(&asset_sym);
 
+            // 3a. Staleness check.
             if health.is_stale {
+                env.events().publish(
+                    (symbol_short!("buyback"), symbol_short!("failed")),
+                    BuybackFailed {
+                        xlm_amount,
+                        reason: Symbol::new(&env, "oracle_stale"),
+                    },
+                );
                 return Err(Error::OracleStale);
             }
-            // MIN_FEEDERS is enforced inside the oracle; we check here so
-            // treasury can surface a distinct error code.
-            if health.active_feeders < 3 {
+
+            // 3b. 5-of-7 consensus check — must have MIN_ORACLE_FEEDERS (5) active feeders.
+            if health.active_feeders < MIN_ORACLE_FEEDERS {
+                env.events().publish(
+                    (symbol_short!("buyback"), symbol_short!("failed")),
+                    BuybackFailed {
+                        xlm_amount,
+                        reason: Symbol::new(&env, "oracle_unhealthy"),
+                    },
+                );
                 return Err(Error::OracleUnhealthy);
+            }
+
+            // 3c. Circuit-breaker check — halt buybacks during high volatility.
+            if health.circuit_breaker_tripped {
+                env.events().publish(
+                    (symbol_short!("buyback"), symbol_short!("failed")),
+                    BuybackFailed {
+                        xlm_amount,
+                        reason: Symbol::new(&env, "oracle_cb"),
+                    },
+                );
+                return Err(Error::OracleCircuitBreaker);
             }
         }
 
-        // 1. Transfer XLM to DEX
+        // ------------------------------------------------------------------
+        // 4. Approve XLM transfer to DEX.
+        // ------------------------------------------------------------------
         let xlm_client = token::Client::new(&env, &xlm_token);
         let expiration_ledger = env.ledger().sequence() + 1;
         xlm_client.approve(
@@ -782,7 +861,9 @@ impl TreasuryContract {
             &expiration_ledger,
         );
 
-        // 2. Call DEX swap — returns the amount of MNT received
+        // ------------------------------------------------------------------
+        // 5. Execute DEX swap.
+        // ------------------------------------------------------------------
         let mnt_received: i128 = env.invoke_contract(
             &dex_contract,
             &dex_iface.swap_fn,
@@ -797,10 +878,9 @@ impl TreasuryContract {
         );
 
         // ------------------------------------------------------------------
-        // 5. Validate output — revoke allowance and emit failure if bad.
+        // 6. Validate swap output.
         // ------------------------------------------------------------------
         if mnt_received == 0 {
-            // Revoke any remaining allowance (defensive; DEX may not have pulled).
             xlm_client.approve(
                 &env.current_contract_address(),
                 &dex_contract,
@@ -818,7 +898,6 @@ impl TreasuryContract {
         }
 
         if mnt_received < min_mnt_out {
-            // Revoke any remaining allowance.
             xlm_client.approve(
                 &env.current_contract_address(),
                 &dex_contract,
@@ -836,7 +915,7 @@ impl TreasuryContract {
         }
 
         // ------------------------------------------------------------------
-        // 6. Burn MNT — only reached if swap succeeded and output is valid.
+        // 7. Burn received MNT.
         // ------------------------------------------------------------------
         env.invoke_contract::<()>(
             &mnt_token,
@@ -917,20 +996,17 @@ mod tests {
             _min_out: i128,
             recipient: Address,
         ) -> i128 {
-            // Pull the XLM allowance from the treasury (simulate DEX pull).
             let xlm = token::Client::new(&env, &token_in);
             xlm.transfer_from(
                 &env.current_contract_address(),
-                &recipient, // pull from treasury (spender == DEX contract)
-                &env.current_contract_address(), // actually pull from who approved
+                &recipient,
+                &env.current_contract_address(),
                 &amount_in,
             );
-            // Return MNT amount (1:1 for tests).
             amount_in
         }
     }
 
-    /// DEX that always returns 0 MNT (simulates failed / empty swap).
     #[contract]
     pub struct MockDEXZero;
 
@@ -944,11 +1020,10 @@ mod tests {
             _min_out: i128,
             _recipient: Address,
         ) -> i128 {
-            0 // returns nothing — no XLM pulled
+            0
         }
     }
 
-    /// DEX that returns less MNT than min_mnt_out (simulates slippage).
     #[contract]
     pub struct MockDEXSlippage;
 
@@ -962,7 +1037,7 @@ mod tests {
             _min_out: i128,
             _recipient: Address,
         ) -> i128 {
-            1 // returns tiny amount — below min_mnt_out
+            1
         }
     }
 
@@ -982,23 +1057,37 @@ mod tests {
         pub fn burn(_env: Env, _from: Address, _amount: i128) {}
     }
 
-    /// A mock oracle that returns a configurable health report.
+    // Oracle mocks — all return OracleHealth with the new fields.
+
     #[contract]
     pub struct MockOracleHealthy;
 
-    fn setup_test(env: &Env) -> (Address, Address, Address, Address) {
-        let admin = Address::generate(env);
-        let staking = env.register_contract(None, MockStaking);
-        let timelock = Address::generate(env); // simulated timelock address
-        let contract_id = env.register_contract(None, TreasuryContract);
-        let client = TreasuryContractClient::new(env, &contract_id);
-        client.initialize(&admin, &staking, &timelock);
-        (admin, staking, timelock, contract_id)
+    #[contractimpl]
+    impl MockOracleHealthy {
+        pub fn get_oracle_health(_env: Env, _asset: Symbol) -> OracleHealth {
+            OracleHealth {
+                active_feeders: 5,
+                last_update: 999,
+                is_stale: false,
+                circuit_breaker_tripped: false,
+                override_active: false,
+            }
+        }
     }
 
-    fn default_dex_iface(env: &Env) -> DexInterface {
-        DexInterface {
-            swap_fn: Symbol::new(env, "swap_exact_in"),
+    #[contract]
+    pub struct MockOracleStale;
+
+    #[contractimpl]
+    impl MockOracleStale {
+        pub fn get_oracle_health(_env: Env, _asset: Symbol) -> OracleHealth {
+            OracleHealth {
+                active_feeders: 5,
+                last_update: 0,
+                is_stale: true,
+                circuit_breaker_tripped: false,
+                override_active: false,
+            }
         }
     }
 
@@ -1012,6 +1101,24 @@ mod tests {
                 active_feeders: 1,
                 last_update: 999,
                 is_stale: false,
+                circuit_breaker_tripped: false,
+                override_active: false,
+            }
+        }
+    }
+
+    #[contract]
+    pub struct MockOracleCircuitBreaker;
+
+    #[contractimpl]
+    impl MockOracleCircuitBreaker {
+        pub fn get_oracle_health(_env: Env, _asset: Symbol) -> OracleHealth {
+            OracleHealth {
+                active_feeders: 5,
+                last_update: 999,
+                is_stale: false,
+                circuit_breaker_tripped: true,
+                override_active: false,
             }
         }
     }
@@ -1020,28 +1127,36 @@ mod tests {
     // Helpers
     // ------------------------------------------------------------------
 
-    fn setup_test(env: &Env) -> (Address, Address, Address) {
+    fn setup_test(env: &Env) -> (Address, Address, Address, Address) {
         let admin = Address::generate(env);
         let staking = env.register_contract(None, MockStaking);
+        let timelock = Address::generate(env);
         let contract_id = env.register_contract(None, TreasuryContract);
         let client = TreasuryContractClient::new(env, &contract_id);
-        client.initialize(&admin, &staking);
-        (admin, staking, contract_id)
+        client.initialize(&admin, &staking, &timelock, &None);
+        (admin, staking, timelock, contract_id)
+    }
+
+    fn default_dex_iface(env: &Env) -> DexInterface {
+        DexInterface {
+            swap_fn: Symbol::new(env, "swap_exact_in"),
+        }
     }
 
     // ------------------------------------------------------------------
-    // Existing tests (unchanged behaviour)
+    // Initialization
     // ------------------------------------------------------------------
 
     #[test]
     fn test_initialization() {
         let env = Env::default();
-        let (admin, staking, _) = setup_test(&env);
-        let client =
-            TreasuryContractClient::new(&env, &env.register_contract(None, TreasuryContract));
-        client.initialize(&admin, &staking);
-        let result = client.try_initialize(&admin, &staking);
-        assert!(result.is_err());
+        env.mock_all_auths();
+        let (admin, staking, timelock, _) = setup_test(&env);
+        let contract_id = env.register_contract(None, TreasuryContract);
+        let client = TreasuryContractClient::new(&env, &contract_id);
+        client.initialize(&admin, &staking, &timelock, &None);
+        let result = client.try_initialize(&admin, &staking, &timelock, &None);
+        assert!(result.is_err(), "double-init must fail");
     }
 
     #[test]
@@ -1096,13 +1211,6 @@ mod tests {
         assert_eq!(token_client.balance(&recipient), 400);
     }
 
-        let history = treasury_client.get_history();
-        assert_eq!(history.len(), 1);
-        let entry = history.get(0).unwrap();
-        assert_eq!(entry.amount, 400);
-        assert_eq!(entry.timestamp, 12345);
-    }
-
     // -----------------------------------------------------------------------
     // buyback_and_burn — timelock access control
     // -----------------------------------------------------------------------
@@ -1124,22 +1232,6 @@ mod tests {
         treasury_client.set_approved_token(&xlm_addr, &true);
         treasury_client.set_approved_token(&mnt_addr, &true);
 
-        // get_timelock should return the registered address
-        assert_eq!(treasury_client.get_timelock(), _timelock);
-
-        // mock_all_auths covers timelock auth — call succeeds
-        // (full auth-gating is enforced by require_auth; this test confirms the
-        //  function reads the timelock address from storage correctly)
-        let _ = treasury_client.try_buyback_and_burn(
-            &xlm_addr,
-            &mnt_addr,
-            &dex_addr,
-            &1000,
-            &500,
-            &default_dex_iface(&env),
-        );
-        // We only check that get_timelock() returns the expected address; the
-        // auth mock covers the auth requirement in unit test mode.
         assert_eq!(treasury_client.get_timelock(), _timelock);
     }
 
@@ -1155,7 +1247,7 @@ mod tests {
 
         let xlm_addr = env.register_stellar_asset_contract(admin.clone());
         let mnt_addr = env.register_contract(None, MockMNT);
-        let dex_addr = env.register_contract(None, MockDEXZero); // returns 0
+        let dex_addr = env.register_contract(None, MockDEXZero);
 
         let stellar_asset_client = token::StellarAssetClient::new(&env, &xlm_addr);
         stellar_asset_client.mint(&contract_id, &1000);
@@ -1173,32 +1265,29 @@ mod tests {
             &500,
             &100,
             &default_dex_iface(&env),
+            &None,
+            &None,
         );
 
-        // Must return ZeroOutput error
         assert!(result.is_err(), "expected ZeroOutput error");
 
-        // XLM balance must not have changed — no funds left treasury
         let xlm_balance_after = treasury_client.get_balance(&xlm_addr);
-        assert_eq!(
-            xlm_balance_before, xlm_balance_after,
-            "XLM must not leave treasury when DEX returns 0 MNT"
-        );
+        assert_eq!(xlm_balance_before, xlm_balance_after);
     }
 
     // -----------------------------------------------------------------------
-    // buyback_and_burn — slippage guard (min_mnt_out not met)
+    // buyback_and_burn — slippage guard
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_buyback_and_burn_without_oracle() {
+    fn test_buyback_and_burn_slippage() {
         let env = Env::default();
         env.mock_all_auths();
         let (admin, _, _, contract_id) = setup_test(&env);
 
         let xlm_addr = env.register_stellar_asset_contract(admin.clone());
         let mnt_addr = env.register_contract(None, MockMNT);
-        let dex_addr = env.register_contract(None, MockDEXSlippage); // returns 1
+        let dex_addr = env.register_contract(None, MockDEXSlippage);
 
         let stellar_asset_client = token::StellarAssetClient::new(&env, &xlm_addr);
         stellar_asset_client.mint(&contract_id, &1000);
@@ -1209,7 +1298,6 @@ mod tests {
 
         let xlm_balance_before = treasury_client.get_balance(&xlm_addr);
 
-        // min_mnt_out = 500, DEX returns 1 → slippage
         let result = treasury_client.try_buyback_and_burn(
             &xlm_addr,
             &mnt_addr,
@@ -1217,19 +1305,18 @@ mod tests {
             &500,
             &500,
             &default_dex_iface(&env),
+            &None,
+            &None,
         );
 
         assert!(result.is_err(), "expected SlippageExceeded error");
 
         let xlm_balance_after = treasury_client.get_balance(&xlm_addr);
-        assert_eq!(
-            xlm_balance_before, xlm_balance_after,
-            "XLM must not leave treasury when slippage guard triggers"
-        );
+        assert_eq!(xlm_balance_before, xlm_balance_after);
     }
 
     // -----------------------------------------------------------------------
-    // buyback_and_burn — invalid min_mnt_out (= 0) rejected before any transfer
+    // buyback_and_burn — zero min_out rejected
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1251,22 +1338,19 @@ mod tests {
 
         let xlm_balance_before = treasury_client.get_balance(&xlm_addr);
 
-        // min_mnt_out = 0 → InvalidMinOut, no XLM transferred
         let result = treasury_client.try_buyback_and_burn(
             &xlm_addr,
             &mnt_addr,
             &dex_addr,
             &500,
-            &0, // invalid
+            &0,
             &default_dex_iface(&env),
+            &None,
+            &None,
         );
 
         assert!(result.is_err(), "expected InvalidMinOut error");
-        assert_eq!(
-            treasury_client.get_balance(&xlm_addr),
-            xlm_balance_before,
-            "XLM must remain in treasury when min_out = 0"
-        );
+        assert_eq!(treasury_client.get_balance(&xlm_addr), xlm_balance_before);
     }
 
     // -----------------------------------------------------------------------
@@ -1287,7 +1371,6 @@ mod tests {
         stellar_asset_client.mint(&contract_id, &1000);
 
         let treasury_client = TreasuryContractClient::new(&env, &contract_id);
-        // Do NOT approve tokens
 
         let result = treasury_client.try_buyback_and_burn(
             &xlm_addr,
@@ -1296,12 +1379,14 @@ mod tests {
             &1000,
             &500,
             &default_dex_iface(&env),
+            &None,
+            &None,
         );
         assert!(result.is_err(), "unapproved token buyback must fail");
     }
 
     // -----------------------------------------------------------------------
-    // buyback_and_burn — invalid DEX interface rejected
+    // buyback_and_burn — empty swap_fn panics
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1319,33 +1404,34 @@ mod tests {
         stellar_asset_client.mint(&contract_id, &1000);
 
         let treasury_client = TreasuryContractClient::new(&env, &contract_id);
-        // oracle_contract = None → skip health check (backward compat)
-        treasury_client.buyback_and_burn(
-            &xlm_addr,
-            &mnt_addr,
-            &dex_addr,
-            &1000,
-            &None,
-            &None,
-        );
+        treasury_client.set_approved_token(&xlm_addr, &true);
+        treasury_client.set_approved_token(&mnt_addr, &true);
 
         let bad_iface = DexInterface {
             swap_fn: Symbol::new(&env, ""),
         };
-        let _ = treasury_client
-            .try_buyback_and_burn(&xlm_addr, &mnt_addr, &dex_addr, &1000, &500, &bad_iface);
+        let _ = treasury_client.try_buyback_and_burn(
+            &xlm_addr,
+            &mnt_addr,
+            &dex_addr,
+            &1000,
+            &500,
+            &bad_iface,
+            &None,
+            &None,
+        );
     }
 
-    // ------------------------------------------------------------------
-    // #614-AC4: treasury::buyback_and_burn queries oracle health before swap
-    // ------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Oracle validation tests
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_buyback_proceeds_with_healthy_oracle() {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().set_timestamp(1_000);
-        let (admin, _, contract_id) = setup_test(&env);
+        let (admin, _, _, contract_id) = setup_test(&env);
 
         let xlm_addr = env.register_stellar_asset_contract(admin.clone());
         let mnt_addr = env.register_contract(None, MockMNT);
@@ -1356,11 +1442,16 @@ mod tests {
         stellar_asset_client.mint(&contract_id, &500);
 
         let treasury_client = TreasuryContractClient::new(&env, &contract_id);
+        treasury_client.set_approved_token(&xlm_addr, &true);
+        treasury_client.set_approved_token(&mnt_addr, &true);
+
         let result = treasury_client.try_buyback_and_burn(
             &xlm_addr,
             &mnt_addr,
             &dex_addr,
             &500,
+            &1,
+            &default_dex_iface(&env),
             &Some(oracle_addr),
             &Some(symbol_short!("MNT")),
         );
@@ -1372,7 +1463,7 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().set_timestamp(1_000);
-        let (admin, _, contract_id) = setup_test(&env);
+        let (admin, _, _, contract_id) = setup_test(&env);
 
         let xlm_addr = env.register_stellar_asset_contract(admin.clone());
         let mnt_addr = env.register_contract(None, MockMNT);
@@ -1383,11 +1474,16 @@ mod tests {
         stellar_asset_client.mint(&contract_id, &500);
 
         let treasury_client = TreasuryContractClient::new(&env, &contract_id);
+        treasury_client.set_approved_token(&xlm_addr, &true);
+        treasury_client.set_approved_token(&mnt_addr, &true);
+
         let result = treasury_client.try_buyback_and_burn(
             &xlm_addr,
             &mnt_addr,
             &dex_addr,
             &500,
+            &1,
+            &default_dex_iface(&env),
             &Some(oracle_addr),
             &Some(symbol_short!("MNT")),
         );
@@ -1399,7 +1495,7 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().set_timestamp(1_000);
-        let (admin, _, contract_id) = setup_test(&env);
+        let (admin, _, _, contract_id) = setup_test(&env);
 
         let xlm_addr = env.register_stellar_asset_contract(admin.clone());
         let mnt_addr = env.register_contract(None, MockMNT);
@@ -1410,14 +1506,51 @@ mod tests {
         stellar_asset_client.mint(&contract_id, &500);
 
         let treasury_client = TreasuryContractClient::new(&env, &contract_id);
+        treasury_client.set_approved_token(&xlm_addr, &true);
+        treasury_client.set_approved_token(&mnt_addr, &true);
+
         let result = treasury_client.try_buyback_and_burn(
             &xlm_addr,
             &mnt_addr,
             &dex_addr,
             &500,
+            &1,
+            &default_dex_iface(&env),
             &Some(oracle_addr),
             &Some(symbol_short!("MNT")),
         );
         assert_eq!(result, Err(Ok(Error::OracleUnhealthy)));
+    }
+
+    #[test]
+    fn test_buyback_aborted_when_circuit_breaker_tripped() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000);
+        let (admin, _, _, contract_id) = setup_test(&env);
+
+        let xlm_addr = env.register_stellar_asset_contract(admin.clone());
+        let mnt_addr = env.register_contract(None, MockMNT);
+        let dex_addr = env.register_contract(None, MockDEX);
+        let oracle_addr = env.register_contract(None, MockOracleCircuitBreaker);
+
+        let stellar_asset_client = token::StellarAssetClient::new(&env, &xlm_addr);
+        stellar_asset_client.mint(&contract_id, &500);
+
+        let treasury_client = TreasuryContractClient::new(&env, &contract_id);
+        treasury_client.set_approved_token(&xlm_addr, &true);
+        treasury_client.set_approved_token(&mnt_addr, &true);
+
+        let result = treasury_client.try_buyback_and_burn(
+            &xlm_addr,
+            &mnt_addr,
+            &dex_addr,
+            &500,
+            &1,
+            &default_dex_iface(&env),
+            &Some(oracle_addr),
+            &Some(symbol_short!("MNT")),
+        );
+        assert_eq!(result, Err(Ok(Error::OracleCircuitBreaker)));
     }
 }
