@@ -1,10 +1,14 @@
 #![no_std]
 
+use shared::Validator;
 use soroban_sdk::{
     contract, contractclient, contractimpl, contracttype, token, Address, Env, Symbol,
 };
 
 const MIN_COLLATERAL_RATIO_BPS: i128 = 15_000; // 150%
+/// Economic sanity ceiling for a single collateral/borrow/repay amount, in
+/// the token's smallest unit.
+const MAX_FINANCIAL_AMOUNT: i128 = 1_000_000_000_000_000; // 100M tokens @ 7 decimals
 const LIQUIDATION_THRESHOLD_BPS: i128 = 12_000; // 120%
 const LIQUIDATOR_BONUS_BPS: i128 = 500; // 5%
 const BPS_DENOMINATOR: i128 = 10_000;
@@ -88,9 +92,12 @@ impl CollateralLoanContract {
         Self::require_initialized(&env);
         borrower.require_auth();
 
-        if collateral_amount <= 0 || borrow_amount <= 0 {
-            panic!("invalid amount");
-        }
+        Validator::new(&env)
+            .require_positive(collateral_amount, "collateral_amount")
+            .require_max(collateral_amount, MAX_FINANCIAL_AMOUNT, "collateral_amount")
+            .require_positive(borrow_amount, "borrow_amount")
+            .require_max(borrow_amount, MAX_FINANCIAL_AMOUNT, "borrow_amount")
+            .validate_or_panic();
 
         let loan_key = DataKey::Loan(borrower.clone());
         if env.storage().persistent().has(&loan_key) {
@@ -140,9 +147,10 @@ impl CollateralLoanContract {
         Self::require_initialized(&env);
         borrower.require_auth();
 
-        if amount <= 0 {
-            panic!("invalid amount");
-        }
+        Validator::new(&env)
+            .require_positive(amount, "amount")
+            .require_max(amount, MAX_FINANCIAL_AMOUNT, "amount")
+            .validate_or_panic();
 
         let loan_key = DataKey::Loan(borrower.clone());
         let mut loan: Loan = env
@@ -200,9 +208,10 @@ impl CollateralLoanContract {
         Self::require_initialized(&env);
         borrower.require_auth();
 
-        if amount <= 0 {
-            panic!("invalid amount");
-        }
+        Validator::new(&env)
+            .require_positive(amount, "amount")
+            .require_max(amount, MAX_FINANCIAL_AMOUNT, "amount")
+            .validate_or_panic();
 
         let loan_key = DataKey::Loan(borrower.clone());
         let mut loan: Loan = env
@@ -215,7 +224,7 @@ impl CollateralLoanContract {
         let mnt_client = token::Client::new(&env, &mnt);
         mnt_client.transfer(&borrower, &env.current_contract_address(), &amount);
 
-        loan.collateral_amount += amount;
+        loan.collateral_amount = loan.collateral_amount.checked_add(amount).expect("overflow");
         env.storage().persistent().set(&loan_key, &loan);
 
         env.events().publish(

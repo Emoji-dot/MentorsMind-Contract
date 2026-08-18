@@ -1,6 +1,6 @@
 #![no_std]
 
-use shared::{require_not_paused, ReentrancyGuard};
+use shared::{require_not_paused, ReentrancyGuard, Validator};
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token,
     Address, Env, IntoVal, Symbol, Vec,
@@ -41,6 +41,24 @@ pub enum Error {
     OracleUnhealthy = 5,
     /// Oracle data is stale — buyback aborted until a fresh price is available.
     OracleStale = 6,
+    /// Requested token is not on the approved whitelist for this operation.
+    TokenNotApproved = 7,
+    /// `min_mnt_out` passed to `buyback_and_burn` was not strictly positive.
+    InvalidMinOut = 8,
+    /// The DEX swap returned zero output tokens.
+    ZeroOutput = 9,
+    /// The DEX swap returned less than the caller's requested `min_mnt_out`.
+    SlippageExceeded = 10,
+    /// An amount failed comprehensive financial validation (non-positive,
+    /// exceeds the economic sanity bound, or fails a business-logic rule
+    /// specific to the operation).
+    InvalidAmount = 11,
+    /// No admin-change proposal is currently pending.
+    NoPendingAdminChange = 12,
+    /// The admin-change timelock has not yet elapsed.
+    AdminChangeNotYetEffective = 13,
+    /// The caller is not the address named in the pending admin change.
+    InvalidAdminChange = 14,
 }
 
 // ---------------------------------------------------------------------------
@@ -96,6 +114,12 @@ pub struct AdminChangeProposedEvent {
 }
 
 const ADMIN_CHANGE_TIMELOCK: u64 = 48 * 60 * 60;
+
+/// Economic sanity ceiling for a single treasury operation (deposit,
+/// allocation, distribution, or buyback), in the token's smallest unit.
+/// Guards against amounts large enough to be a fat-finger or manipulation
+/// attempt rather than a legitimate treasury movement.
+const MAX_FINANCIAL_AMOUNT: i128 = 1_000_000_000_000_000; // 100M tokens @ 7 decimals
 
 // ---------------------------------------------------------------------------
 // Storage keys
@@ -158,9 +182,10 @@ impl TreasuryContract {
 
     pub fn set_auto_burn_rate(env: Env, admin: Address, bps: u32) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
-        if bps > 10_000 {
-            return Err(Error::Unauthorized);
-        }
+        Validator::new(&env)
+            .require_valid_bps(bps, "bps")
+            .validate()
+            .map_err(|_| Error::InvalidAmount)?;
         env.storage().persistent().set(&DataKey::AutoBurnRateBps, &bps);
         Ok(())
     }
@@ -358,6 +383,11 @@ impl TreasuryContract {
         }
 
         from.require_auth();
+        Validator::new(&env)
+            .require_positive(amount, "amount")
+            .require_max(amount, MAX_FINANCIAL_AMOUNT, "amount")
+            .validate()
+            .map_err(|_| Error::InvalidAmount)?;
         if !Self::_is_token_approved(&env, &token) {
             panic!("Token not approved");
         }
@@ -403,6 +433,12 @@ impl TreasuryContract {
         if !Self::_is_token_approved(&env, &token) {
             return Err(Error::TokenNotApproved);
         }
+
+        Validator::new(&env)
+            .require_positive(amount, "amount")
+            .require_max(amount, MAX_FINANCIAL_AMOUNT, "amount")
+            .validate()
+            .map_err(|_| Error::InvalidAmount)?;
 
         // Check for large transaction threshold and trigger regulatory reporting
         Self::_check_and_report_large_tx(
@@ -610,6 +646,12 @@ impl TreasuryContract {
             return Err(Error::TokenNotApproved);
         }
 
+        Validator::new(&env)
+            .require_positive(total_amount, "total_amount")
+            .require_max(total_amount, MAX_FINANCIAL_AMOUNT, "total_amount")
+            .validate()
+            .map_err(|_| Error::InvalidAmount)?;
+
         let staking_contract: Address = env
             .storage()
             .persistent()
@@ -668,6 +710,8 @@ impl TreasuryContract {
         xlm_amount: i128,
         min_mnt_out: i128,
         dex_iface: DexInterface,
+        oracle_contract: Option<Address>,
+        mnt_asset_symbol: Option<Symbol>,
     ) -> Result<(), Error> {
         let _guard = ReentrancyGuard::enter(&env, Symbol::new(&env, "buyback"));
 
@@ -685,6 +729,22 @@ impl TreasuryContract {
         // 2. Pre-flight validation — no state changes yet.
         // ------------------------------------------------------------------
         dex_iface.validate(&env);
+
+        if Validator::new(&env)
+            .require_positive(xlm_amount, "xlm_amount")
+            .require_max(xlm_amount, MAX_FINANCIAL_AMOUNT, "xlm_amount")
+            .validate()
+            .is_err()
+        {
+            env.events().publish(
+                (symbol_short!("buyback"), symbol_short!("failed")),
+                BuybackFailed {
+                    xlm_amount,
+                    reason: Symbol::new(&env, "invalid_xlm_amount"),
+                },
+            );
+            return Err(Error::InvalidAmount);
+        }
 
         if min_mnt_out <= 0 {
             env.events().publish(

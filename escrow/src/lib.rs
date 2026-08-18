@@ -8,7 +8,7 @@ use shared::events::{
 use shared::{
     compute_checksum, push_snapshot_index, EscrowRecord, EscrowStatus, RollbackProposal,
     SnapshotMeta, StateVerificationReport, EMERGENCY_SIGNERS, EMERGENCY_THRESHOLD, MAX_SNAPSHOTS,
-    StateMachine, EscrowTransitionLog, GasEstimate,
+    StateMachine, EscrowTransitionLog, GasEstimate, Validator,
 };
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, Bytes, Env, Symbol, Vec,
@@ -299,6 +299,13 @@ const ORACLE_MAX_AGE: Symbol = symbol_short!("OR_AGE");
 const MENTOR_ESCROWS: Symbol = symbol_short!("MNT_ESC");
 const LEARNER_ESCROWS: Symbol = symbol_short!("LRN_ESC");
 const MAX_FEE_BPS: u32 = 1_000;
+
+/// Economic sanity ceiling for a single escrow/milestone amount, expressed
+/// in the token's smallest unit. Guards against fat-fingered or malicious
+/// amounts many orders of magnitude larger than any real session fee, which
+/// could otherwise sit close enough to `i128::MAX` to make downstream
+/// `checked_mul` (fee math) fail or make the amount economically absurd.
+const MAX_FINANCIAL_AMOUNT: i128 = 1_000_000_000_000_000; // 100M tokens @ 7 decimals
 
 /// Default auto-release delay: 72 hours in seconds.
 const DEFAULT_AUTO_RELEASE_DELAY: u64 = 72 * 60 * 60;
@@ -2133,6 +2140,11 @@ impl EscrowContract {
         token_address: Address,
         total_sessions: u32,
     ) -> u64 {
+        Validator::new(&env)
+            .require_positive(usd_amount, "usd_amount")
+            .require_max(usd_amount, MAX_FINANCIAL_AMOUNT, "usd_amount")
+            .validate_or_panic();
+
         let oracle: Address = env.storage().persistent().get(&ORACLE_ID).expect("oracle not set");
         let max_age: u64 = env.storage().persistent().get(&ORACLE_MAX_AGE).unwrap_or(300);
         let oracle_sym = Symbol::new(&env, "get_price");
@@ -2189,6 +2201,13 @@ impl EscrowContract {
             panic!("Dest asset token not approved");
         }
 
+        Validator::new(&env)
+            .require_positive(dest_amount, "dest_amount")
+            .require_max(dest_amount, MAX_FINANCIAL_AMOUNT, "dest_amount")
+            .require_positive(send_max, "send_max")
+            .require_max(send_max, MAX_FINANCIAL_AMOUNT, "send_max")
+            .validate_or_panic();
+
         if send_max < dest_amount {
             panic!("path slippage exceeded");
         }
@@ -2237,13 +2256,26 @@ impl EscrowContract {
             panic!("Token not approved");
         }
 
+        // Every individual milestone must itself be a strictly positive,
+        // economically sane amount. Validating only the summed total would
+        // let a negative milestone offset an inflated one while still
+        // passing an aggregate check, corrupting per-milestone fee/payout
+        // math in `complete_milestone`.
+        for m in milestones.iter() {
+            Validator::new(&env)
+                .require_positive(m.amount, "milestone_amount")
+                .require_max(m.amount, MAX_FINANCIAL_AMOUNT, "milestone_amount")
+                .validate_or_panic();
+        }
+
         let total_amount = milestones
             .iter()
             .fold(0i128, |acc, m| acc.checked_add(m.amount).expect("Amount overflow"));
 
-        if total_amount <= 0 {
-            panic!("Total amount must be greater than zero");
-        }
+        Validator::new(&env)
+            .require_positive(total_amount, "total_amount")
+            .require_max(total_amount, MAX_FINANCIAL_AMOUNT, "total_amount")
+            .validate_or_panic();
 
         learner.require_auth();
 
@@ -2625,9 +2657,12 @@ impl EscrowContract {
         total_sessions: u32,
     ) -> u64 {
         // --- Strict input validation ---
-        if amount <= 0 {
-            panic!("Amount must be greater than zero");
-        }
+        Validator::new(&env)
+            .require_positive(amount, "amount")
+            .require_max(amount, MAX_FINANCIAL_AMOUNT, "amount")
+            .require_positive(total_sessions as i128, "total_sessions")
+            .require_sufficient_for_division(amount, total_sessions as i128, "amount")
+            .validate_or_panic();
 
         // *** STRICT WHITELIST VALIDATION ***
         // This is the critical security check: only admin-approved tokens are accepted.
