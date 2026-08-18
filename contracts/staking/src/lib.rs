@@ -4,7 +4,7 @@ use shared::events::{emit_staking_event, evt_staking_staked, evt_staking_unstake
 use shared::{
     compute_checksum, push_snapshot_index, require_not_paused, ReentrancyGuard, RollbackProposal,
     SnapshotMeta, StakeRecord, StakedEventData, StateVerificationReport, EMERGENCY_THRESHOLD,
-    MAX_SNAPSHOTS,
+    MAX_SNAPSHOTS, Validator,
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
@@ -69,6 +69,12 @@ pub struct AdminChangeProposedEvent {
 }
 
 const ADMIN_CHANGE_TIMELOCK: u64 = 48 * 60 * 60;
+
+/// Economic sanity ceiling for a single stake or reward-distribution
+/// amount, in the token's smallest unit. Guards against a fat-fingered or
+/// manipulative amount many orders of magnitude beyond any real mentor
+/// stake or platform revenue distribution.
+const MAX_FINANCIAL_AMOUNT: i128 = 1_000_000_000_000_000; // 100M tokens @ 7 decimals
 
 // ---------------------------------------------------------------------------
 // Storage keys
@@ -406,9 +412,11 @@ impl StakingContract {
             return Err(Error::NotInitialized);
         }
 
-        if amount <= 0 {
-            return Err(Error::InvalidAmount);
-        }
+        Validator::new(&env)
+            .require_positive(amount, "amount")
+            .require_max(amount, MAX_FINANCIAL_AMOUNT, "amount")
+            .validate()
+            .map_err(|_| Error::InvalidAmount)?;
 
         let bypass: bool = env
             .storage()
@@ -718,6 +726,13 @@ impl StakingContract {
         let _guard = ReentrancyGuard::enter(&env, Symbol::new(&env, "distribute_revenue"));
         let _ = token;
 
+        // Zero is a valid "no reward this epoch" input; only reject negative
+        // amounts (which would corrupt EpochReward) and unreasonably large ones.
+        Validator::new(&env)
+            .require_non_negative(amount, "amount")
+            .require_max(amount, MAX_FINANCIAL_AMOUNT, "amount")
+            .validate_or_panic();
+
         let total_staked: i128 = env
             .storage()
             .persistent()
@@ -765,6 +780,12 @@ impl StakingContract {
         limit: u32,
     ) {
         let _ = token;
+
+        Validator::new(&env)
+            .require_non_negative(amount, "amount")
+            .require_max(amount, MAX_FINANCIAL_AMOUNT, "amount")
+            .validate_or_panic();
+
         let total_staked: i128 = env
             .storage()
             .persistent()
@@ -912,8 +933,16 @@ impl StakingContract {
 
     pub fn add_to_lp_reward_pool(env: Env, amount: i128) {
         // Anyone can call this to add rewards to the pool, typically the treasury.
+        Validator::new(&env)
+            .require_positive(amount, "amount")
+            .require_max(amount, MAX_FINANCIAL_AMOUNT, "amount")
+            .validate_or_panic();
+
         let pool_balance: i128 = env.storage().persistent().get(&DataKey::LPRewardPool).unwrap_or(0);
-        env.storage().persistent().set(&DataKey::LPRewardPool, &(pool_balance + amount));
+        env.storage().persistent().set(
+            &DataKey::LPRewardPool,
+            &pool_balance.checked_add(amount).expect("Overflow"),
+        );
     }
 
     pub fn register_lp_position(
