@@ -12,12 +12,13 @@ pub mod disaster_recovery;
 pub mod escrow;
 pub mod events;
 pub mod gas_estimation;
+pub mod governance_voting;
 pub mod pause_guard;
 pub mod reentrancy_guard;
 pub mod sig_validation;
 pub mod state_machine;
-pub mod storage;
 pub mod staking;
+pub mod storage;
 pub mod ttl_utils;
 pub mod interface_id;
 pub mod validation;
@@ -29,6 +30,12 @@ pub use disaster_recovery::{
 pub use cross_contract_auth::{ContractRegistry, CrossContractAuth, InterfaceRegistryLookup};
 pub use escrow::{EscrowRecord, EscrowStatus, EscrowTransitionLog};
 pub use gas_estimation::GasEstimate;
+pub use governance_voting::{
+    calculate_voting_weight, compute_commitment_hash, compute_random_deadline_extension,
+    detect_vote_manipulation, get_vote_phase, validate_minimum_holding_period, ManipulationFlag,
+    MAX_RANDOM_EXTENSION_SECS, MIN_HOLDING_PERIOD_SECS, COMMIT_PHASE_BPS, RevealedVote, VoteCommitment,
+    VotePhase,
+};
 pub use pause_guard::{ContractPaused, is_paused, require_not_paused};
 pub use reentrancy_guard::{
     AtomicBatch, BatchOp, ReentrancyAttemptLog, ReentrancyGuard, StateSnapshot,
