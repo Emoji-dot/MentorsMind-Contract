@@ -105,6 +105,69 @@ impl<'a> Validator<'a> {
         self
     }
 
+    /// Assert that `value` does not exceed `max`.
+    ///
+    /// Used to enforce upper economic bounds (e.g. a value must never exceed
+    /// the total token supply) so a single oversized amount can't be used to
+    /// trigger overflow further down the call chain or drain a pool in one
+    /// shot.
+    pub fn require_max(mut self, value: i128, max: i128, field: &str) -> Self {
+        if value > max {
+            self.errors.push_back(ValidationError {
+                field: Symbol::new(self.env, field),
+                constraint: Symbol::new(self.env, "max"),
+                value_provided: value,
+            });
+        }
+        self
+    }
+
+    /// Assert that `value` is at least `min`.
+    ///
+    /// Used for business-logic minimums (e.g. a stake or escrow amount below
+    /// which the operation isn't economically meaningful, or would round to
+    /// zero once fees/splits are applied).
+    pub fn require_min(mut self, value: i128, min: i128, field: &str) -> Self {
+        if value < min {
+            self.errors.push_back(ValidationError {
+                field: Symbol::new(self.env, field),
+                constraint: Symbol::new(self.env, "min"),
+                value_provided: value,
+            });
+        }
+        self
+    }
+
+    /// Assert that `bps` is a valid basis-points value (`0..=10_000`).
+    pub fn require_valid_bps(mut self, bps: u32, field: &str) -> Self {
+        if bps > 10_000 {
+            self.errors.push_back(ValidationError {
+                field: Symbol::new(self.env, field),
+                constraint: Symbol::new(self.env, "bps_range"),
+                value_provided: bps as i128,
+            });
+        }
+        self
+    }
+
+    /// Assert that `total` can be split `parts` ways without every share
+    /// rounding down to zero (a common source of "precision" exploits where
+    /// a caller inflates `parts` so each recipient's cut truncates to
+    /// nothing while the remainder is swept elsewhere).
+    ///
+    /// Also rejects a non-positive `parts`, which would otherwise divide by
+    /// zero downstream.
+    pub fn require_sufficient_for_division(mut self, total: i128, parts: i128, field: &str) -> Self {
+        if parts <= 0 || total < parts {
+            self.errors.push_back(ValidationError {
+                field: Symbol::new(self.env, field),
+                constraint: Symbol::new(self.env, "divisible"),
+                value_provided: parts,
+            });
+        }
+        self
+    }
+
     /// Consume the builder and return `Ok(())` if all rules passed, or
     /// `Err(ValidationError)` with the first failure.
     pub fn validate(self) -> Result<(), ValidationError> {
@@ -117,6 +180,36 @@ impl<'a> Validator<'a> {
     /// Consume the builder and return all collected errors (empty = all passed).
     pub fn validate_all(self) -> Vec<ValidationError> {
         self.errors
+    }
+
+    /// Consume the builder and panic with a constraint-specific message on
+    /// the first failure. Intended for contracts (like `escrow`) that use
+    /// panic-based error handling rather than `Result<_, Error>`.
+    pub fn validate_or_panic(self) {
+        let env = self.env;
+        if let Some(err) = self.errors.iter().next() {
+            if err.constraint == Symbol::new(env, "positive") {
+                panic!("validation failed: value must be greater than zero");
+            } else if err.constraint == Symbol::new(env, "non_negative") {
+                panic!("validation failed: value must not be negative");
+            } else if err.constraint == Symbol::new(env, "future") {
+                panic!("validation failed: timestamp must be in the future");
+            } else if err.constraint == Symbol::new(env, "range") {
+                panic!("validation failed: value is outside the allowed range");
+            } else if err.constraint == Symbol::new(env, "nonzero") {
+                panic!("validation failed: value must be nonzero");
+            } else if err.constraint == Symbol::new(env, "max") {
+                panic!("validation failed: value exceeds the maximum allowed amount");
+            } else if err.constraint == Symbol::new(env, "min") {
+                panic!("validation failed: value is below the minimum required amount");
+            } else if err.constraint == Symbol::new(env, "bps_range") {
+                panic!("validation failed: basis-points value must be between 0 and 10000");
+            } else if err.constraint == Symbol::new(env, "divisible") {
+                panic!("validation failed: amount too small to split without rounding a share to zero");
+            } else {
+                panic!("validation failed");
+            }
+        }
     }
 }
 
@@ -231,5 +324,102 @@ mod tests {
             .validate()
             .unwrap_err();
         assert_eq!(err.constraint, Symbol::new(&env, "non_negative"));
+    }
+
+    #[test]
+    fn require_max_passes_at_boundary() {
+        let env = Env::default();
+        let result = Validator::new(&env).require_max(1_000, 1_000, "amount").validate();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn require_max_fails_above_bound() {
+        let env = Env::default();
+        let err = Validator::new(&env)
+            .require_max(1_001, 1_000, "amount")
+            .validate()
+            .unwrap_err();
+        assert_eq!(err.constraint, Symbol::new(&env, "max"));
+        assert_eq!(err.value_provided, 1_001);
+    }
+
+    #[test]
+    fn require_min_passes_at_boundary() {
+        let env = Env::default();
+        let result = Validator::new(&env).require_min(10, 10, "amount").validate();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn require_min_fails_below_bound() {
+        let env = Env::default();
+        let err = Validator::new(&env)
+            .require_min(5, 10, "amount")
+            .validate()
+            .unwrap_err();
+        assert_eq!(err.constraint, Symbol::new(&env, "min"));
+    }
+
+    #[test]
+    fn require_valid_bps_passes_within_range() {
+        let env = Env::default();
+        let result = Validator::new(&env).require_valid_bps(10_000, "fee_bps").validate();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn require_valid_bps_fails_above_10000() {
+        let env = Env::default();
+        let err = Validator::new(&env)
+            .require_valid_bps(10_001, "fee_bps")
+            .validate()
+            .unwrap_err();
+        assert_eq!(err.constraint, Symbol::new(&env, "bps_range"));
+    }
+
+    #[test]
+    fn require_sufficient_for_division_passes_when_each_share_nonzero() {
+        let env = Env::default();
+        let result = Validator::new(&env)
+            .require_sufficient_for_division(100, 4, "amount")
+            .validate();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn require_sufficient_for_division_fails_when_shares_would_round_to_zero() {
+        let env = Env::default();
+        let err = Validator::new(&env)
+            .require_sufficient_for_division(3, 4, "amount")
+            .validate()
+            .unwrap_err();
+        assert_eq!(err.constraint, Symbol::new(&env, "divisible"));
+    }
+
+    #[test]
+    fn require_sufficient_for_division_fails_for_zero_parts() {
+        let env = Env::default();
+        let err = Validator::new(&env)
+            .require_sufficient_for_division(100, 0, "amount")
+            .validate()
+            .unwrap_err();
+        assert_eq!(err.constraint, Symbol::new(&env, "divisible"));
+    }
+
+    #[test]
+    #[should_panic(expected = "value exceeds the maximum allowed amount")]
+    fn validate_or_panic_panics_with_constraint_message() {
+        let env = Env::default();
+        Validator::new(&env).require_max(2_000, 1_000, "amount").validate_or_panic();
+    }
+
+    #[test]
+    fn validate_or_panic_passes_silently_when_valid() {
+        let env = Env::default();
+        Validator::new(&env)
+            .require_positive(100, "amount")
+            .require_max(100, 1_000, "amount")
+            .validate_or_panic();
     }
 }
