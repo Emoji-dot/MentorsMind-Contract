@@ -307,11 +307,6 @@ const MAX_FEE_BPS: u32 = 1_000;
 /// `checked_mul` (fee math) fail or make the amount economically absurd.
 const MAX_FINANCIAL_AMOUNT: i128 = 1_000_000_000_000_000; // 100M tokens @ 7 decimals
 
-/// A multi-session or milestone escrow must have at least this many token
-/// units per session/milestone, otherwise fee/split math truncates a
-/// recipient's share to zero.
-const MIN_SPLIT_AMOUNT: i128 = 1;
-
 /// Default auto-release delay: 72 hours in seconds.
 const DEFAULT_AUTO_RELEASE_DELAY: u64 = 72 * 60 * 60;
 
