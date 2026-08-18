@@ -11,6 +11,7 @@ members = [
     "contracts/cert_showcase",
     "contracts/collateral_loan",
     "contracts/credit_score",
+    "contracts/delegated_staking_proxy",
     "contracts/delegation",
     "contracts/dispute_evidence",
     "contracts/endorsements",
