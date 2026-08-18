@@ -30,7 +30,10 @@ pub use cross_contract_auth::{ContractRegistry, CrossContractAuth, InterfaceRegi
 pub use escrow::{EscrowRecord, EscrowStatus, EscrowTransitionLog};
 pub use gas_estimation::GasEstimate;
 pub use pause_guard::{ContractPaused, is_paused, require_not_paused};
-pub use reentrancy_guard::ReentrancyGuard;
+pub use reentrancy_guard::{
+    AtomicBatch, BatchOp, ReentrancyAttemptLog, ReentrancyGuard, StateSnapshot,
+    validate_amount_limits, validate_caller_is_authorized,
+};
 pub use sig_validation::{
     current_nonce, is_deadline_valid, validate_and_consume_nonce, validate_deadline,
     MetaTxAction, MetaTxPayload, SigError, EXPIRY_TOLERANCE_SECS, MAX_DEADLINE_SECS,

@@ -2,9 +2,10 @@
 
 use shared::events::{emit_staking_event, evt_staking_staked, evt_staking_unstaked};
 use shared::{
-    compute_checksum, push_snapshot_index, require_not_paused, ReentrancyGuard, RollbackProposal,
-    SnapshotMeta, StakeRecord, StakedEventData, StateVerificationReport, EMERGENCY_THRESHOLD,
-    MAX_SNAPSHOTS, Validator,
+    compute_checksum, push_snapshot_index, require_not_paused, AtomicBatch, BatchOp,
+    ReentrancyGuard, RollbackProposal, SnapshotMeta, StateSnapshot, StakeRecord, StakedEventData,
+    StateVerificationReport, EMERGENCY_THRESHOLD, MAX_SNAPSHOTS, Validator,
+    validate_amount_limits, validate_caller_is_authorized,
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
@@ -30,6 +31,14 @@ pub enum Error {
     AdminChangeNotYetEffective = 8,
     InvalidAdminChange = 9,
     Unauthorized = 10,
+    CallerNotTreasury = 11,
+    DistributionAlreadyProcessed = 12,
+    InvalidState = 13,
+    Overflow = 14,
+    DuplicateEntry = 15,
+    TreasuryNotConfigured = 16,
+    StateValidationFailed = 17,
+    ReentrancyGuardPaused = 18,
 }
 
 // ---------------------------------------------------------------------------
@@ -121,6 +130,19 @@ pub enum DataKey {
     /// Configurable tier thresholds (stake / rating / session requirements).
     TierRequirements,
     // -----------------------------------------------------------------------
+    // Treasury integration keys
+    // -----------------------------------------------------------------------
+    /// Authorized treasury contract address — only this address may call
+    /// `receive_treasury_distribution` and related treasury entry points.
+    TreasuryContract,
+    /// Tracks whether a specific distribution_id from the treasury has
+    /// already been processed, to prevent replay / duplicate acceptance.
+    ProcessedDistribution(u64),
+    /// Receipt of a processed treasury distribution for audit / forensics.
+    TreasuryDistributionReceipt(u64),
+    /// Counter of treasury distributions processed by this staking contract.
+    TreasuryDistributionCount,
+    // -----------------------------------------------------------------------
     // Disaster-recovery keys
     // -----------------------------------------------------------------------
     /// Serialised Vec<StakeSnapshot> for DR snapshot `n`.
@@ -137,6 +159,18 @@ pub enum DataKey {
     StakeRollbackApproval(u32, Address),
     /// Auto-incremented staking rollback proposal counter.
     StakeRollbackProposalCount,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryDistributionReceipt {
+    pub distribution_id: u64,
+    pub treasury: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub treasury_timestamp: u64,
+    pub received_at: u64,
+    pub processed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -346,6 +380,29 @@ impl StakingContract {
         env.storage()
             .instance()
             .set(&DataKey::BypassAnomalyCheck, &bypass);
+    }
+
+    pub fn set_treasury_contract(env: Env, admin: Address, treasury: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::TreasuryContract, &treasury);
+        env.events().publish(
+            (Symbol::new(&env, "treasury"), Symbol::new(&env, "set")),
+            treasury,
+        );
+        Ok(())
+    }
+
+    pub fn get_treasury_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::TreasuryContract)
+    }
+
+    fn require_not_rg_paused(env: &Env, lock_name: &Symbol) -> Result<(), Error> {
+        if ReentrancyGuard::is_paused(env, Some(lock_name.clone())) {
+            return Err(Error::ReentrancyGuardPaused);
+        }
+        Ok(())
     }
 
     /// Configure the `reputation` contract consulted by `compute_tier`.
@@ -722,17 +779,105 @@ impl StakingContract {
     /// than `current_epoch`) are not eligible for this epoch's reward, so a
     /// large late deposit cannot dilute rewards already earned by existing
     /// stakers. `stake`/`unstake` never mutate a closed epoch's snapshot.
-    pub fn distribute_revenue(env: Env, token: Address, amount: i128) {
-        let _guard = ReentrancyGuard::enter(&env, Symbol::new(&env, "distribute_revenue"));
-        let _ = token;
+    pub fn receive_treasury_distribution(
+        env: Env,
+        distribution_id: u64,
+        treasury: Address,
+        token: Address,
+        staker_amount: i128,
+        treasury_timestamp: u64,
+    ) -> Result<(), Error> {
+        let lock_sym = Symbol::new(&env, "treasury_dist");
+        Self::require_not_rg_paused(&env, &lock_sym)?;
 
-        // Zero is a valid "no reward this epoch" input; only reject negative
-        // amounts (which would corrupt EpochReward) and unreasonably large ones.
+        let _guard = ReentrancyGuard::enter(&env, lock_sym);
+
+        treasury.require_auth();
+        let authorized: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::TreasuryContract)
+            .ok_or(Error::TreasuryNotConfigured)?;
+        if treasury != authorized {
+            return Err(Error::CallerNotTreasury);
+        }
+
+        let processed_key = DataKey::ProcessedDistribution(distribution_id);
+        if env.storage().persistent().has(&processed_key) {
+            return Err(Error::DistributionAlreadyProcessed);
+        }
+
         Validator::new(&env)
-            .require_non_negative(amount, "amount")
-            .require_max(amount, MAX_FINANCIAL_AMOUNT, "amount")
-            .validate_or_panic();
+            .require_non_negative(staker_amount, "staker_amount")
+            .require_max(staker_amount, MAX_FINANCIAL_AMOUNT, "staker_amount")
+            .validate()
+            .map_err(|_| Error::InvalidAmount)?;
 
+        if !validate_amount_limits(staker_amount, 0, MAX_FINANCIAL_AMOUNT) {
+            return Err(Error::InvalidAmount);
+        }
+
+        let pre_snapshot = StateSnapshot::capture(&env);
+        let token_client = token::Client::new(&env, &token);
+        let balance_before = token_client.balance(&env.current_contract_address());
+
+        env.storage().persistent().set(&processed_key, &true);
+
+        let receipt = TreasuryDistributionReceipt {
+            distribution_id,
+            treasury: treasury.clone(),
+            token: token.clone(),
+            amount: staker_amount,
+            treasury_timestamp,
+            received_at: env.ledger().timestamp(),
+            processed: false,
+        };
+        env.storage().persistent().set(
+            &DataKey::TreasuryDistributionReceipt(distribution_id),
+            &receipt,
+        );
+
+        let dist_count: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TreasuryDistributionCount)
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::TreasuryDistributionCount,
+            &(dist_count.checked_add(1).unwrap_or(dist_count)),
+        );
+
+        Self::internal_distribute_revenue(&env, token.clone(), staker_amount);
+
+        let balance_after = token_client.balance(&env.current_contract_address());
+        if balance_after < balance_before {
+            return Err(Error::StateValidationFailed);
+        }
+        pre_snapshot.assert_valid();
+
+        let mut final_receipt: TreasuryDistributionReceipt = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TreasuryDistributionReceipt(distribution_id))
+            .unwrap();
+        final_receipt.processed = true;
+        env.storage().persistent().set(
+            &DataKey::TreasuryDistributionReceipt(distribution_id),
+            &final_receipt,
+        );
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "treasury"),
+                Symbol::new(&env, "dist_received"),
+            ),
+            (distribution_id, treasury, token.clone(), staker_amount),
+        );
+
+        Ok(())
+    }
+
+    fn internal_distribute_revenue(env: &Env, _token: Address, amount: i128) {
         let total_staked: i128 = env
             .storage()
             .persistent()
@@ -758,10 +903,48 @@ impl StakingContract {
             .set(&DataKey::EpochId, &next_epoch);
 
         emit_staking_event(
-            &env,
-            Symbol::new(&env, "revenue_distributed"),
+            env,
+            Symbol::new(env, "revenue_distributed"),
             (current_epoch, total_staked, amount),
         );
+    }
+
+    pub fn distribute_revenue(env: Env, token: Address, amount: i128) {
+        let lock_sym = Symbol::new(&env, "distribute_revenue");
+        if ReentrancyGuard::is_paused(&env, Some(lock_sym.clone())) {
+            panic!("reentrancy guard paused for distribute_revenue");
+        }
+        let _guard = ReentrancyGuard::enter(&env, lock_sym);
+        let _ = token;
+
+        Validator::new(&env)
+            .require_non_negative(amount, "amount")
+            .require_max(amount, MAX_FINANCIAL_AMOUNT, "amount")
+            .validate_or_panic();
+
+        Self::internal_distribute_revenue(&env, token, amount);
+    }
+
+    pub fn get_treasury_distribution_receipt(
+        env: Env,
+        distribution_id: u64,
+    ) -> Option<TreasuryDistributionReceipt> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TreasuryDistributionReceipt(distribution_id))
+    }
+
+    pub fn is_distribution_processed(env: Env, distribution_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::ProcessedDistribution(distribution_id))
+    }
+
+    pub fn get_treasury_distribution_count(env: Env) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TreasuryDistributionCount)
+            .unwrap_or(0)
     }
 
     /// Legacy batch-based distribution kept for existing callers/benchmarks.
@@ -931,18 +1114,55 @@ impl StakingContract {
             .unwrap_or(0)
     }
 
-    pub fn add_to_lp_reward_pool(env: Env, amount: i128) {
-        // Anyone can call this to add rewards to the pool, typically the treasury.
+    pub fn add_to_lp_reward_pool(env: Env, amount: i128) -> Result<(), Error> {
+        let lock_sym = Symbol::new(&env, "lp_reward_pool");
+        Self::require_not_rg_paused(&env, &lock_sym)?;
+        let _guard = ReentrancyGuard::enter(&env, lock_sym);
+
         Validator::new(&env)
             .require_positive(amount, "amount")
             .require_max(amount, MAX_FINANCIAL_AMOUNT, "amount")
-            .validate_or_panic();
+            .validate()
+            .map_err(|_| Error::InvalidAmount)?;
+
+        if !validate_amount_limits(amount, 1, MAX_FINANCIAL_AMOUNT) {
+            return Err(Error::InvalidAmount);
+        }
+
+        let caller = env.current_contract_address();
+        let pre_snapshot = StateSnapshot::capture(&env);
 
         let pool_balance: i128 = env.storage().persistent().get(&DataKey::LPRewardPool).unwrap_or(0);
+        let new_pool = pool_balance
+            .checked_add(amount)
+            .ok_or(Error::Overflow)?;
         env.storage().persistent().set(
             &DataKey::LPRewardPool,
-            &pool_balance.checked_add(amount).expect("Overflow"),
+            &new_pool,
         );
+
+        let mnt_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::MNTToken)
+            .expect("Not initialized");
+        let token_client = token::Client::new(&env, &mnt_token);
+        let contract_addr = env.current_contract_address();
+        let balance_before = token_client.balance(&contract_addr);
+
+        let invoker_addr = env.current_contract_address();
+        let _ = invoker_addr;
+        let _ = caller;
+
+        pre_snapshot.assert_valid();
+
+        emit_staking_event(
+            &env,
+            Symbol::new(&env, "lp_pool_funded"),
+            (amount, new_pool),
+        );
+
+        Ok(())
     }
 
     pub fn register_lp_position(
