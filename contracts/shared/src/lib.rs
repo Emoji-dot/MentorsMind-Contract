@@ -20,6 +20,7 @@ pub mod staking;
 pub mod ttl_utils;
 pub mod interface_id;
 pub mod validation;
+pub mod admin;
 
 pub use disaster_recovery::{
     compute_checksum, push_snapshot_index, RollbackApproval, RollbackProposal, SnapshotMeta,
@@ -38,6 +39,7 @@ pub use staking::{StakeRecord, StakedEventData};
 pub use storage::{EternalStorage, StorageType, InstanceKey, PersistentKey, TempKey};
 pub use ttl_utils::{next_bump_interval, should_bump_ttl};
 pub use validation::{Validator, ValidationError, require_auth_and_validate};
+pub use admin::{AdminTransfer, AdminChangeProposal, MIN_ADMIN_TIMELOCK_SECS, ADMIN_COOLING_OFF_SECS};
 
 /// Common error codes shared across all MentorsMind contracts.
 ///
@@ -69,4 +71,12 @@ pub enum SharedError {
     Underflow = 10,
     /// Input validation failed (see `ValidationError` for field details).
     ValidationError = 11,
+    /// Pending admin change already in progress.
+    AdminTransferPending = 12,
+    /// The timelock for the admin change has not expired yet.
+    TimelockNotExpired = 13,
+    /// Cooling off period after the last admin change has not expired.
+    CoolingOffPeriod = 14,
+    /// No pending admin transfer exists.
+    NoPendingAdminTransfer = 15,
 }
