@@ -710,6 +710,8 @@ impl TreasuryContract {
         xlm_amount: i128,
         min_mnt_out: i128,
         dex_iface: DexInterface,
+        oracle_contract: Option<Address>,
+        mnt_asset_symbol: Option<Symbol>,
     ) -> Result<(), Error> {
         let _guard = ReentrancyGuard::enter(&env, Symbol::new(&env, "buyback"));
 
