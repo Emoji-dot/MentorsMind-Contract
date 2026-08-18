@@ -7,6 +7,7 @@ use soroban_sdk::contracterror;
 ///
 /// Centralizing these definitions keeps authorization and state-transition
 /// behavior aligned across contracts that make the same safety assumptions.
+pub mod cross_contract_auth;
 pub mod disaster_recovery;
 pub mod escrow;
 pub mod events;
@@ -25,6 +26,7 @@ pub use disaster_recovery::{
     compute_checksum, push_snapshot_index, RollbackApproval, RollbackProposal, SnapshotMeta,
     StateVerificationReport, EMERGENCY_SIGNERS, EMERGENCY_THRESHOLD, MAX_SNAPSHOTS,
 };
+pub use cross_contract_auth::{ContractRegistry, CrossContractAuth, InterfaceRegistryLookup};
 pub use escrow::{EscrowRecord, EscrowStatus, EscrowTransitionLog};
 pub use gas_estimation::GasEstimate;
 pub use pause_guard::{ContractPaused, is_paused, require_not_paused};
@@ -69,4 +71,6 @@ pub enum SharedError {
     Underflow = 10,
     /// Input validation failed (see `ValidationError` for field details).
     ValidationError = 11,
+    /// A cross-contract caller failed interface-registry verification.
+    UnauthorizedContract = 12,
 }
