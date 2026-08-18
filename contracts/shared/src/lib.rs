@@ -7,16 +7,18 @@ use soroban_sdk::contracterror;
 ///
 /// Centralizing these definitions keeps authorization and state-transition
 /// behavior aligned across contracts that make the same safety assumptions.
+pub mod cross_contract_auth;
 pub mod disaster_recovery;
 pub mod escrow;
 pub mod events;
 pub mod gas_estimation;
+pub mod governance_voting;
 pub mod pause_guard;
 pub mod reentrancy_guard;
 pub mod sig_validation;
 pub mod state_machine;
-pub mod storage;
 pub mod staking;
+pub mod storage;
 pub mod ttl_utils;
 pub mod interface_id;
 pub mod validation;
@@ -25,10 +27,20 @@ pub use disaster_recovery::{
     compute_checksum, push_snapshot_index, RollbackApproval, RollbackProposal, SnapshotMeta,
     StateVerificationReport, EMERGENCY_SIGNERS, EMERGENCY_THRESHOLD, MAX_SNAPSHOTS,
 };
+pub use cross_contract_auth::{ContractRegistry, CrossContractAuth, InterfaceRegistryLookup};
 pub use escrow::{EscrowRecord, EscrowStatus, EscrowTransitionLog};
 pub use gas_estimation::GasEstimate;
+pub use governance_voting::{
+    calculate_voting_weight, compute_commitment_hash, compute_random_deadline_extension,
+    detect_vote_manipulation, get_vote_phase, validate_minimum_holding_period, ManipulationFlag,
+    MAX_RANDOM_EXTENSION_SECS, MIN_HOLDING_PERIOD_SECS, COMMIT_PHASE_BPS, RevealedVote, VoteCommitment,
+    VotePhase,
+};
 pub use pause_guard::{ContractPaused, is_paused, require_not_paused};
-pub use reentrancy_guard::ReentrancyGuard;
+pub use reentrancy_guard::{
+    AtomicBatch, BatchOp, ReentrancyAttemptLog, ReentrancyGuard, StateSnapshot,
+    validate_amount_limits, validate_caller_is_authorized,
+};
 pub use sig_validation::{
     current_nonce, is_deadline_valid, validate_and_consume_nonce, validate_deadline,
     MetaTxAction, MetaTxPayload, SigError, EXPIRY_TOLERANCE_SECS, MAX_DEADLINE_SECS,
@@ -69,4 +81,6 @@ pub enum SharedError {
     Underflow = 10,
     /// Input validation failed (see `ValidationError` for field details).
     ValidationError = 11,
+    /// A cross-contract caller failed interface-registry verification.
+    UnauthorizedContract = 12,
 }
