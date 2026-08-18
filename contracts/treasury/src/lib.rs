@@ -1,6 +1,6 @@
 #![no_std]
 
-use shared::{require_not_paused, ReentrancyGuard};
+use shared::{require_not_paused, ReentrancyGuard, Validator};
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token,
     Address, Env, IntoVal, Symbol, Vec,
@@ -41,6 +41,24 @@ pub enum Error {
     OracleUnhealthy = 5,
     /// Oracle data is stale — buyback aborted until a fresh price is available.
     OracleStale = 6,
+    /// Requested token is not on the approved whitelist for this operation.
+    TokenNotApproved = 7,
+    /// `min_mnt_out` passed to `buyback_and_burn` was not strictly positive.
+    InvalidMinOut = 8,
+    /// The DEX swap returned zero output tokens.
+    ZeroOutput = 9,
+    /// The DEX swap returned less than the caller's requested `min_mnt_out`.
+    SlippageExceeded = 10,
+    /// An amount failed comprehensive financial validation (non-positive,
+    /// exceeds the economic sanity bound, or fails a business-logic rule
+    /// specific to the operation).
+    InvalidAmount = 11,
+    /// No admin-change proposal is currently pending.
+    NoPendingAdminChange = 12,
+    /// The admin-change timelock has not yet elapsed.
+    AdminChangeNotYetEffective = 13,
+    /// The caller is not the address named in the pending admin change.
+    InvalidAdminChange = 14,
 }
 
 // ---------------------------------------------------------------------------
