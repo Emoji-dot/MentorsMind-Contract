@@ -14,12 +14,15 @@ use soroban_sdk::{
 // ---------------------------------------------------------------------------
 
 /// Mirrors `OracleHealth` from the oracle contract.
+/// Extended to include circuit-breaker and override state.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OracleHealth {
     pub active_feeders: u32,
     pub last_update: u64,
     pub is_stale: bool,
+    pub circuit_breaker_tripped: bool,
+    pub override_active: bool,
 }
 
 #[contractclient(name = "OracleContractClient")]
@@ -69,8 +72,8 @@ pub struct BuybackSucceeded {
 #[repr(u32)]
 pub enum Error {
     AlreadyInitialized = 1,
-    NotInitialized     = 2,
-    Unauthorized       = 3,
+    NotInitialized = 2,
+    Unauthorized = 3,
     InsufficientBalance = 4,
     OracleUnhealthy = 5,
     OracleStale = 6,
@@ -92,6 +95,21 @@ pub enum Error {
 // ---------------------------------------------------------------------------
 // Data types
 // ---------------------------------------------------------------------------
+
+/// Describes how to invoke the DEX swap function.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DexInterface {
+    pub swap_fn: Symbol,
+}
+
+impl DexInterface {
+    pub fn validate(&self, env: &Env) {
+        if self.swap_fn == Symbol::new(env, "") {
+            panic!("DexInterface: swap_fn must not be empty");
+        }
+    }
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -262,12 +280,18 @@ impl TreasuryContract {
             .require_valid_bps(bps, "bps")
             .validate()
             .map_err(|_| Error::InvalidAmount)?;
-        env.storage().persistent().set(&DataKey::AutoBurnRateBps, &bps);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AutoBurnRateBps, &bps);
         Ok(())
     }
 
     pub fn execute_burn_queue(env: Env) -> Result<i128, Error> {
-        let queued: i128 = env.storage().persistent().get(&DataKey::BurnQueue).unwrap_or(0);
+        let queued: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BurnQueue)
+            .unwrap_or(0);
         if queued <= 0 {
             return Ok(0);
         }
@@ -349,7 +373,6 @@ impl TreasuryContract {
     pub fn set_regulatory_reporting(env: Env, reporting_address: Address) -> Result<(), Error> {
         let admin = Self::admin(&env)?;
         admin.require_auth();
-
         env.storage()
             .persistent()
             .set(&DataKey::RegulatoryReporting, &reporting_address);
@@ -794,7 +817,6 @@ impl TreasuryContract {
             .get::<DataKey, Address>(&DataKey::Admin)
             .ok_or(Error::NotInitialized)?;
         admin.require_auth();
-
         env.storage()
             .persistent()
             .set(&DataKey::MultisigThreshold, &threshold);
@@ -1190,11 +1212,31 @@ impl TreasuryContract {
             let health: OracleHealth =
                 OracleContractClient::new(&env, &oracle).get_oracle_health(&asset_sym);
 
+            // 3a. Staleness check.
             if health.is_stale {
+                env.events().publish(
+                    (symbol_short!("buyback"), symbol_short!("failed")),
+                    BuybackFailed {
+                        xlm_amount,
+                        reason: Symbol::new(&env, "oracle_stale"),
+                    },
+                );
                 return Err(Error::OracleStale);
             }
             if health.active_feeders < 3 {
                 return Err(Error::OracleUnhealthy);
+            }
+
+            // 3c. Circuit-breaker check — halt buybacks during high volatility.
+            if health.circuit_breaker_tripped {
+                env.events().publish(
+                    (symbol_short!("buyback"), symbol_short!("failed")),
+                    BuybackFailed {
+                        xlm_amount,
+                        reason: Symbol::new(&env, "oracle_cb"),
+                    },
+                );
+                return Err(Error::OracleCircuitBreaker);
             }
         }
 
@@ -1399,5 +1441,37 @@ impl TreasuryContract {
             .persistent()
             .get(&DataKey::StakingContract)
             .ok_or(Error::NotInitialized)
+    }
+
+    #[test]
+    fn test_buyback_aborted_when_circuit_breaker_tripped() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000);
+        let (admin, _, _, contract_id) = setup_test(&env);
+
+        let xlm_addr = env.register_stellar_asset_contract(admin.clone());
+        let mnt_addr = env.register_contract(None, MockMNT);
+        let dex_addr = env.register_contract(None, MockDEX);
+        let oracle_addr = env.register_contract(None, MockOracleCircuitBreaker);
+
+        let stellar_asset_client = token::StellarAssetClient::new(&env, &xlm_addr);
+        stellar_asset_client.mint(&contract_id, &500);
+
+        let treasury_client = TreasuryContractClient::new(&env, &contract_id);
+        treasury_client.set_approved_token(&xlm_addr, &true);
+        treasury_client.set_approved_token(&mnt_addr, &true);
+
+        let result = treasury_client.try_buyback_and_burn(
+            &xlm_addr,
+            &mnt_addr,
+            &dex_addr,
+            &500,
+            &1,
+            &default_dex_iface(&env),
+            &Some(oracle_addr),
+            &Some(symbol_short!("MNT")),
+        );
+        assert_eq!(result, Err(Ok(Error::OracleCircuitBreaker)));
     }
 }
