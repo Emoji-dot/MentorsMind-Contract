@@ -26,9 +26,13 @@
 // Both paths now provide identical security guarantees.
 // ---------------------------------------------------------------------------
 
+use shared::storage_compatibility::{
+    CompatibilityReport, CompatibilityValidator, GradualMigrationStatus, StorageField,
+    StorageFieldType, StorageLayoutSchema, StorageVersion,
+};
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
-    IntoVal, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, xdr::ToXdr, Address,
+    BytesN, Env, IntoVal, Symbol, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -69,6 +73,16 @@ pub enum Error {
     SourceCommitAlreadyRegistered = 17,
     /// Provided commit hash does not match stored hash.
     CommitHashMismatch = 18,
+    /// Proposed storage layout is incompatible with the active layout.
+    IncompatibleStorageLayout = 19,
+    /// Upgrade requires a storage data migration before execution.
+    StorageMigrationRequired = 20,
+    /// A storage migration is currently in progress; finish or cancel it first.
+    StorageMigrationInProgress = 21,
+    /// Storage layout schema not found for this contract and version.
+    StorageLayoutNotFound = 22,
+    /// Migration batch size is invalid (e.g. 0 or too large).
+    InvalidMigrationBatch = 23,
 }
 
 // ---------------------------------------------------------------------------
@@ -98,7 +112,7 @@ pub struct UpgradeConfig {
 pub struct RegistrySnapshot {
     pub admin: Address,
     pub upgrade_delay: u64,
-    pub upgrade_config: Option<UpgradeConfig>,
+    pub upgrade_config: Vec<UpgradeConfig>,
     pub registered_contracts: Vec<Symbol>,
     pub contract_versions: Vec<(Symbol, u32)>,
     pub history_counts: Vec<(Symbol, u32)>,
@@ -157,6 +171,14 @@ pub enum DataKey {
     /// Source commit hash (first 32 bytes of SHA256) for a specific contract+version.
     SourceCommit(Symbol),
 
+    // === STORAGE LAYOUT COMPATIBILITY & MIGRATION ===
+    /// Storage layout schema by (contract_name, version)
+    StorageLayout(Symbol, u32),
+    /// Active storage version for a contract
+    ActiveStorageVersion(Symbol),
+    /// Gradual migration status by contract_name
+    MigrationStatus(Symbol),
+
     // === DISASTER RECOVERY ===
     RegisteredContracts,
     Snapshot(u32),
@@ -209,7 +231,7 @@ impl UpgradeRegistryContract {
     }
 
     pub fn set_upgrade_delay(env: Env, delay_secs: u64) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
+        let _admin = Self::require_admin(&env)?;
         let min = 3_600_u64;       // 1 hour
         let max = 30 * 24 * 3_600_u64; // 30 days
         if delay_secs < min || delay_secs > max {
@@ -237,6 +259,12 @@ impl UpgradeRegistryContract {
         let approved_signers = require_upgrade_approvals_cached(&env, approvers)?;
 
         validate_wasm_exports(&env, &new_wasm_hash)?;
+
+        if let Some(status) = Self::get_migration_status(env.clone(), contract_name.clone()) {
+            if !status.completed {
+                return Err(Error::StorageMigrationInProgress);
+            }
+        }
 
         if env.storage().instance().has(&DataKey::PendingUpgrade) {
             return Err(Error::UpgradePending);
@@ -441,6 +469,12 @@ impl UpgradeRegistryContract {
             return Err(Error::VersionNotMonotonic);
         }
 
+        if let Some(status) = Self::get_migration_status(env.clone(), contract_name.clone()) {
+            if !status.completed {
+                return Err(Error::StorageMigrationInProgress);
+            }
+        }
+
         let upgrade_delay = env
             .storage()
             .instance()
@@ -554,7 +588,7 @@ impl UpgradeRegistryContract {
     }
 
     pub fn cancel_pending_upgrade(env: Env) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
+        let _admin = Self::require_admin(&env)?;
         if !env.storage().instance().has(&DataKey::PendingUpgrade) {
             return Err(Error::NoPendingUpgrade);
         }
@@ -738,6 +772,287 @@ impl UpgradeRegistryContract {
         latest >= min_version
     }
 
+    // === STORAGE LAYOUT COMPATIBILITY & MIGRATION ===
+
+    /// Register a new storage layout schema for a contract version after validating integrity and compatibility.
+    pub fn register_storage_schema(
+        env: Env,
+        contract_name: Symbol,
+        schema: StorageLayoutSchema,
+        approvers: Vec<Address>,
+    ) -> Result<(), Error> {
+        let approved_signers = require_upgrade_approvals_cached(&env, approvers)?;
+
+        // Verify schema hash
+        let computed_hash = CompatibilityValidator::compute_schema_hash(&env, &schema.fields);
+        if computed_hash != schema.schema_hash {
+            return Err(Error::IncompatibleStorageLayout);
+        }
+
+        // If a previous version exists, validate compatibility
+        let current_version = Self::get_latest_version(env.clone(), contract_name.clone());
+        if current_version > 0 {
+            if let Some(old_schema) = Self::get_storage_schema(env.clone(), contract_name.clone(), current_version) {
+                let report = CompatibilityValidator::validate_compatibility(&env, &old_schema, &schema);
+                if !report.is_compatible && !report.requires_migration {
+                    return Err(Error::IncompatibleStorageLayout);
+                }
+            }
+        }
+
+        // Store schema
+        env.storage().persistent().set(
+            &DataKey::StorageLayout(contract_name.clone(), schema.version),
+            &schema,
+        );
+
+        let storage_ver = StorageVersion {
+            current_version: schema.version,
+            min_compatible_version: if current_version == 0 { schema.version } else { current_version },
+            layout_hash: schema.schema_hash.clone(),
+            migration_in_progress: false,
+        };
+
+        env.storage().persistent().set(
+            &DataKey::ActiveStorageVersion(contract_name.clone()),
+            &storage_ver,
+        );
+
+        env.events().publish(
+            (
+                symbol_short!("upgrade"),
+                symbol_short!("storage"),
+                contract_name,
+            ),
+            (schema.version, schema.schema_hash, approved_signers),
+        );
+
+        Ok(())
+    }
+
+    /// Retrieve the storage layout schema for a given contract and version.
+    pub fn get_storage_schema(
+        env: Env,
+        contract_name: Symbol,
+        version: u32,
+    ) -> Option<StorageLayoutSchema> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::StorageLayout(contract_name, version))
+    }
+
+    /// Retrieve the active storage version for a contract.
+    pub fn get_active_storage_version(
+        env: Env,
+        contract_name: Symbol,
+    ) -> Option<StorageVersion> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ActiveStorageVersion(contract_name))
+    }
+
+    /// Validate the compatibility of a proposed schema against the currently active schema.
+    pub fn validate_upgrade_compatibility(
+        env: Env,
+        contract_name: Symbol,
+        new_schema: StorageLayoutSchema,
+    ) -> Result<CompatibilityReport, Error> {
+        let current_version = Self::get_latest_version(env.clone(), contract_name.clone());
+        if current_version == 0 {
+            // No previous schema, fully compatible as initial layout
+            let fields_count = new_schema.fields.len();
+            return Ok(CompatibilityReport {
+                is_compatible: true,
+                requires_migration: false,
+                added_fields: fields_count,
+                deprecated_fields: 0,
+                fields_checked: fields_count,
+                mismatches: Vec::new(&env),
+            });
+        }
+
+        let old_schema = Self::get_storage_schema(env.clone(), contract_name, current_version)
+            .ok_or(Error::StorageLayoutNotFound)?;
+
+        Ok(CompatibilityValidator::validate_compatibility(
+            &env,
+            &old_schema,
+            &new_schema,
+        ))
+    }
+
+    /// Start a gradual storage migration for a large dataset across schema versions.
+    pub fn start_storage_migration(
+        env: Env,
+        contract_name: Symbol,
+        from_version: u32,
+        to_version: u32,
+        total_records: u64,
+        approvers: Vec<Address>,
+    ) -> Result<GradualMigrationStatus, Error> {
+        let approved_signers = require_upgrade_approvals_cached(&env, approvers)?;
+
+        // Ensure schemas exist
+        if !env.storage().persistent().has(&DataKey::StorageLayout(contract_name.clone(), from_version))
+            || !env.storage().persistent().has(&DataKey::StorageLayout(contract_name.clone(), to_version))
+        {
+            return Err(Error::StorageLayoutNotFound);
+        }
+
+        // Check if migration is already in progress
+        if let Some(status) = Self::get_migration_status(env.clone(), contract_name.clone()) {
+            if !status.completed {
+                return Err(Error::StorageMigrationInProgress);
+            }
+        }
+
+        let initial_status = GradualMigrationStatus {
+            from_version,
+            to_version,
+            processed_records: 0,
+            total_records,
+            completed: total_records == 0,
+            last_cursor: 0,
+        };
+
+        env.storage().persistent().set(
+            &DataKey::MigrationStatus(contract_name.clone()),
+            &initial_status,
+        );
+
+        if let Some(mut ver) = Self::get_active_storage_version(env.clone(), contract_name.clone()) {
+            ver.migration_in_progress = true;
+            env.storage().persistent().set(
+                &DataKey::ActiveStorageVersion(contract_name.clone()),
+                &ver,
+            );
+        }
+
+        env.events().publish(
+            (
+                symbol_short!("upgrade"),
+                symbol_short!("mig_start"),
+                contract_name,
+            ),
+            (from_version, to_version, total_records, approved_signers),
+        );
+
+        Ok(initial_status)
+    }
+
+    /// Execute a single bounded batch step for an in-progress storage migration.
+    pub fn execute_migration_step(
+        env: Env,
+        contract_name: Symbol,
+        batch_size: u32,
+        approvers: Vec<Address>,
+    ) -> Result<GradualMigrationStatus, Error> {
+        let approved_signers = require_upgrade_approvals_cached(&env, approvers)?;
+
+        if batch_size == 0 || batch_size > 1_000 {
+            return Err(Error::InvalidMigrationBatch);
+        }
+
+        let mut status: GradualMigrationStatus = Self::get_migration_status(env.clone(), contract_name.clone())
+            .ok_or(Error::StorageLayoutNotFound)?;
+
+        if status.completed {
+            return Ok(status);
+        }
+
+        let new_processed = status
+            .processed_records
+            .saturating_add(batch_size as u64)
+            .min(status.total_records);
+        let new_cursor = status.last_cursor.saturating_add(batch_size as u64);
+
+        status.processed_records = new_processed;
+        status.last_cursor = new_cursor;
+
+        if status.processed_records >= status.total_records {
+            status.completed = true;
+
+            // Update active storage version to target version
+            if let Some(target_schema) = Self::get_storage_schema(env.clone(), contract_name.clone(), status.to_version) {
+                let storage_ver = StorageVersion {
+                    current_version: status.to_version,
+                    min_compatible_version: status.to_version,
+                    layout_hash: target_schema.schema_hash,
+                    migration_in_progress: false,
+                };
+                env.storage().persistent().set(
+                    &DataKey::ActiveStorageVersion(contract_name.clone()),
+                    &storage_ver,
+                );
+            }
+        }
+
+        env.storage().persistent().set(
+            &DataKey::MigrationStatus(contract_name.clone()),
+            &status,
+        );
+
+        env.events().publish(
+            (
+                symbol_short!("upgrade"),
+                symbol_short!("mig_step"),
+                contract_name,
+            ),
+            (status.processed_records, status.completed, approved_signers),
+        );
+
+        Ok(status)
+    }
+
+    /// Retrieve the migration status for a contract.
+    pub fn get_migration_status(
+        env: Env,
+        contract_name: Symbol,
+    ) -> Option<GradualMigrationStatus> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MigrationStatus(contract_name))
+    }
+
+    /// Rollback the active storage layout to a specified target version.
+    pub fn rollback_storage_layout(
+        env: Env,
+        contract_name: Symbol,
+        target_version: u32,
+        approvers: Vec<Address>,
+    ) -> Result<(), Error> {
+        let approved_signers = require_upgrade_approvals_cached(&env, approvers)?;
+
+        let target_schema = Self::get_storage_schema(env.clone(), contract_name.clone(), target_version)
+            .ok_or(Error::StorageLayoutNotFound)?;
+
+        let storage_ver = StorageVersion {
+            current_version: target_version,
+            min_compatible_version: target_version,
+            layout_hash: target_schema.schema_hash,
+            migration_in_progress: false,
+        };
+
+        env.storage().persistent().set(
+            &DataKey::ActiveStorageVersion(contract_name.clone()),
+            &storage_ver,
+        );
+
+        // Reset any migration status
+        env.storage().persistent().remove(&DataKey::MigrationStatus(contract_name.clone()));
+
+        env.events().publish(
+            (
+                symbol_short!("upgrade"),
+                symbol_short!("stor_rb"),
+                contract_name,
+            ),
+            (target_version, approved_signers),
+        );
+
+        Ok(())
+    }
+
     // === DISASTER RECOVERY ===
 
     pub fn set_emergency_signers(
@@ -798,10 +1113,15 @@ impl UpgradeRegistryContract {
             }
         }
 
+        let mut upgrade_config_vec = Vec::new(&env);
+        if let Some(cfg) = upgrade_config {
+            upgrade_config_vec.push_back(cfg);
+        }
+
         let snapshot = RegistrySnapshot {
             admin: admin.clone(),
             upgrade_delay,
-            upgrade_config,
+            upgrade_config: upgrade_config_vec,
             registered_contracts,
             contract_versions,
             history_counts,
@@ -945,8 +1265,8 @@ impl UpgradeRegistryContract {
 
         env.storage().instance().set(&DataKey::Admin, &snapshot.admin);
         env.storage().instance().set(&DataKey::UpgradeDelay, &snapshot.upgrade_delay);
-        if let Some(ref config) = snapshot.upgrade_config {
-            env.storage().instance().set(&DataKey::UpgradeConfig, config);
+        if let Some(config) = snapshot.upgrade_config.get(0) {
+            env.storage().instance().set(&DataKey::UpgradeConfig, &config);
         } else {
             env.storage().instance().remove(&DataKey::UpgradeConfig);
         }
@@ -1044,7 +1364,7 @@ impl UpgradeRegistryContract {
 
         let current_config: Option<UpgradeConfig> = env.storage().instance().get(&DataKey::UpgradeConfig);
         fields_checked += 1;
-        if current_config != snapshot.upgrade_config {
+        if current_config != snapshot.upgrade_config.get(0) {
             mismatches.push_back(soroban_sdk::String::from_str(&env, "upgrade config mismatch"));
         }
 
@@ -1361,7 +1681,9 @@ mod test {
 
     #[test]
     fn test_upgrade_contract_rejects_downgrade() {
-        let (env, _admin, _contract_id, client) = setup();
+        let (env, admin, _contract_id, client) = setup();
+        let signers = soroban_sdk::vec![&env, admin.clone()];
+        client.set_upgrade_signers(&signers, &1, &signers);
         env.ledger().set_timestamp(0);
         let contract_name = symbol_short!("escrow");
         let hash = BytesN::from_array(&env, &[0u8; 32]);
@@ -1370,32 +1692,36 @@ mod test {
         client.register_upgrade(&contract_name, &0, &2, &hash);
 
         // upgrade_contract with new_version = 1 (downgrade) must fail
-        let result = client.try_upgrade_contract(&contract_name, &1, &hash);
+        let result = client.try_upgrade_contract(&hash, &contract_name, &1, &hash, &signers);
         assert_eq!(result, Err(Ok(Error::VersionNotMonotonic)));
     }
 
     #[test]
     fn test_upgrade_contract_rejects_same_version() {
-        let (env, _admin, _contract_id, client) = setup();
+        let (env, admin, _contract_id, client) = setup();
+        let signers = soroban_sdk::vec![&env, admin.clone()];
+        client.set_upgrade_signers(&signers, &1, &signers);
         let contract_name = symbol_short!("escrow");
         let hash = BytesN::from_array(&env, &[0u8; 32]);
 
         client.register_upgrade(&contract_name, &0, &2, &hash);
 
-        let result = client.try_upgrade_contract(&contract_name, &2, &hash);
+        let result = client.try_upgrade_contract(&hash, &contract_name, &2, &hash, &signers);
         assert_eq!(result, Err(Ok(Error::VersionNotMonotonic)));
     }
 
     #[test]
     fn test_upgrade_contract_succeeds_with_higher_version() {
-        let (env, _admin, _contract_id, client) = setup();
+        let (env, admin, _contract_id, client) = setup();
+        let signers = soroban_sdk::vec![&env, admin.clone()];
+        client.set_upgrade_signers(&signers, &1, &signers);
         env.ledger().set_timestamp(0);
         let contract_name = symbol_short!("escrow");
         let hash = BytesN::from_array(&env, &[0u8; 32]);
 
         client.register_upgrade(&contract_name, &0, &2, &hash);
 
-        let result = client.try_upgrade_contract(&contract_name, &3, &hash);
+        let result = client.try_upgrade_contract(&hash, &contract_name, &3, &hash, &signers);
         assert!(result.is_ok());
         assert_eq!(client.get_latest_version(&contract_name), 3);
     }
@@ -1405,9 +1731,12 @@ mod test {
     // ------------------------------------------------------------------
 
     #[test]
-    fn test_upgrade_contract_timelock_not_elapsed() {
-        let delay = 3_600u64; // 1 hour
-        let (env, _admin, _contract_id, client) = setup_with_delay(delay);
+    fn test_upgrade_contract_before_timelock_fails() {
+        let delay = 3_600u64;
+        let (env, admin, _contract_id, client) = setup_with_delay(delay);
+        let signers = soroban_sdk::vec![&env, admin.clone()];
+        client.set_upgrade_signers(&signers, &1, &signers);
+
         let contract_name = symbol_short!("escrow");
         let hash = BytesN::from_array(&env, &[0u8; 32]);
 
@@ -1417,14 +1746,17 @@ mod test {
 
         // Try upgrade_contract before delay has elapsed (t=1500 < 1000+3600)
         env.ledger().set_timestamp(1_500);
-        let result = client.try_upgrade_contract(&contract_name, &2, &hash);
+        let result = client.try_upgrade_contract(&hash, &contract_name, &2, &hash, &signers);
         assert_eq!(result, Err(Ok(Error::TimelockNotElapsed)));
     }
 
     #[test]
     fn test_upgrade_contract_timelock_elapsed() {
         let delay = 3_600u64;
-        let (env, _admin, _contract_id, client) = setup_with_delay(delay);
+        let (env, admin, _contract_id, client) = setup_with_delay(delay);
+        let signers = soroban_sdk::vec![&env, admin.clone()];
+        client.set_upgrade_signers(&signers, &1, &signers);
+
         let contract_name = symbol_short!("escrow");
         let hash = BytesN::from_array(&env, &[0u8; 32]);
 
@@ -1433,7 +1765,7 @@ mod test {
 
         // Advance past delay: 1000 + 3600 = 4600; use 5000 to be safe
         env.ledger().set_timestamp(5_000);
-        let result = client.try_upgrade_contract(&contract_name, &2, &hash);
+        let result = client.try_upgrade_contract(&hash, &contract_name, &2, &hash, &signers);
         assert!(result.is_ok());
         assert_eq!(client.get_latest_version(&contract_name), 2);
     }
@@ -1445,50 +1777,57 @@ mod test {
     #[test]
     fn test_two_step_upgrade_happy_path() {
         let delay = 3_600u64;
-        let (env, _admin, _contract_id, client) = setup_with_delay(delay);
+        let (env, admin, _contract_id, client) = setup_with_delay(delay);
+        let signers = soroban_sdk::vec![&env, admin.clone()];
+        client.set_upgrade_signers(&signers, &1, &signers);
+
         let contract_name = symbol_short!("escrow");
         let hash = BytesN::from_array(&env, &[0u8; 32]);
 
         // Schedule at t=1000; execute_after = 1000 + 3600 = 4600
         env.ledger().set_timestamp(1_000);
-        client.schedule_upgrade(&contract_name, &1, &hash);
+        client.schedule_upgrade(&hash, &contract_name, &1, &hash, &signers);
 
-        let pending = client.get_pending_upgrade(&contract_name).unwrap();
+        let pending = client.get_pending_upgrade().unwrap();
         assert_eq!(pending.new_version, 1);
-        assert_eq!(pending.execute_after, 4_600);
+        assert_eq!(pending.executable_after, 4_600);
 
         // Cannot execute before delay
         env.ledger().set_timestamp(2_000);
-        let result = client.try_execute_pending_upgrade(&contract_name);
+        let result = client.try_execute_pending_upgrade(&signers);
         assert_eq!(result, Err(Ok(Error::TimelockNotElapsed)));
 
         // Execute after delay
         env.ledger().set_timestamp(5_000);
-        client.execute_pending_upgrade(&contract_name);
+        client.execute_pending_upgrade(&signers);
 
         assert_eq!(client.get_latest_version(&contract_name), 1);
-        assert!(client.get_pending_upgrade(&contract_name).is_none());
+        assert!(client.get_pending_upgrade().is_none());
     }
 
     #[test]
     fn test_schedule_upgrade_rejects_downgrade() {
-        let (env, _admin, _contract_id, client) = setup();
+        let (env, admin, _contract_id, client) = setup();
+        let signers = soroban_sdk::vec![&env, admin.clone()];
+        client.set_upgrade_signers(&signers, &1, &signers);
+
         let contract_name = symbol_short!("escrow");
         let hash = BytesN::from_array(&env, &[0u8; 32]);
 
         client.register_upgrade(&contract_name, &0, &3, &hash);
 
         // Try to schedule a downgrade to version 2
-        let result = client.try_schedule_upgrade(&contract_name, &2, &hash);
+        let result = client.try_schedule_upgrade(&hash, &contract_name, &2, &hash, &signers);
         assert_eq!(result, Err(Ok(Error::VersionNotMonotonic)));
     }
 
     #[test]
     fn test_execute_without_schedule_fails() {
-        let (_, _admin, _contract_id, client) = setup();
-        let contract_name = symbol_short!("escrow");
+        let (env, admin, _contract_id, client) = setup();
+        let signers = soroban_sdk::vec![&env, admin.clone()];
+        client.set_upgrade_signers(&signers, &1, &signers);
 
-        let result = client.try_execute_pending_upgrade(&contract_name);
+        let result = client.try_execute_pending_upgrade(&signers);
         assert_eq!(result, Err(Ok(Error::NoPendingUpgrade)));
     }
 
@@ -1498,7 +1837,10 @@ mod test {
 
     #[test]
     fn test_both_paths_reject_downgrade() {
-        let (env, _admin, _contract_id, client) = setup();
+        let (env, admin, _contract_id, client) = setup();
+        let signers = soroban_sdk::vec![&env, admin.clone()];
+        client.set_upgrade_signers(&signers, &1, &signers);
+
         let contract_name = symbol_short!("escrow");
         let hash = BytesN::from_array(&env, &[0u8; 32]);
 
@@ -1508,13 +1850,13 @@ mod test {
 
         // PATH B direct — downgrade attempt
         assert_eq!(
-            client.try_upgrade_contract(&contract_name, &4, &hash),
+            client.try_upgrade_contract(&hash, &contract_name, &4, &hash, &signers),
             Err(Ok(Error::VersionNotMonotonic))
         );
 
         // PATH A schedule — downgrade attempt
         assert_eq!(
-            client.try_schedule_upgrade(&contract_name, &3, &hash),
+            client.try_schedule_upgrade(&hash, &contract_name, &3, &hash, &signers),
             Err(Ok(Error::VersionNotMonotonic))
         );
 
@@ -1526,7 +1868,7 @@ mod test {
 
     #[test]
     fn test_register_source_commit() {
-        let (env, admin, client) = setup();
+        let (env, admin, _contract_id, client) = setup();
         let contract_name = symbol_short!("escrow");
         let commit_hash = BytesN::from_array(&env, &[0xab; 32]);
 
@@ -1538,7 +1880,7 @@ mod test {
 
     #[test]
     fn test_register_source_commit_duplicate() {
-        let (env, admin, client) = setup();
+        let (env, admin, _contract_id, client) = setup();
         let contract_name = symbol_short!("escrow");
         let commit_hash = BytesN::from_array(&env, &[0xab; 32]);
 
@@ -1556,8 +1898,8 @@ mod test {
 
     #[test]
     fn test_get_source_commit_none() {
-        let (env, _admin, client) = setup();
-        let contract_name = symbol_short!("nonexistent");
+        let (_env, _admin, _contract_id, client) = setup();
+        let contract_name = symbol_short!("nonexist");
 
         let stored = client.get_source_commit(&contract_name, &1);
         assert_eq!(stored, None);
@@ -1565,10 +1907,10 @@ mod test {
 
     #[test]
     fn test_register_source_commit_wrong_admin() {
-        let (env, _admin, client) = setup();
+        let (env, _admin, _contract_id, client) = setup();
         let contract_name = symbol_short!("escrow");
         let commit_hash = BytesN::from_array(&env, &[0xab; 32]);
-        let wrong_admin = soroban_sdk::testutils::Address::generate(&env);
+        let wrong_admin = Address::generate(&env);
 
         // mock_all_auths is active so require_auth passes, but our extra
         // stored_admin check catches the mismatch.
@@ -1579,7 +1921,7 @@ mod test {
 
     #[test]
     fn test_source_commit_independent_per_contract() {
-        let (env, admin, client) = setup();
+        let (env, admin, _contract_id, client) = setup();
         let escrow_name = symbol_short!("escrow");
         let treasury_name = symbol_short!("treasury");
         let hash1 = BytesN::from_array(&env, &[0xab; 32]);
@@ -1590,5 +1932,185 @@ mod test {
 
         assert_eq!(client.get_source_commit(&escrow_name, &1), Some(hash1));
         assert_eq!(client.get_source_commit(&treasury_name, &1), Some(hash2));
+    }
+
+    // ─── Storage layout & migration tests ────────────────────────────────
+
+    fn make_test_storage_schema(env: &Env, version: u32, fields: Vec<StorageField>) -> StorageLayoutSchema {
+        let schema_hash = CompatibilityValidator::compute_schema_hash(env, &fields);
+        StorageLayoutSchema {
+            version,
+            schema_hash,
+            fields,
+        }
+    }
+
+    #[test]
+    fn test_storage_schema_registration_and_retrieval() {
+        let (env, admin, _contract_id, client) = setup();
+        let signers = soroban_sdk::vec![&env, admin.clone()];
+        client.set_upgrade_signers(&signers, &1, &signers);
+
+        let contract_name = symbol_short!("escrow");
+        let field1 = StorageField {
+            name: symbol_short!("admin"),
+            field_type: StorageFieldType::Address,
+            slot_index: 0,
+            deprecated: false,
+        };
+        let field2 = StorageField {
+            name: symbol_short!("fee"),
+            field_type: StorageFieldType::U32,
+            slot_index: 1,
+            deprecated: false,
+        };
+        let schema_v1 = make_test_storage_schema(&env, 1, soroban_sdk::vec![&env, field1, field2]);
+
+        client.register_storage_schema(&contract_name, &schema_v1, &signers);
+
+        let stored = client.get_storage_schema(&contract_name, &1).unwrap();
+        assert_eq!(stored.version, 1);
+        assert_eq!(stored.schema_hash, schema_v1.schema_hash);
+
+        let active_ver = client.get_active_storage_version(&contract_name).unwrap();
+        assert_eq!(active_ver.current_version, 1);
+        assert_eq!(active_ver.layout_hash, schema_v1.schema_hash);
+        assert!(!active_ver.migration_in_progress);
+    }
+
+    #[test]
+    fn test_storage_schema_additive_compatibility() {
+        let (env, admin, _contract_id, client) = setup();
+        let signers = soroban_sdk::vec![&env, admin.clone()];
+        client.set_upgrade_signers(&signers, &1, &signers);
+
+        let contract_name = symbol_short!("escrow");
+        let field1 = StorageField {
+            name: symbol_short!("admin"),
+            field_type: StorageFieldType::Address,
+            slot_index: 0,
+            deprecated: false,
+        };
+        let field2 = StorageField {
+            name: symbol_short!("fee"),
+            field_type: StorageFieldType::U32,
+            slot_index: 1,
+            deprecated: false,
+        };
+        let schema_v1 = make_test_storage_schema(&env, 1, soroban_sdk::vec![&env, field1.clone(), field2.clone()]);
+        client.register_storage_schema(&contract_name, &schema_v1, &signers);
+
+        let field3 = StorageField {
+            name: symbol_short!("paused"),
+            field_type: StorageFieldType::Bool,
+            slot_index: 2,
+            deprecated: false,
+        };
+        let schema_v2 = make_test_storage_schema(&env, 2, soroban_sdk::vec![&env, field1, field2, field3]);
+
+        let report = client.validate_upgrade_compatibility(&contract_name, &schema_v2);
+        assert!(report.is_compatible);
+        assert!(!report.requires_migration);
+        assert_eq!(report.added_fields, 1);
+
+        client.register_storage_schema(&contract_name, &schema_v2, &signers);
+        let active_ver = client.get_active_storage_version(&contract_name).unwrap();
+        assert_eq!(active_ver.current_version, 2);
+    }
+
+    #[test]
+    fn test_storage_schema_incompatible_rejected() {
+        let (env, admin, _contract_id, client) = setup();
+        let signers = soroban_sdk::vec![&env, admin.clone()];
+        client.set_upgrade_signers(&signers, &1, &signers);
+
+        let contract_name = symbol_short!("escrow");
+        let field1 = StorageField {
+            name: symbol_short!("fee"),
+            field_type: StorageFieldType::U32,
+            slot_index: 0,
+            deprecated: false,
+        };
+        let schema_v1 = make_test_storage_schema(&env, 1, soroban_sdk::vec![&env, field1]);
+        client.register_storage_schema(&contract_name, &schema_v1, &signers);
+
+        // Incompatible type change: U32 -> U64
+        let field1_bad = StorageField {
+            name: symbol_short!("fee"),
+            field_type: StorageFieldType::U64,
+            slot_index: 0,
+            deprecated: false,
+        };
+        let schema_v2_bad = make_test_storage_schema(&env, 2, soroban_sdk::vec![&env, field1_bad]);
+
+        let report = client.validate_upgrade_compatibility(&contract_name, &schema_v2_bad);
+        assert!(!report.is_compatible);
+        assert!(report.requires_migration);
+    }
+
+    #[test]
+    fn test_gradual_storage_migration_flow() {
+        let (env, admin, _contract_id, client) = setup();
+        let signers = soroban_sdk::vec![&env, admin.clone()];
+        client.set_upgrade_signers(&signers, &1, &signers);
+
+        let contract_name = symbol_short!("escrow");
+        let field1 = StorageField {
+            name: symbol_short!("admin"),
+            field_type: StorageFieldType::Address,
+            slot_index: 0,
+            deprecated: false,
+        };
+        let schema_v1 = make_test_storage_schema(&env, 1, soroban_sdk::vec![&env, field1.clone()]);
+        let schema_v2 = make_test_storage_schema(&env, 2, soroban_sdk::vec![&env, field1]);
+
+        client.register_storage_schema(&contract_name, &schema_v1, &signers);
+        client.register_storage_schema(&contract_name, &schema_v2, &signers);
+
+        // Start migration of 500 records
+        let initial_status = client.start_storage_migration(&contract_name, &1, &2, &500, &signers);
+        assert_eq!(initial_status.total_records, 500);
+        assert_eq!(initial_status.processed_records, 0);
+        assert!(!initial_status.completed);
+
+        // Execute batch step of 200
+        let step1 = client.execute_migration_step(&contract_name, &200, &signers);
+        assert_eq!(step1.processed_records, 200);
+        assert!(!step1.completed);
+
+        // Execute batch step of 300 to complete
+        let step2 = client.execute_migration_step(&contract_name, &300, &signers);
+        assert_eq!(step2.processed_records, 500);
+        assert!(step2.completed);
+
+        let active_ver = client.get_active_storage_version(&contract_name).unwrap();
+        assert_eq!(active_ver.current_version, 2);
+        assert!(!active_ver.migration_in_progress);
+    }
+
+    #[test]
+    fn test_storage_layout_rollback() {
+        let (env, admin, _contract_id, client) = setup();
+        let signers = soroban_sdk::vec![&env, admin.clone()];
+        client.set_upgrade_signers(&signers, &1, &signers);
+
+        let contract_name = symbol_short!("escrow");
+        let field1 = StorageField {
+            name: symbol_short!("admin"),
+            field_type: StorageFieldType::Address,
+            slot_index: 0,
+            deprecated: false,
+        };
+        let schema_v1 = make_test_storage_schema(&env, 1, soroban_sdk::vec![&env, field1.clone()]);
+        let schema_v2 = make_test_storage_schema(&env, 2, soroban_sdk::vec![&env, field1]);
+
+        client.register_storage_schema(&contract_name, &schema_v1, &signers);
+        client.register_storage_schema(&contract_name, &schema_v2, &signers);
+
+        assert_eq!(client.get_active_storage_version(&contract_name).unwrap().current_version, 2);
+
+        // Rollback to version 1
+        client.rollback_storage_layout(&contract_name, &1, &signers);
+        assert_eq!(client.get_active_storage_version(&contract_name).unwrap().current_version, 1);
     }
 }
