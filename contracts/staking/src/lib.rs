@@ -16,7 +16,7 @@ use shared::{
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
-    Symbol, Vec,
+    IntoVal, Symbol, Vec,
 };
 
 
