@@ -14,6 +14,9 @@ use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, Bytes, Env, Symbol, Vec,
     IntoVal, BytesN,
 };
+use shared::{
+    AdminTransfer, AdminChangeProposal, MIN_ADMIN_TIMELOCK_SECS, ADMIN_COOLING_OFF_SECS, SharedError
+};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -173,6 +176,26 @@ pub struct EmergencyReleaseExecutedEventData {
 }
 
 // ---------------------------------------------------------------------------
+// Admin Events
+// ---------------------------------------------------------------------------
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminChangeProposedEventData {
+    pub contract: Address,
+    pub old_admin: Address,
+    pub new_admin: Address,
+    pub effective_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminChangeAcceptedEventData {
+    pub contract: Address,
+    pub new_admin: Address,
+}
+
+// ---------------------------------------------------------------------------
 // Graduated fee schedule (Issue #676)
 // ---------------------------------------------------------------------------
 
@@ -285,6 +308,10 @@ pub enum DataKey {
     RollbackProposalCount,
     /// Store a vector of escrow transition logs.
     TransitionLog(u64),
+    /// Pending admin change tracking.
+    PendingAdminTransfer,
+    /// Last admin change timestamp for cooling-off enforcement.
+    LastAdminChange,
 }
 
 // ---------------------------------------------------------------------------
@@ -455,6 +482,105 @@ impl EscrowContract {
                 },
             );
         }
+    }
+
+    /// Propose a new admin for the Escrow contract.
+    /// The new admin can only be accepted after the `MIN_ADMIN_TIMELOCK_SECS` has passed.
+    /// Also enforces `ADMIN_COOLING_OFF_SECS` between consecutive admin changes.
+    pub fn propose_admin_change(env: Env, new_admin: Address) {
+        let current_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Admin, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        current_admin.require_auth();
+
+        let last_change: u64 = env.storage().persistent().get(&DataKey::LastAdminChange).unwrap_or(0);
+        let current_time = env.ledger().timestamp();
+
+        if current_time < last_change + ADMIN_COOLING_OFF_SECS {
+            panic!("Cooling-off period active");
+        }
+
+        let effective_at = current_time.checked_add(MIN_ADMIN_TIMELOCK_SECS).unwrap();
+        
+        let pending = AdminTransfer {
+            new_admin: new_admin.clone(),
+            effective_at,
+            status: AdminChangeProposal::Proposed,
+        };
+
+        env.storage().persistent().set(&DataKey::PendingAdminTransfer, &pending);
+        env.storage().persistent().extend_ttl(&DataKey::PendingAdminTransfer, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("proposed")),
+            AdminChangeProposedEventData {
+                contract: env.current_contract_address(),
+                old_admin: current_admin,
+                new_admin,
+                effective_at,
+            },
+        );
+    }
+
+    /// Accept the admin role if a pending proposal exists and the timelock has expired.
+    pub fn accept_admin_role(env: Env, new_admin: Address) {
+        new_admin.require_auth();
+
+        let mut pending: AdminTransfer = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingAdminTransfer)
+            .expect("No pending admin transfer");
+
+        if pending.new_admin != new_admin {
+            panic!("Unauthorized to accept role");
+        }
+
+        if env.ledger().timestamp() < pending.effective_at {
+            panic!("Timelock not expired");
+        }
+
+        if pending.status != AdminChangeProposal::Proposed {
+            panic!("Invalid proposal state");
+        }
+
+        pending.status = AdminChangeProposal::Accepted;
+        
+        env.storage().persistent().set(&DataKey::Admin, &new_admin);
+        env.storage().persistent().extend_ttl(&DataKey::Admin, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        
+        env.storage().persistent().set(&DataKey::LastAdminChange, &env.ledger().timestamp());
+        env.storage().persistent().extend_ttl(&DataKey::LastAdminChange, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        
+        env.storage().persistent().remove(&DataKey::PendingAdminTransfer);
+
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("accepted")),
+            AdminChangeAcceptedEventData {
+                contract: env.current_contract_address(),
+                new_admin,
+            },
+        );
+    }
+
+    /// Immediately revokes the current admin and assigns a new one.
+    /// Can only be called by the multisig admin contract.
+    pub fn revoke_admin_emergency(env: Env, new_admin: Address) {
+        let multisig: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultisigAdmin)
+            .expect("Multisig not configured");
+        multisig.require_auth();
+        
+        env.storage().persistent().set(&DataKey::Admin, &new_admin);
+        env.storage().persistent().extend_ttl(&DataKey::Admin, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        env.storage().persistent().remove(&DataKey::PendingAdminTransfer);
     }
 
     /// Update the platform fee — admin only, capped at 1 000 bps (10%).

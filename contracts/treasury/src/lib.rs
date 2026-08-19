@@ -157,18 +157,18 @@ pub struct PendingAllocation {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PendingAdminChange {
+pub struct AdminChangeProposedEvent {
+    pub contract: Address,
+    pub old_admin: Address,
     pub new_admin: Address,
     pub effective_at: u64,
 }
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AdminChangeProposedEvent {
+pub struct AdminChangeAcceptedEvent {
     pub contract: Address,
-    pub old_admin: Address,
     pub new_admin: Address,
-    pub effective_at: u64,
 }
 
 #[contracttype]
@@ -251,7 +251,8 @@ pub enum DataKey {
     PendingAllocationCount,
     PendingAllocation(u32),
     AllocationApproval(u32, Address),
-    PendingAdmin,
+    PendingAdminTransfer,
+    LastAdminChange,
     AutoBurnRateBps,
     BurnQueue,
     DistributionReceipt(u64),
@@ -374,25 +375,30 @@ impl TreasuryContract {
         new_admin: Address,
     ) -> Result<(), Error> {
         Self::require_admin(&env, &current_admin)?;
-        let old_admin = Self::admin(&env)?;
-        let effective_at = env
-            .ledger()
-            .timestamp()
-            .checked_add(ADMIN_CHANGE_TIMELOCK)
+        
+        let last_change: u64 = env.storage().persistent().get(&DataKey::LastAdminChange).unwrap_or(0);
+        let current_time = env.ledger().timestamp();
+        if current_time < last_change + ADMIN_COOLING_OFF_SECS {
+            return Err(Error::CoolingOffPeriod);
+        }
+
+        let effective_at = current_time
+            .checked_add(MIN_ADMIN_TIMELOCK_SECS)
             .ok_or(Error::InvalidAdminChange)?;
 
-        let pending = PendingAdminChange {
+        let pending = AdminTransfer {
             new_admin: new_admin.clone(),
             effective_at,
+            status: AdminChangeProposal::Proposed,
         };
         env.storage()
             .persistent()
-            .set(&DataKey::PendingAdmin, &pending);
+            .set(&DataKey::PendingAdminTransfer, &pending);
         env.events().publish(
             (symbol_short!("admin"), symbol_short!("proposed")),
             AdminChangeProposedEvent {
                 contract: env.current_contract_address(),
-                old_admin,
+                old_admin: current_admin,
                 new_admin,
                 effective_at,
             },
@@ -402,33 +408,58 @@ impl TreasuryContract {
 
     pub fn accept_admin_change(env: Env, new_admin: Address) -> Result<(), Error> {
         new_admin.require_auth();
-        let pending: PendingAdminChange = env
+        let mut pending: AdminTransfer = env
             .storage()
             .persistent()
-            .get(&DataKey::PendingAdmin)
+            .get(&DataKey::PendingAdminTransfer)
             .ok_or(Error::NoPendingAdminChange)?;
         if pending.new_admin != new_admin {
             return Err(Error::Unauthorized);
         }
         if env.ledger().timestamp() < pending.effective_at {
-            return Err(Error::AdminChangeNotYetEffective);
+            return Err(Error::TimelockNotExpired);
         }
+        if pending.status != AdminChangeProposal::Proposed {
+            return Err(Error::InvalidAdminChange);
+        }
+        
+        pending.status = AdminChangeProposal::Accepted;
+
         env.storage().persistent().set(&DataKey::Admin, &new_admin);
-        env.storage().persistent().remove(&DataKey::PendingAdmin);
+        env.storage().persistent().set(&DataKey::LastAdminChange, &env.ledger().timestamp());
+        env.storage().persistent().remove(&DataKey::PendingAdminTransfer);
+        
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("accepted")),
+            AdminChangeAcceptedEvent {
+                contract: env.current_contract_address(),
+                new_admin,
+            },
+        );
         Ok(())
     }
 
     pub fn cancel_admin_change(env: Env, multisig: Address) -> Result<(), Error> {
         multisig.require_auth();
-        if !env.storage().persistent().has(&DataKey::PendingAdmin) {
+        if !env.storage().persistent().has(&DataKey::PendingAdminTransfer) {
             return Err(Error::NoPendingAdminChange);
         }
-        env.storage().persistent().remove(&DataKey::PendingAdmin);
+        env.storage().persistent().remove(&DataKey::PendingAdminTransfer);
         Ok(())
     }
 
-    pub fn get_pending_admin_change(env: Env) -> Option<PendingAdminChange> {
-        env.storage().persistent().get(&DataKey::PendingAdmin)
+    pub fn revoke_admin_emergency(env: Env, new_admin: Address) -> Result<(), Error> {
+        // Assume multisig is authorized to call this via timelock or direct consensus
+        let timelock: Address = env.storage().persistent().get(&DataKey::Timelock).ok_or(Error::NotInitialized)?;
+        timelock.require_auth();
+        
+        env.storage().persistent().set(&DataKey::Admin, &new_admin);
+        env.storage().persistent().remove(&DataKey::PendingAdminTransfer);
+        Ok(())
+    }
+
+    pub fn get_pending_admin_change(env: Env) -> Option<AdminTransfer> {
+        env.storage().persistent().get(&DataKey::PendingAdminTransfer)
     }
 
     pub fn get_admin(env: Env) -> Result<Address, Error> {
@@ -496,6 +527,9 @@ impl TreasuryContract {
         let stored_admin = Self::admin(env)?;
         if stored_admin != *admin {
             return Err(Error::Unauthorized);
+        }
+        if env.storage().persistent().has(&DataKey::PendingAdminTransfer) {
+            return Err(Error::SuspendedDuringAdminTransfer);
         }
         Ok(())
     }
