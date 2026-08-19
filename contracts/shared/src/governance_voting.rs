@@ -1,6 +1,6 @@
-#![no_std]
+//! Shared governance voting primitives.
 
-use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, Symbol};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, IntoVal, Symbol, TryIntoVal, Val};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -78,9 +78,13 @@ pub fn compute_commitment_hash(
     input.push_back((proposal_id >> 16) as u8);
     input.push_back((proposal_id >> 8) as u8);
     input.push_back(proposal_id as u8);
-    input.append(&mut voter.clone().into_val(env).try_into_val(env).unwrap());
+    let voter_val: Val = voter.clone().into_val(env);
+    let mut voter_bytes: Bytes = voter_val.try_into_val(env).unwrap();
+    input.append(&mut voter_bytes);
     input.push_back(if support { 1 } else { 0 });
-    input.append(&mut salt.clone().into_val(env).try_into_val(env).unwrap());
+    let salt_val: Val = salt.clone().into_val(env);
+    let mut salt_bytes: Bytes = salt_val.try_into_val(env).unwrap();
+    input.append(&mut salt_bytes);
     env.crypto().sha256(&input).into()
 }
 
@@ -106,7 +110,7 @@ pub fn calculate_voting_weight(snapshot_weight: i128, delegated_power: i128) -> 
 /// Determine the current voting phase based on timestamps.
 pub fn get_vote_phase(
     env: &Env,
-    created_at: u64,
+    _created_at: u64,
     commit_phase_ends_at: u64,
     voting_ends_at: u64,
 ) -> VotePhase {

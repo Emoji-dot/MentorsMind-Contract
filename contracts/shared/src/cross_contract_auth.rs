@@ -19,7 +19,7 @@ impl ContractRegistry for InterfaceRegistryLookup {
         env.invoke_contract(
             registry,
             &Symbol::new(env, "verify"),
-            soroban_sdk::vec![env, candidate.clone().into(), interface_id.into()],
+            soroban_sdk::vec![env, candidate.clone().to_val(), interface_id.to_val()],
         )
     }
 }
