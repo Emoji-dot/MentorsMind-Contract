@@ -1,6 +1,4 @@
-#![no_std]
-
-use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, Symbol};
+use soroban_sdk::{contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env, Symbol};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -29,24 +27,28 @@ pub struct VoteCommitment {
     pub committed_at: u64,
 }
 
-/// A revealed vote recorded during the reveal phase.
+/// A revealed vote stored during the reveal phase.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RevealedVote {
     pub proposal_id: u32,
     pub voter: Address,
     pub support: bool,
-    pub weight: i128,
+    pub voting_weight: i128,
     pub revealed_at: u64,
 }
 
 /// The current phase of a proposal's voting lifecycle.
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
 pub enum VotePhase {
-    Commit,
-    Reveal,
-    Ended,
+    /// Commit phase: voters submit commitment hashes.
+    Commit = 1,
+    /// Reveal phase: voters reveal their actual votes.
+    Reveal = 2,
+    /// Voting has ended.
+    Ended = 3,
 }
 
 /// A flag raised when vote manipulation is detected.
@@ -65,7 +67,7 @@ pub struct ManipulationFlag {
 // Commitment hash computation
 // ---------------------------------------------------------------------------
 
-/// Compute SHA-256(proposal_id || voter || support || salt).
+/// Compute a commitment hash: sha256(proposal_id || voter || support || salt).
 pub fn compute_commitment_hash(
     env: &Env,
     proposal_id: u32,
@@ -78,9 +80,9 @@ pub fn compute_commitment_hash(
     input.push_back((proposal_id >> 16) as u8);
     input.push_back((proposal_id >> 8) as u8);
     input.push_back(proposal_id as u8);
-    input.append(&mut voter.clone().into_val(env).try_into_val(env).unwrap());
+    input.append(&mut voter.to_xdr(env));
     input.push_back(if support { 1 } else { 0 });
-    input.append(&mut salt.clone().into_val(env).try_into_val(env).unwrap());
+    input.append(&mut salt.to_xdr(env));
     env.crypto().sha256(&input).into()
 }
 
@@ -106,7 +108,7 @@ pub fn calculate_voting_weight(snapshot_weight: i128, delegated_power: i128) -> 
 /// Determine the current voting phase based on timestamps.
 pub fn get_vote_phase(
     env: &Env,
-    created_at: u64,
+    _created_at: u64,
     commit_phase_ends_at: u64,
     voting_ends_at: u64,
 ) -> VotePhase {

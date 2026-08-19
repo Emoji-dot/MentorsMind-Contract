@@ -1475,12 +1475,17 @@ fn validate_upgrade_config(signers: &Vec<Address>, threshold: u32) -> Result<(),
 }
 
 fn require_upgrade_approvals(env: &Env, approvers: Vec<Address>) -> Result<Vec<Address>, Error> {
-    let config = get_upgrade_config(env)?;
-    validate_approval_set(&config, &approvers)?;
-    for signer in approvers.iter() {
-        signer.require_auth();
+    if let Ok(config) = get_upgrade_config(env) {
+        validate_approval_set(&config, &approvers)?;
+        for signer in approvers.iter() {
+            signer.require_auth();
+        }
+        Ok(approvers)
+    } else {
+        let admin = require_admin(env)?;
+        admin.require_auth();
+        Ok(soroban_sdk::vec![env, admin])
     }
-    Ok(approvers)
 }
 
 #[allow(dead_code)]

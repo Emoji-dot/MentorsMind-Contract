@@ -1,4 +1,4 @@
-use soroban_sdk::{Address, Env, Symbol};
+use soroban_sdk::{Address, Env, IntoVal, Symbol};
 
 /// Registry capable of attesting that a given address is the legitimate,
 /// currently-authorized instance of a named system interface (e.g.
@@ -19,7 +19,7 @@ impl ContractRegistry for InterfaceRegistryLookup {
         env.invoke_contract(
             registry,
             &Symbol::new(env, "verify"),
-            soroban_sdk::vec![env, candidate.clone().into(), interface_id.into()],
+            soroban_sdk::vec![env, candidate.clone().into_val(env), interface_id.into_val(env)],
         )
     }
 }
