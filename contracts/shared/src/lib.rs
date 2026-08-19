@@ -22,6 +22,7 @@ pub mod storage;
 pub mod ttl_utils;
 pub mod interface_id;
 pub mod validation;
+pub mod reputation;
 
 pub use disaster_recovery::{
     compute_checksum, push_snapshot_index, RollbackApproval, RollbackProposal, SnapshotMeta,
@@ -59,6 +60,10 @@ pub use staking::{
 pub use storage::{EternalStorage, StorageType, InstanceKey, PersistentKey, TempKey};
 pub use ttl_utils::{next_bump_interval, should_bump_ttl};
 pub use validation::{Validator, ValidationError, require_auth_and_validate};
+pub use reputation::{
+    analyze_review_pattern, detect_sybil, interaction_commitment, BehavioralAnalysis,
+    ReputationProof, SybilDetection,
+};
 
 /// Common error codes shared across all MentorsMind contracts.
 ///
