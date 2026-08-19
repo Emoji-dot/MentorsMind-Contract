@@ -1,8 +1,9 @@
 #![no_std]
 
-use shared::EscrowRecord;
+use shared::{analyze_review_pattern, interaction_commitment, BehavioralAnalysis, EscrowRecord, ReputationProof};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, IntoVal, Symbol,
+    contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal,
+    Symbol, Vec,
 };
 
 // ── Storage keys ────────────────────────────────────────────────────────────
@@ -20,6 +21,9 @@ pub struct ReviewRecord {
     pub rating: u32,
     pub timestamp: u64,
     pub comment_hash: BytesN<32>,
+    pub authenticity_proof: ReputationProof,
+    pub stake_amount: i128,
+    pub investigation_required: bool,
 }
 
 #[contracttype]
@@ -48,6 +52,12 @@ pub enum DataKey {
     Rehabilitated(Address),
     ReviewDispute(Symbol),
     ThresholdProof(Address, u32),
+    SessionRegistry,
+    ReviewToken,
+    ReviewStakeBase,
+    ReviewTimestamps(Address),
+    ReviewRatings(Address),
+    ReviewSignalScore(Address),
 }
 
 pub const REVIEW_DISPUTE_WINDOW_SECS: u64 = 14 * 24 * 3600;
@@ -91,6 +101,23 @@ impl ReputationContract {
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
     }
 
+    pub fn configure_review_security(
+        env: Env,
+        admin: Address,
+        session_registry: Address,
+        review_token: Address,
+        base_stake: i128,
+    ) {
+        let escrow: Address = env.storage().instance().get(&ESCROW).expect("Not initialized");
+        admin.require_auth();
+        if admin != escrow || base_stake <= 0 {
+            panic!("Unauthorized");
+        }
+        env.storage().instance().set(&DataKey::SessionRegistry, &session_registry);
+        env.storage().instance().set(&DataKey::ReviewToken, &review_token);
+        env.storage().instance().set(&DataKey::ReviewStakeBase, &base_stake);
+    }
+
     /// Submit a review for a completed session.
     /// Caller must be the learner; session must be Released in escrow.
     pub fn submit_review(
@@ -132,6 +159,26 @@ impl ReputationContract {
             panic!("SessionNotReleased");
         }
 
+        let proof = if env.storage().instance().has(&DataKey::SessionRegistry) {
+            Self::load_and_validate_proof(&env, &session_id, &mentor, &learner)
+        } else {
+            ReputationProof {
+                session_id: session_id.clone(),
+                mentor: mentor.clone(),
+                learner: learner.clone(),
+                completed_at: env.ledger().timestamp(),
+                commitment: interaction_commitment(
+                    &env,
+                    &session_id,
+                    &mentor,
+                    &learner,
+                    env.ledger().timestamp(),
+                ),
+            }
+        };
+        let stake_amount = Self::collect_review_stake(&env, &learner, rating);
+        let analysis = Self::record_behavior(&env, &mentor, rating);
+
         // Store review
         let record = ReviewRecord {
             session_id: session_id.clone(),
@@ -140,6 +187,9 @@ impl ReputationContract {
             rating,
             timestamp: env.ledger().timestamp(),
             comment_hash,
+            authenticity_proof: proof,
+            stake_amount,
+            investigation_required: analysis.risk_score >= 60,
         };
         env.storage().persistent().set(&review_key, &record);
         env.storage()
@@ -174,6 +224,56 @@ impl ReputationContract {
             ),
             (session_id, learner, rating, env.ledger().timestamp()),
         );
+    }
+
+    fn load_and_validate_proof(
+        env: &Env,
+        session_id: &Symbol,
+        mentor: &Address,
+        learner: &Address,
+    ) -> ReputationProof {
+        let registry: Address = env.storage().instance().get(&DataKey::SessionRegistry)
+            .expect("SessionRegistryNotConfigured");
+        let proof: ReputationProof = env.invoke_contract(
+            &registry,
+            &Symbol::new(env, "get_completion_proof"),
+            (session_id.clone(),).into_val(env),
+        );
+        if proof.mentor != *mentor || proof.learner != *learner || proof.commitment
+            != interaction_commitment(env, session_id, mentor, learner, proof.completed_at)
+        {
+            panic!("InvalidReputationProof");
+        }
+        proof
+    }
+
+    fn collect_review_stake(env: &Env, learner: &Address, rating: u32) -> i128 {
+        let base: i128 = env.storage().instance().get(&DataKey::ReviewStakeBase).unwrap_or(0);
+        if base == 0 { return 0; }
+        let token_addr: Address = env.storage().instance().get(&DataKey::ReviewToken)
+            .expect("ReviewTokenNotConfigured");
+        let amount = base.checked_mul((rating.max(1)) as i128).expect("StakeOverflow");
+        token::Client::new(env, &token_addr).transfer(learner, &env.current_contract_address(), &amount);
+        amount
+    }
+
+    fn record_behavior(env: &Env, mentor: &Address, rating: u32) -> BehavioralAnalysis {
+        let timestamps_key = DataKey::ReviewTimestamps(mentor.clone());
+        let ratings_key = DataKey::ReviewRatings(mentor.clone());
+        let mut timestamps: Vec<u64> = env.storage().persistent().get(&timestamps_key).unwrap_or(Vec::new(env));
+        let mut ratings: Vec<u32> = env.storage().persistent().get(&ratings_key).unwrap_or(Vec::new(env));
+        timestamps.push_back(env.ledger().timestamp());
+        ratings.push_back(rating);
+        while timestamps.len() > 10 { timestamps.remove(0); ratings.remove(0); }
+        let analysis = analyze_review_pattern(&timestamps, &ratings, env.ledger().timestamp());
+        env.storage().persistent().set(&timestamps_key, &timestamps);
+        env.storage().persistent().set(&ratings_key, &ratings);
+        env.storage().persistent().set(&DataKey::ReviewSignalScore(mentor.clone()), &analysis.risk_score);
+        analysis
+    }
+
+    pub fn get_review_risk(env: Env, mentor: Address) -> u32 {
+        env.storage().persistent().get(&DataKey::ReviewSignalScore(mentor)).unwrap_or(0)
     }
 
     /// Returns (avg_rating * 100, review_count) for a mentor, incorporating slash penalties (Issue #751).
@@ -548,7 +648,7 @@ impl ReputationContract {
         let commitment = env.crypto().sha256(&bytes);
         
         let proof = ReputationThresholdProof {
-            commitment,
+            commitment: commitment.into(),
             threshold: min_rating,
             proof_type: Symbol::new(&env, "rating_threshold"),
         };
@@ -573,7 +673,9 @@ impl ReputationContract {
         bytes.append(&secret_nonce.into_val(&env));
         let commitment = env.crypto().sha256(&bytes);
         
-        commitment == proof.commitment && proof.proof_type == Symbol::new(&env, "rating_threshold")
+        let commitment_bytes: BytesN<32> = commitment.into();
+        commitment_bytes == proof.commitment
+            && proof.proof_type == Symbol::new(&env, "rating_threshold")
     }
 
 }

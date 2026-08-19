@@ -6,9 +6,9 @@ use shared::events::{
     evt_escrow_refunded, evt_escrow_released, evt_escrow_resolved, evt_escrow_stuck_reported,
 };
 use shared::{
-    compute_checksum, push_snapshot_index, EscrowRecord, EscrowStatus, RollbackProposal,
-    SnapshotMeta, StateVerificationReport, EMERGENCY_SIGNERS, EMERGENCY_THRESHOLD, MAX_SNAPSHOTS,
-    StateMachine, EscrowTransitionLog, GasEstimate, Validator,
+    compute_checksum, push_snapshot_index, CrossContractAuth, EscrowRecord, EscrowStatus,
+    RollbackProposal, SnapshotMeta, StateVerificationReport, EMERGENCY_SIGNERS,
+    EMERGENCY_THRESHOLD, MAX_SNAPSHOTS, StateMachine, EscrowTransitionLog, GasEstimate, Validator,
 };
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, Bytes, Env, Symbol, Vec,
@@ -278,6 +278,11 @@ pub enum DataKey {
     StakingContract,
     ReputationContract,
     InsuranceContract,
+    /// Interface registry consulted to authenticate cross-contract peers
+    /// (staking/reputation/insurance) before they're wired in. Optional:
+    /// absent config skips verification so tests/early deployments work
+    /// without a deployed registry.
+    InterfaceRegistry,
     /// Address of the MultisigAdmin contract used for emergency release approvals.
     MultisigAdmin,
     /// Count of failed auto-release attempts for a given escrow_id.
@@ -789,6 +794,38 @@ impl EscrowContract {
         env.storage().persistent().get(&DataKey::FeeSchedule)
     }
 
+    /// Set the interface registry consulted to authenticate cross-contract
+    /// peers (staking/reputation/insurance) before they're wired in
+    /// (admin only). See issue #818 (cross-contract authentication bypass).
+    pub fn set_interface_registry(env: Env, admin: Address, registry: Address) {
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("Caller not authorized");
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::InterfaceRegistry, &registry);
+    }
+
+    /// Rejects `candidate` unless it verifies against `interface_id` in the
+    /// configured interface registry. A no-op when no registry is
+    /// configured, so tests/early deployments keep working without one.
+    fn _require_authorized_peer(env: &Env, candidate: &Address, interface_id: Symbol) {
+        if let Some(registry) = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::InterfaceRegistry)
+        {
+            CrossContractAuth::require_authorized_contract(env, &registry, candidate, interface_id);
+        }
+    }
+
     /// Set the staking contract address used to read mentor tiers (admin only).
     pub fn set_staking_contract(env: Env, admin: Address, staking: Address) {
         let stored_admin: Address = env
@@ -803,6 +840,7 @@ impl EscrowContract {
         if admin != stored_admin {
             panic!("Caller not authorized");
         }
+        Self::_require_authorized_peer(&env, &staking, Symbol::new(&env, "staking_v1"));
 
         env.storage().persistent().set(&DataKey::StakingContract, &staking);
         env.storage()
@@ -827,6 +865,7 @@ impl EscrowContract {
         if admin != stored_admin {
             panic!("Caller not authorized");
         }
+        Self::_require_authorized_peer(&env, &reputation, Symbol::new(&env, "reputation_v1"));
 
         env.storage()
             .persistent()
@@ -853,6 +892,7 @@ impl EscrowContract {
         if admin != stored_admin {
             panic!("Caller not authorized");
         }
+        Self::_require_authorized_peer(&env, &insurance, Symbol::new(&env, "insurance_v1"));
 
         env.storage()
             .persistent()

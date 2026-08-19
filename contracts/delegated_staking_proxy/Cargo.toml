@@ -1,5 +1,5 @@
 [package]
-name = "mentorminds-session-registry"
+name = "mentorminds-delegated-staking-proxy"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.70"
@@ -9,6 +9,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
+soroban-token-sdk = { workspace = true }
 shared = { path = "../shared" }
 
 [dev-dependencies]

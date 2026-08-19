@@ -7,39 +7,63 @@ use soroban_sdk::contracterror;
 ///
 /// Centralizing these definitions keeps authorization and state-transition
 /// behavior aligned across contracts that make the same safety assumptions.
+pub mod cross_contract_auth;
 pub mod disaster_recovery;
 pub mod escrow;
 pub mod events;
 pub mod gas_estimation;
+pub mod governance_voting;
 pub mod pause_guard;
 pub mod reentrancy_guard;
 pub mod sig_validation;
 pub mod state_machine;
-pub mod storage;
 pub mod staking;
+pub mod storage;
 pub mod ttl_utils;
 pub mod interface_id;
 pub mod validation;
-pub mod admin;
+pub mod reputation;
 
 pub use disaster_recovery::{
     compute_checksum, push_snapshot_index, RollbackApproval, RollbackProposal, SnapshotMeta,
     StateVerificationReport, EMERGENCY_SIGNERS, EMERGENCY_THRESHOLD, MAX_SNAPSHOTS,
 };
+pub use cross_contract_auth::{ContractRegistry, CrossContractAuth, InterfaceRegistryLookup};
 pub use escrow::{EscrowRecord, EscrowStatus, EscrowTransitionLog};
 pub use gas_estimation::GasEstimate;
+pub use governance_voting::{
+    calculate_voting_weight, compute_commitment_hash, compute_random_deadline_extension,
+    detect_vote_manipulation, get_vote_phase, validate_minimum_holding_period, ManipulationFlag,
+    MAX_RANDOM_EXTENSION_SECS, MIN_HOLDING_PERIOD_SECS, COMMIT_PHASE_BPS, RevealedVote, VoteCommitment,
+    VotePhase,
+};
 pub use pause_guard::{ContractPaused, is_paused, require_not_paused};
-pub use reentrancy_guard::ReentrancyGuard;
+pub use reentrancy_guard::{
+    AtomicBatch, BatchOp, ReentrancyAttemptLog, ReentrancyGuard, StateSnapshot,
+    validate_amount_limits, validate_caller_is_authorized,
+};
 pub use sig_validation::{
     current_nonce, is_deadline_valid, validate_and_consume_nonce, validate_deadline,
     MetaTxAction, MetaTxPayload, SigError, EXPIRY_TOLERANCE_SECS, MAX_DEADLINE_SECS,
 };
 pub use state_machine::StateMachine;
-pub use staking::{StakeRecord, StakedEventData};
+pub use staking::{
+    StakeRecord, StakedEventData, StakingSnapshot, RewardLockup, PenaltyCalculation,
+    SuspiciousPatternFlag, StakingActionRecord, compute_reward_multiplier_bps,
+    compute_early_unstake_penalty, detect_suspicious_pattern, apply_bps_multiplier,
+    action_stake, action_unstake, action_claim,
+    MIN_STAKING_DURATION_SECS, REWARD_LOCKUP_SECS, MAX_SCALING_DURATION_SECS,
+    REWARD_MULTIPLIER_MIN_BPS, REWARD_MULTIPLIER_MAX_BPS,
+    EARLY_UNSTAKE_PENALTY_MIN_BPS, EARLY_UNSTAKE_PENALTY_MAX_BPS,
+    BASIS_POINTS, PATTERN_DETECTION_WINDOW, SUSPICIOUS_CYCLE_THRESHOLD_SECS,
+};
 pub use storage::{EternalStorage, StorageType, InstanceKey, PersistentKey, TempKey};
 pub use ttl_utils::{next_bump_interval, should_bump_ttl};
 pub use validation::{Validator, ValidationError, require_auth_and_validate};
-pub use admin::{AdminTransfer, AdminChangeProposal, MIN_ADMIN_TIMELOCK_SECS, ADMIN_COOLING_OFF_SECS};
+pub use reputation::{
+    analyze_review_pattern, detect_sybil, interaction_commitment, BehavioralAnalysis,
+    ReputationProof, SybilDetection,
+};
 
 /// Common error codes shared across all MentorsMind contracts.
 ///
@@ -71,12 +95,6 @@ pub enum SharedError {
     Underflow = 10,
     /// Input validation failed (see `ValidationError` for field details).
     ValidationError = 11,
-    /// Pending admin change already in progress.
-    AdminTransferPending = 12,
-    /// The timelock for the admin change has not expired yet.
-    TimelockNotExpired = 13,
-    /// Cooling off period after the last admin change has not expired.
-    CoolingOffPeriod = 14,
-    /// No pending admin transfer exists.
-    NoPendingAdminTransfer = 15,
+    /// A cross-contract caller failed interface-registry verification.
+    UnauthorizedContract = 12,
 }
