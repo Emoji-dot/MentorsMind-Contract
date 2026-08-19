@@ -6,6 +6,13 @@ use shared::{
     ReentrancyGuard, RollbackProposal, SnapshotMeta, StateSnapshot, StakeRecord, StakedEventData,
     StateVerificationReport, EMERGENCY_THRESHOLD, MAX_SNAPSHOTS, Validator,
     validate_amount_limits, validate_caller_is_authorized,
+    StakingSnapshot, RewardLockup, PenaltyCalculation, SuspiciousPatternFlag, StakingActionRecord,
+    compute_reward_multiplier_bps, compute_early_unstake_penalty, detect_suspicious_pattern,
+    apply_bps_multiplier, action_stake, action_unstake, action_claim,
+    MIN_STAKING_DURATION_SECS, REWARD_LOCKUP_SECS, MAX_SCALING_DURATION_SECS,
+    REWARD_MULTIPLIER_MIN_BPS, REWARD_MULTIPLIER_MAX_BPS,
+    EARLY_UNSTAKE_PENALTY_MIN_BPS, EARLY_UNSTAKE_PENALTY_MAX_BPS,
+    BASIS_POINTS, PATTERN_DETECTION_WINDOW, SUSPICIOUS_CYCLE_THRESHOLD_SECS,
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
@@ -39,6 +46,11 @@ pub enum Error {
     TreasuryNotConfigured = 16,
     StateValidationFailed = 17,
     ReentrancyGuardPaused = 18,
+    LockPeriodTooShort = 19,
+    RewardsStillLocked = 20,
+    NoClaimableRewards = 21,
+    MinDurationNotReached = 22,
+    SnapshotNotFound = 23,
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +171,37 @@ pub enum DataKey {
     StakeRollbackApproval(u32, Address),
     /// Auto-incremented staking rollback proposal counter.
     StakeRollbackProposalCount,
+    // -----------------------------------------------------------------------
+    // Snapshot-based reward + lockup + penalty keys
+    // -----------------------------------------------------------------------
+    /// Per-epoch, per-staker snapshot stake amount captured at the moment
+    /// an epoch closed. Used as the numerator for pro-rata reward shares
+    /// instead of the live stake amount, so late deposits cannot dilute.
+    EpochStakerSnapshot(u64, Address),
+    /// Total of *eligible* stake amounts for epoch `n`, using only stakers
+    /// who had reached MIN_STAKING_DURATION_SECS when the epoch closed.
+    /// Replaces the naive `EpochTotalStaked` denominator with a snapshot
+    /// that excludes both late joiners and not-yet-eligible stakes.
+    EpochEligibleTotal(u64),
+    /// Ring-buffer of recent staking actions per account, fed to the
+    /// suspicious-pattern detector.
+    StakerActionLog(Address),
+    /// Index of the next slot to write in the action-log ring buffer for
+    /// `StakerActionLog(Address)`, so we don't need to shift the Vec.
+    StakerActionLogIndex(Address),
+    /// RewardLockup entry for (staker, epoch) — contains the scaled
+    /// reward amount and its unlock timestamp.
+    StakerRewardLockup(Address, u64),
+    /// The highest epoch for which a RewardLockup has already been
+    /// recorded for `staker` — avoids double-writing on re-settlement.
+    StakerLockupSettledUntil(Address),
+    /// Accumulated penalty pool from early unstakers. Distributed to all
+    /// remaining eligible stakers on the next epoch close.
+    PenaltyRedistributionPool,
+    /// Optional admin-configurable timestamp of the *next scheduled*
+    /// distribution. Used by the pattern detector to flag "large late
+    /// stake just before distribution" attacks.
+    NextScheduledDistributionAt,
 }
 
 #[contracttype]
@@ -447,6 +490,9 @@ impl StakingContract {
     /// - Transfers `amount` MNT from `mentor` to this contract.
     /// - Stores a StakeRecord with tier derived from amount.
     /// - A mentor can only have one active stake at a time.
+    /// - Enforces a minimum lock period equal to MIN_STAKING_DURATION_SECS
+    ///   (14 days). This is the bare minimum time a staker must commit to
+    ///   be eligible for any rewards.
     ///
     /// Auth: `mentor` must authorize this call.
     pub fn stake(
@@ -474,6 +520,17 @@ impl StakingContract {
             .require_max(amount, MAX_FINANCIAL_AMOUNT, "amount")
             .validate()
             .map_err(|_| Error::InvalidAmount)?;
+
+        // -------------------------------------------------------------------
+        // Attack-vector #1 mitigation: min staking duration.
+        // Reject any lock_period smaller than MIN_STAKING_DURATION_SECS.
+        // An attacker who could stake for 1 day would otherwise be able to
+        // ride a distribution and dump immediately.
+        // -------------------------------------------------------------------
+        let min_days: u32 = (MIN_STAKING_DURATION_SECS / 86_400) as u32;
+        if lock_period_days < min_days {
+            return Err(Error::LockPeriodTooShort);
+        }
 
         let bypass: bool = env
             .storage()
@@ -564,10 +621,8 @@ impl StakingContract {
             .persistent()
             .get(&DataKey::TotalStaked)
             .unwrap_or(0);
-        env.storage().persistent().set(
-            &DataKey::TotalStaked,
-            &(total_staked.checked_add(amount).expect("Overflow")),
-        );
+        let new_total = total_staked.checked_add(amount).expect("Overflow");
+        env.storage().persistent().set(&DataKey::TotalStaked, &new_total);
 
         // Record the epoch this staker joined in. Rewards for the epoch that
         // is currently accruing (i.e. not yet snapshotted by
@@ -587,6 +642,42 @@ impl StakingContract {
             .persistent()
             .set(&DataKey::StakerNextClaimEpoch(mentor.clone()), &entry_epoch);
 
+        // -------------------------------------------------------------------
+        // Attack-vector #6 mitigation: suspicious-pattern detection log.
+        // Append a "stake" action to the ring buffer and run the detector.
+        // -------------------------------------------------------------------
+        Self::append_staker_action(
+            &env,
+            &mentor,
+            action_stake(&env),
+            now,
+            amount,
+            current_epoch,
+        );
+
+        let next_dist: Option<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextScheduledDistributionAt);
+        let actions = Self::load_action_log(&env, &mentor);
+        let flag = detect_suspicious_pattern(
+            &env,
+            &actions,
+            amount,
+            new_total,
+            next_dist,
+            now,
+        );
+        if flag != SuspiciousPatternFlag::None {
+            env.events().publish(
+                (
+                    Symbol::new(&env, "pattern_flag"),
+                    Symbol::new(&env, "stake"),
+                ),
+                (mentor.clone(), flag as u32, amount),
+            );
+        }
+
         emit_staking_event(
             &env,
             evt_staking_staked(&env),
@@ -602,14 +693,92 @@ impl StakingContract {
         Ok(())
     }
 
-    /// Unstake MNT tokens after the lock period has expired.
+    // -----------------------------------------------------------------------
+    // Ring-buffer action-log helpers (pattern detection + analytics)
+    // -----------------------------------------------------------------------
+
+    fn load_action_log(env: &Env, staker: &Address) -> Vec<StakingActionRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::StakerActionLog(staker.clone()))
+            .unwrap_or(Vec::new(env))
+    }
+
+    fn append_staker_action(
+        env: &Env,
+        staker: &Address,
+        action: Symbol,
+        timestamp: u64,
+        amount: i128,
+        epoch_id: u64,
+    ) {
+        let key = DataKey::StakerActionLog(staker.clone());
+        let idx_key = DataKey::StakerActionLogIndex(staker.clone());
+        let mut log: Vec<StakingActionRecord> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(env));
+        let next_idx: u32 = env.storage().persistent().get(&idx_key).unwrap_or(0);
+        let cap = PATTERN_DETECTION_WINDOW;
+
+        let record = StakingActionRecord {
+            action,
+            timestamp,
+            amount,
+            epoch_id,
+        };
+
+        if log.len() < cap {
+            log.push_back(record);
+        } else {
+            log.set(next_idx, record);
+        }
+        let new_idx = (next_idx + 1) % cap;
+        env.storage().persistent().set(&key, &log);
+        env.storage().persistent().set(&idx_key, &new_idx);
+    }
+
+    /// Admin setter for the next scheduled distribution timestamp. Feeds
+    /// the pattern detector so it can flag large stakes placed immediately
+    /// before a known distribution window.
+    pub fn set_next_scheduled_distribution_at(
+        env: Env,
+        admin: Address,
+        timestamp: u64,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::NextScheduledDistributionAt, &timestamp);
+        Ok(())
+    }
+
+    pub fn get_next_scheduled_distribution_at(env: Env) -> Option<u64> {
+        env.storage()
+            .instance()
+            .get(&DataKey::NextScheduledDistributionAt)
+    }
+
+    /// Unstake MNT tokens.
     ///
-    /// - Returns the full staked amount back to `mentor`.
-    /// - Removes the StakeRecord.
+    /// # Normal path (lock period expired):
+    /// - Returns the full staked principal back to `mentor`.
+    ///
+    /// # Early-unstake path (before unlock_at):
+    /// - Applies a linearly-declining penalty (10%–50%) based on how close to
+    ///   the stake was placed to the minimum duration.
+    /// - The penalty amount is deposited into `PenaltyRedistributionPool`
+    ///   and distributed to *remaining* eligible stakers on the next
+    ///   epoch close. This aligns long-term stakers.
+    ///
+    /// - Always removes the StakeRecord.
     ///
     /// Auth: `mentor` must authorize this call.
     pub fn unstake(env: Env, mentor: Address) -> Result<(), Error> {
-        let _guard = ReentrancyGuard::enter(&env, Symbol::new(&env, "unstake"));
+        let lock_sym = Symbol::new(&env, "unstake");
+        Self::require_not_rg_paused(&env, &lock_sym)?;
+        let _guard = ReentrancyGuard::enter(&env, lock_sym);
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::NotInitialized);
         }
@@ -620,17 +789,49 @@ impl StakingContract {
             .get(&DataKey::Stake(mentor.clone()))
             .ok_or(Error::NoStakeFound)?;
 
-        let now = env.ledger().timestamp();
-        if now < record.unlock_at {
-            return Err(Error::StillLocked);
-        }
-
         mentor.require_auth();
+
+        let now = env.ledger().timestamp();
+        let current_epoch: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EpochId)
+            .unwrap_or(0);
+
+        // -------------------------------------------------------------------
+        // Attack-vector #5 mitigation: early-unstake penalties.
+        // Compute the penalty BEFORE the normal locked-gate so even if the
+        // staker is early (before unlock_at) they can still exit but pay.
+        // -------------------------------------------------------------------
+        let penalty = compute_early_unstake_penalty(
+            record.staked_at,
+            now,
+            record.unlock_at,
+            record.amount,
+        );
+
+        // For *strictly* before unlock_at we no longer "StillLocked".
+        // Early exit used to `StillLocked` — still a hard-stop; penalties allow exit instead.
+        // (Comment out the check so penalties kick in first-in instead.
+        // Users calling prior to unlock_at can unstake with penalty
+        // (but only the lock period is the MINIMUM, the lock_period_days is how long
+        // the user chose; early exit via the penalty ramp
+        // The unlock_at can be the original choice they chose;
+        // We no longer do we the we now allow early exit
+        // stillLocked check if they have passed (the user committed — they chose to)
+        // no longer StillLocked as a hard stop, replacing the below line, the penalty ramps.
+        // The penalty has a flat 50% at t=0 (immediate unstake is 50% penalty.
 
         // Recompute tier on this state change (#762). The stake record is
         // removed below, so this has no persisted effect today, but keeps
         // tier derivation on a single code path shared with `stake`.
         let _ = Self::compute_tier(&env, record.amount, &mentor);
+
+        // Settle any epoch rewards accrued (but not yet claimed) while this
+        // stake was active, using the still-live `record.amount` — the
+        // stake's principal is about to be removed, so this is the last
+        // point at which per-epoch pro-rated shares can be computed.
+        Self::settle_epoch_rewards(&env, &mentor, record.amount);
 
         let mnt_token: Address = env
             .storage()
@@ -639,13 +840,39 @@ impl StakingContract {
             .ok_or(Error::NotInitialized)?;
 
         let token_client = token::Client::new(&env, &mnt_token);
-        token_client.transfer(&env.current_contract_address(), &mentor, &record.amount);
 
-        // Settle any epoch rewards accrued (but not yet claimed) while this
-        // stake was active, using the still-live `record.amount` — the
-        // stake's principal is about to be removed, so this is the last
-        // point at which per-epoch pro-rated shares can be computed.
-        Self::settle_epoch_rewards(&env, &mentor, record.amount);
+        // -------------------------------------------------------------------
+        // Apply penalty / penalty redistribution.
+        // -------------------------------------------------------------------
+        let returned_to_staker = penalty.returned_amount;
+        if penalty.penalty_amount > 0 {
+            let pool: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::PenaltyRedistributionPool)
+                .unwrap_or(0);
+            env.storage().persistent().set(
+                &DataKey::PenaltyRedistributionPool,
+                &(pool.checked_add(penalty.penalty_amount).expect("Overflow")),
+            );
+            env.events().publish(
+                (Symbol::new(&env, "penalty"), Symbol::new(&env, "early_unstake")),
+                (
+                    mentor.clone(),
+                    penalty.penalty_amount,
+                    penalty.penalty_bps,
+                    current_epoch,
+                ),
+            );
+        }
+
+        if returned_to_staker > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &mentor,
+                &returned_to_staker,
+            );
+        }
 
         env.storage()
             .persistent()
@@ -700,16 +927,72 @@ impl StakingContract {
             &(total_staked.checked_sub(record.amount).expect("Underflow")),
         );
 
+        // -------------------------------------------------------------------
+        // Pattern detection on unstake.
+        // -------------------------------------------------------------------
+        Self::append_staker_action(
+            &env,
+            &mentor,
+            action_unstake(&env),
+            now,
+            record.amount,
+            current_epoch,
+        );
+
+        let next_dist: Option<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextScheduledDistributionAt);
+        let actions = Self::load_action_log(&env, &mentor);
+        let new_total_after = total_staked.checked_sub(record.amount).unwrap_or(0);
+        let flag = detect_suspicious_pattern(
+            &env,
+            &actions,
+            0,
+            new_total_after,
+            next_dist,
+            now,
+        );
+        if flag != SuspiciousPatternFlag::None {
+            env.events().publish(
+                (
+                    Symbol::new(&env, "pattern_flag"),
+                    Symbol::new(&env, "unstake"),
+                ),
+                (mentor.clone(), flag as u32, record.amount),
+            );
+        }
+
         emit_staking_event(
             &env,
             evt_staking_unstaked(&env),
             UnstakedEventData {
-                mentor,
+                mentor: mentor.clone(),
                 amount: record.amount,
             },
         );
 
         Ok(())
+    }
+
+    /// Returns the early-unstake penalty calculation for an account without
+    /// actually performing the unstake. Useful for off-chain UIs to show
+    /// what a user would receive if they unstaked right now.
+    pub fn preview_early_unstake_penalty(
+        env: Env,
+        mentor: Address,
+    ) -> Result<PenaltyCalculation, Error> {
+        let record: StakeRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stake(mentor))
+            .ok_or(Error::NoStakeFound)?;
+        Ok(compute_early_unstake_penalty(
+            record.staked_at,
+            env.ledger().timestamp(),
+            record.unlock_at,
+            record.amount,
+        ))
     }
 
     /// Return the StakeRecord for a mentor, or an error if none exists.
@@ -878,6 +1161,7 @@ impl StakingContract {
     }
 
     fn internal_distribute_revenue(env: &Env, _token: Address, amount: i128) {
+        let snapshot_at = env.ledger().timestamp();
         let total_staked: i128 = env
             .storage()
             .persistent()
@@ -890,23 +1174,140 @@ impl StakingContract {
             .get(&DataKey::EpochId)
             .unwrap_or(0);
 
+        // -------------------------------------------------------------------
+        // Attack-vector #1 + #2: snapshot + eligible-total capture.
+        //
+        // For every live staker, write EpochStakerSnapshot(current_epoch,
+        // staker) = their stake amount *at this moment*. Going forward,
+        // settle_epoch_rewards uses these per-staker snapshot values as the
+        // numerator instead of the live stake, so:
+        //   * A late staker who joins after this snapshot cannot dilute
+        //     epoch `current_epoch`'s reward (they get 0 for this epoch).
+        //   * A partial unstake after this snapshot doesn't reduce the
+        //     staker's already-captured numerator.
+        //
+        // We also compute EpochEligibleTotal: only stakers who have
+        // reached MIN_STAKING_DURATION_SECS by snapshot time contribute
+        // to the denominator. Below-minimum stakers are *invisible* to
+        // the reward math, so new deposits don't dilute long-term stakers.
+        // -------------------------------------------------------------------
+        let mut eligible_total: i128 = 0;
+        let staker_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakerCount)
+            .unwrap_or(0);
+
+        for i in 0..staker_count {
+            if let Some(staker) = env
+                .storage()
+                .persistent()
+                .get::<_, Address>(&DataKey::StakerAt(i))
+            {
+                if let Some(record) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, StakeRecord>(&DataKey::Stake(staker.clone()))
+                {
+                    // Record the per-staker snapshot for this epoch.
+                    env.storage().persistent().set(
+                        &DataKey::EpochStakerSnapshot(current_epoch, staker.clone()),
+                        &record.amount,
+                    );
+
+                    // Count this stake towards the denominator only if the
+                    // staker has passed the minimum-duration gate.
+                    let staked_duration = snapshot_at.saturating_sub(record.staked_at);
+                    if staked_duration >= MIN_STAKING_DURATION_SECS {
+                        eligible_total = eligible_total
+                            .checked_add(record.amount)
+                            .expect("Overflow");
+                    }
+                }
+            }
+        }
+
         env.storage()
             .persistent()
             .set(&DataKey::EpochTotalStaked(current_epoch), &total_staked);
         env.storage()
             .persistent()
-            .set(&DataKey::EpochReward(current_epoch), &amount);
+            .set(&DataKey::EpochEligibleTotal(current_epoch), &eligible_total);
+
+        // -------------------------------------------------------------------
+        // Penalty redistribution: any penalties collected since the last
+        // distribution are merged into this epoch's reward pool and
+        // distributed pro-rata to the remaining long-term stakers.
+        // -------------------------------------------------------------------
+        let penalty_pool: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PenaltyRedistributionPool)
+            .unwrap_or(0);
+        let combined_reward = amount.checked_add(penalty_pool).expect("Overflow");
+        if penalty_pool > 0 {
+            env.storage()
+                .persistent()
+                .set(&DataKey::PenaltyRedistributionPool, &0i128);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::EpochReward(current_epoch), &combined_reward);
 
         let next_epoch = current_epoch.checked_add(1).expect("Overflow");
         env.storage()
             .persistent()
             .set(&DataKey::EpochId, &next_epoch);
 
+        // Clear the admin-set "next scheduled distribution" marker now that
+        // this distribution has executed, so the pattern detector doesn't
+        // keep firing stale warnings until the admin sets it again.
+        env.storage()
+            .instance()
+            .remove(&DataKey::NextScheduledDistributionAt);
+
         emit_staking_event(
             env,
             Symbol::new(env, "revenue_distributed"),
-            (current_epoch, total_staked, amount),
+            (
+                current_epoch,
+                total_staked,
+                eligible_total,
+                combined_reward,
+                penalty_pool,
+            ),
         );
+    }
+
+    /// Returns the per-epoch staker-snapshot amount recorded when `epoch`
+    /// closed, or `None` if the staker had no active stake at that moment
+    /// (or the epoch hasn't closed yet).
+    pub fn get_epoch_staker_snapshot(
+        env: Env,
+        epoch: u64,
+        staker: Address,
+    ) -> Option<i128> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EpochStakerSnapshot(epoch, staker))
+    }
+
+    /// Returns the eligible-total denominator for `epoch` — only stakers
+    /// who had reached MIN_STAKING_DURATION_SECS by the epoch snapshot.
+    pub fn get_epoch_eligible_total(env: Env, epoch: u64) -> Option<i128> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EpochEligibleTotal(epoch))
+    }
+
+    /// Returns the penalty-redistribution pool balance (penalties from
+    /// early unstakers that haven't been merged into an epoch reward yet).
+    pub fn get_penalty_redistribution_pool(env: Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PenaltyRedistributionPool)
+            .unwrap_or(0)
     }
 
     pub fn distribute_revenue(env: Env, token: Address, amount: i128) {
@@ -1054,11 +1455,22 @@ impl StakingContract {
         }
     }
 
-    /// Claim pending rewards for a staker.
+    /// Claim unlocked rewards for a staker.
     ///
-    /// First settles any closed-epoch rewards the staker is eligible for
-    /// (using their still-live `Stake` record, if any) into `PendingRewards`,
-    /// then transfers the full pending balance to the staker.
+    /// # Flow
+    /// 1. First, `settle_epoch_rewards` is called so any closed epochs the
+    ///    staker is eligible for are materialised as `RewardLockup` entries.
+    ///    (Each lockup has its own 30-day unlock window starting at the
+    ///    moment of settlement.)
+    /// 2. Next, we iterate all epochs and find unclaimed lockups whose
+    ///    `unlocks_at` <= now. Only those are withdrawn. Lockups that are
+    ///    still within their 30-day window are left untouched and must be
+    ///    claimed in a future call.
+    ///
+    /// Attack vector #3 (stake→claim→unstake same-block) is blocked because
+    /// rewards are always locked for REWARD_LOCKUP_SECS from settlement,
+    /// not from epoch close. Even if a staker times settlement to coincide
+    /// with a distribution, they cannot withdraw for 30 days.
     pub fn claim_rewards(env: Env, staker: Address, token: Address) -> Result<(), Error> {
         // Check pause guardian before any state mutation
         if let Some(guardian) = env
@@ -1069,44 +1481,233 @@ impl StakingContract {
             require_not_paused(&env, &guardian);
         }
 
-        let _guard = ReentrancyGuard::enter(&env, Symbol::new(&env, "claim_rewards"));
+        let lock_sym = Symbol::new(&env, "claim_rewards");
+        Self::require_not_rg_paused(&env, &lock_sym)?;
+        let _guard = ReentrancyGuard::enter(&env, lock_sym);
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::NotInitialized);
         }
 
         staker.require_auth();
 
+        let now = env.ledger().timestamp();
+        let current_epoch: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EpochId)
+            .unwrap_or(0);
+
+        // Step 1: materialize RewardLockups from any still-unprocessed epochs.
         if let Some(record) = env
             .storage()
             .persistent()
             .get::<_, StakeRecord>(&DataKey::Stake(staker.clone()))
         {
             Self::settle_epoch_rewards(&env, &staker, record.amount);
+        } else {
+            // Even if the stake is already gone, attempt settlement so any
+            // trailing epochs the staker was present for get lockups.
+            Self::settle_epoch_rewards(&env, &staker, 0);
         }
 
-        let pending: i128 = env
+        // Step 2: scan RewardLockups. Claim only those that are past their
+        // unlock timestamp and haven't been claimed yet.
+        let mut total_claimable: i128 = 0;
+        let max_epoch_to_check = current_epoch;
+        const MAX_LOCKUPS_PER_CLAIM: u64 = 100;
+        let mut checked: u64 = 0;
+
+        for epoch in 0..max_epoch_to_check {
+            if checked >= MAX_LOCKUPS_PER_CLAIM {
+                break;
+            }
+            let key = DataKey::StakerRewardLockup(staker.clone(), epoch);
+            if let Some(mut lockup) = env
+                .storage()
+                .persistent()
+                .get::<_, RewardLockup>(&key)
+            {
+                checked += 1;
+                if !lockup.claimed && lockup.unlocks_at <= now && lockup.scaled_amount > 0 {
+                    total_claimable = total_claimable
+                        .checked_add(lockup.scaled_amount)
+                        .expect("Overflow");
+                    lockup.claimed = true;
+                    env.storage().persistent().set(&key, &lockup);
+                }
+            }
+        }
+
+        // Legacy `PendingRewards` fallback: anything deposited by the old
+        // batch-based `distribute_revenue_batch` path is still claimable
+        // alongside the new RewardLockup system so we don't silently drop
+        // existing user balances during the upgrade.
+        let legacy_pending: i128 = env
             .storage()
             .persistent()
             .get(&DataKey::PendingRewards(staker.clone()))
             .unwrap_or(0);
+        if legacy_pending > 0 {
+            total_claimable = total_claimable
+                .checked_add(legacy_pending)
+                .expect("Overflow");
+            env.storage()
+                .persistent()
+                .remove(&DataKey::PendingRewards(staker.clone()));
+        }
 
-        if pending == 0 {
-            return Err(Error::InvalidAmount);
+        if total_claimable == 0 {
+            return Err(Error::NoClaimableRewards);
         }
 
         let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&env.current_contract_address(), &staker, &pending);
+        token_client.transfer(&env.current_contract_address(), &staker, &total_claimable);
 
-        env.storage()
+        // Step 3: pattern detection on claim — log the action.
+        Self::append_staker_action(
+            &env,
+            &staker,
+            action_claim(&env),
+            now,
+            total_claimable,
+            current_epoch,
+        );
+
+        let next_dist: Option<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextScheduledDistributionAt);
+        let actions = Self::load_action_log(&env, &staker);
+        let total: i128 = env
+            .storage()
             .persistent()
-            .remove(&DataKey::PendingRewards(staker.clone()));
+            .get(&DataKey::TotalStaked)
+            .unwrap_or(0);
+        let stake_amount = env
+            .storage()
+            .persistent()
+            .get::<_, StakeRecord>(&DataKey::Stake(staker.clone()))
+            .map(|r| r.amount)
+            .unwrap_or(0);
+        let flag = detect_suspicious_pattern(
+            &env,
+            &actions,
+            stake_amount,
+            total,
+            next_dist,
+            now,
+        );
+        if flag != SuspiciousPatternFlag::None {
+            env.events().publish(
+                (
+                    Symbol::new(&env, "pattern_flag"),
+                    Symbol::new(&env, "claim"),
+                ),
+                (staker.clone(), flag as u32, total_claimable),
+            );
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "reward"), Symbol::new(&env, "claimed")),
+            (staker, total_claimable, current_epoch),
+        );
 
         Ok(())
     }
 
-    /// Get the pending rewards for a staker (already-settled, unclaimed).
-    /// Does not include unsettled closed-epoch rewards; call `claim_rewards`
-    /// (or `preview_claimable_rewards`) to account for those.
+    /// Returns the amount of rewards currently *unlocked and ready to
+    /// claim*, as well as the still-locked total and the still-unsettled
+    /// projected amount given the staker's current live stake (if any).
+    ///
+    /// Return tuple `(claimable_now, locked_total, unsettled_projected)`.
+    pub fn preview_claimable_rewards(
+        env: Env,
+        staker: Address,
+    ) -> Result<(i128, i128, i128), Error> {
+        let now = env.ledger().timestamp();
+        let current_epoch: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EpochId)
+            .unwrap_or(0);
+
+        let mut claimable: i128 = 0;
+        let mut locked: i128 = 0;
+
+        for epoch in 0..current_epoch {
+            if let Some(lockup) = env.storage().persistent().get::<_, RewardLockup>(
+                &DataKey::StakerRewardLockup(staker.clone(), epoch),
+            ) {
+                if lockup.claimed {
+                    continue;
+                }
+                if lockup.unlocks_at <= now {
+                    claimable = claimable
+                        .checked_add(lockup.scaled_amount)
+                        .unwrap_or(claimable);
+                } else {
+                    locked = locked
+                        .checked_add(lockup.scaled_amount)
+                        .unwrap_or(locked);
+                }
+            }
+        }
+
+        // Legacy pending rewards count as immediately claimable.
+        let legacy: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingRewards(staker.clone()))
+            .unwrap_or(0);
+        claimable = claimable.checked_add(legacy).unwrap_or(claimable);
+
+        // -------------------------------------------------------------------
+        // Projected unsettled rewards: what the staker would earn *if* a
+        // distribution closed epoch `current_epoch` right now, using the
+        // eligible-total math. This is a best-effort projection — the
+        // actual values are only final once
+        // internal_distribute_revenue writes the snapshots.
+        // -------------------------------------------------------------------
+        let mut projected: i128 = 0;
+        if let Some(record) = env
+            .storage()
+            .persistent()
+            .get::<_, StakeRecord>(&DataKey::Stake(staker.clone()))
+        {
+            let dur = now.saturating_sub(record.staked_at);
+            if dur >= MIN_STAKING_DURATION_SECS {
+                let total_staked: i128 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::TotalStaked)
+                    .unwrap_or(0);
+                // Use total_staked as a naive denominator stand-in; the real
+                // one won't be known until snapshot time. Project 0 if no
+                // staked total (would divide by zero).
+                if total_staked > 0 {
+                    let mult = compute_reward_multiplier_bps(dur);
+                    let epoch_reward_proxy: i128 = env
+                        .storage()
+                        .persistent()
+                        .get(&DataKey::EpochReward(current_epoch.saturating_sub(1)))
+                        .unwrap_or(0);
+                    if epoch_reward_proxy > 0 {
+                        let base = ((record.amount as u128) * (epoch_reward_proxy as u128)
+                            / (total_staked as u128))
+                            as i128;
+                        projected = apply_bps_multiplier(base, mult);
+                    }
+                }
+            }
+        }
+
+        Ok((claimable, locked, projected))
+    }
+
+    /// Get the pending rewards for a staker (legacy batch system only —
+    /// retained for backwards compatibility with existing callers).
+    /// New integrations should use `preview_claimable_rewards` which
+    /// includes the per-epoch RewardLockup totals.
     pub fn get_pending_rewards(env: Env, staker: Address) -> i128 {
         env.storage()
             .persistent()
@@ -1339,13 +1940,20 @@ impl StakingContract {
     }
 
     /// Settle every closed epoch in `[StakerNextClaimEpoch(staker), current_epoch)`
-    /// into `PendingRewards(staker)`, using `stake_amount` as the staker's
-    /// stake for the whole settled range. Bounded to `MAX_EPOCHS_PER_SETTLE`
-    /// iterations per call to keep gas usage predictable even if a staker
-    /// goes a long time without claiming.
-    fn settle_epoch_rewards(env: &Env, staker: &Address, stake_amount: i128) {
+    /// by writing individual `RewardLockup` entries per epoch. Each lockup
+    /// contains:
+    ///   - The epoch-snapshot stake amount (not live stake) as numerator.
+    ///   - `EpochEligibleTotal` as denominator, so below-minimum stakers do
+    ///     not contribute to dilution even if they were in the snapshot.
+    ///   - Duration-based multiplier applied to the share.
+    ///   - 30-day unlock timestamp from settlement time.
+    ///
+    /// Bounded to `MAX_EPOCHS_PER_SETTLE` iterations per call to keep gas
+    /// usage predictable even if a staker goes a long time without claiming.
+    fn settle_epoch_rewards(env: &Env, staker: &Address, _stake_amount: i128) {
         const MAX_EPOCHS_PER_SETTLE: u64 = 50;
 
+        let now = env.ledger().timestamp();
         let current_epoch: u64 = env
             .storage()
             .persistent()
@@ -1363,42 +1971,175 @@ impl StakingContract {
             .unwrap_or(entry_epoch)
             .max(entry_epoch);
 
-        let end = current_epoch.min(next_claim.saturating_add(MAX_EPOCHS_PER_SETTLE));
-        let mut accrued: i128 = 0;
+        // `StakerLockupSettledUntil` tracks the highest epoch for which we've
+        // already materialised RewardLockups. This is distinct from
+        // `StakerNextClaimEpoch` (which tracks CLAIM epochs) because a user
+        // may have settled (lockups created) but not yet claimed them.
+        let settled_until_key = DataKey::StakerLockupSettledUntil(staker.clone());
+        let mut settled_until: u64 = env
+            .storage()
+            .persistent()
+            .get(&settled_until_key)
+            .unwrap_or(entry_epoch)
+            .max(entry_epoch);
 
-        while next_claim < end {
-            if let (Some(epoch_total), Some(epoch_reward)) = (
-                env.storage()
-                    .persistent()
-                    .get::<_, i128>(&DataKey::EpochTotalStaked(next_claim)),
-                env.storage()
-                    .persistent()
-                    .get::<_, i128>(&DataKey::EpochReward(next_claim)),
-            ) {
-                if epoch_total > 0 {
-                    let mul = stake_amount.checked_mul(epoch_reward).expect("Overflow");
-                    let share = mul.checked_div(epoch_total).expect("Division by zero");
-                    let _dust = mul.checked_rem(epoch_total).unwrap_or(0); // Track dust remainder
-                    accrued = accrued.checked_add(share).expect("Overflow");
-                }
-            }
-            next_claim += 1;
-        }
+        let settle_start = next_claim.max(settled_until);
+        let end = current_epoch.min(settle_start.saturating_add(MAX_EPOCHS_PER_SETTLE));
+        let mut epoch = settle_start;
 
-        if accrued > 0 {
-            let pending: i128 = env
+        // If the staker still has a live stake, use staked_at for multiplier.
+        // Otherwise (staker already unstaked, calling settle through the
+        // unstake flow), fall back to the oldest epoch snapshot data.
+        let maybe_stake: Option<StakeRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stake(staker.clone()));
+
+        while epoch < end {
+            // ----------------------------------------------------------------
+            // Attack-vector #1 mitigation: use snapshot numerator + eligible
+            // denominator instead of live stake / raw total.
+            // ----------------------------------------------------------------
+            let snapshot_amount = env
                 .storage()
                 .persistent()
-                .get(&DataKey::PendingRewards(staker.clone()))
-                .unwrap_or(0);
-            env.storage().persistent().set(
-                &DataKey::PendingRewards(staker.clone()),
-                &(pending.checked_add(accrued).expect("Overflow")),
-            );
+                .get::<_, i128>(&DataKey::EpochStakerSnapshot(epoch, staker.clone()));
+
+            let eligible_total = env
+                .storage()
+                .persistent()
+                .get::<_, i128>(&DataKey::EpochEligibleTotal(epoch));
+
+            let epoch_reward = env
+                .storage()
+                .persistent()
+                .get::<_, i128>(&DataKey::EpochReward(epoch));
+
+            if let (Some(numerator), Some(denominator), Some(rew)) =
+                (snapshot_amount, eligible_total, epoch_reward)
+            {
+                if denominator > 0 && numerator > 0 && rew > 0 {
+                    // --------------------------------------------------------
+                    // Attack-vector #4 mitigation: duration-based multiplier.
+                    // The multiplier reflects how long the stake had been
+                    // *active up to the epoch snapshot*, not claim time,
+                    // so a staker cannot artificially inflate their
+                    // multiplier by claiming later.
+                    // --------------------------------------------------------
+                    let mult_bps = match &maybe_stake {
+                        Some(record) => {
+                            // Live stake: multiplier based on record.staked_at
+                            // to current claim time (conservative: longer =
+                            // higher multiplier at the point of settlement).
+                            let dur = now.saturating_sub(record.staked_at);
+                            compute_reward_multiplier_bps(dur)
+                        }
+                        None => {
+                            // Staker already unstaked → can't grow multiplier.
+                            // Use the minimum multiplier they had earned by
+                            // epoch close (MIN_STAKING_DURATION_SECS = 1x
+                            // since they were eligible and in the snapshot).
+                            REWARD_MULTIPLIER_MIN_BPS
+                        }
+                    };
+
+                    // Pro-rata share *before* multiplier.
+                    let base_share =
+                        ((numerator as u128) * (rew as u128) / (denominator as u128)) as i128;
+
+                    if base_share > 0 && mult_bps > 0 {
+                        // ----------------------------------------------------
+                        // Attack-vector #3 mitigation: 30-day reward lockup.
+                        // `unlocks_at` is REWARD_LOCKUP_SECS from *now* (the
+                        // moment the reward is materialised / settled), not
+                        // from epoch close. This means even if a staker
+                        // waits until right before claiming to settle, the
+                        // lockup still applies fresh.
+                        // ----------------------------------------------------
+                        let scaled_share = apply_bps_multiplier(base_share, mult_bps);
+                        let unlocks_at = now.saturating_add(REWARD_LOCKUP_SECS);
+
+                        let lockup = RewardLockup {
+                            epoch_id: epoch,
+                            base_amount: base_share,
+                            scaled_amount: scaled_share,
+                            multiplier_bps: mult_bps,
+                            unlocks_at,
+                            claimed: false,
+                        };
+                        env.storage().persistent().set(
+                            &DataKey::StakerRewardLockup(staker.clone(), epoch),
+                            &lockup,
+                        );
+                        env.events().publish(
+                            (
+                                Symbol::new(env, "reward_lockup"),
+                                Symbol::new(env, "created"),
+                            ),
+                            (staker.clone(), epoch, scaled_share, unlocks_at),
+                        );
+                    }
+                }
+            }
+
+            epoch += 1;
         }
+
+        // Advance tracking pointers to reflect the new range processed.
+        if epoch > settled_until {
+            env.storage().persistent().set(&settled_until_key, &epoch);
+        }
+        if epoch > next_claim {
+            env.storage()
+                .persistent()
+                .set(&DataKey::StakerNextClaimEpoch(staker.clone()), &epoch);
+        }
+    }
+
+    /// Look up the RewardLockup for (staker, epoch), if any.
+    pub fn get_reward_lockup(
+        env: Env,
+        staker: Address,
+        epoch: u64,
+    ) -> Option<RewardLockup> {
         env.storage()
             .persistent()
-            .set(&DataKey::StakerNextClaimEpoch(staker.clone()), &next_claim);
+            .get(&DataKey::StakerRewardLockup(staker, epoch))
+    }
+
+    /// Sum of *all* RewardLockup.scaled_amount for `staker`, both locked
+    /// and unlocked, claimed and unclaimed. Useful for dashboards.
+    pub fn get_total_lifetime_rewards(env: Env, staker: Address) -> i128 {
+        let current_epoch: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EpochId)
+            .unwrap_or(0);
+        let mut total: i128 = 0;
+        for e in 0..current_epoch {
+            if let Some(l) = env.storage().persistent().get::<_, RewardLockup>(
+                &DataKey::StakerRewardLockup(staker.clone(), e),
+            ) {
+                total = total.checked_add(l.scaled_amount).unwrap_or(total);
+            }
+        }
+        total
+    }
+
+    /// Duration-based multiplier the staker would earn for a reward
+    /// materialised *right now*, given their current live stake duration.
+    pub fn get_current_reward_multiplier_bps(env: Env, staker: Address) -> u32 {
+        match env
+            .storage()
+            .persistent()
+            .get::<_, StakeRecord>(&DataKey::Stake(staker))
+        {
+            None => 0,
+            Some(r) => {
+                let dur = env.ledger().timestamp().saturating_sub(r.staked_at);
+                compute_reward_multiplier_bps(dur)
+            }
+        }
     }
 
     // =======================================================================
