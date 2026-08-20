@@ -1,6 +1,6 @@
 #![no_std]
 
-use shared::{require_not_paused, ReentrancyGuard, Validator};
+use shared::{SafeMath, require_not_paused, ReentrancyGuard, Validator};
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token,
     Address, Env, IntoVal, Symbol, Vec,
@@ -154,8 +154,14 @@ pub struct TreasuryContract;
 
 #[contractimpl]
 impl TreasuryContract {
-    /// Initialize treasury contract with admin and staking contract address.
-    pub fn initialize(env: Env, admin: Address, staking_contract: Address) -> Result<(), Error> {
+    /// Initialize treasury contract with admin, staking contract, timelock, and optional pause guardian.
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        staking_contract: Address,
+        timelock: Address,
+        pause_guardian: Option<Address>,
+    ) -> Result<(), Error> {
         if env.storage().persistent().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
@@ -176,7 +182,7 @@ impl TreasuryContract {
             .set(&DataKey::AllocationCount, &0u32);
         env.storage()
             .persistent()
-            .set(&DataKey::RegulatoryReporting, &Address::generate(&env)); // placeholder
+            .set(&DataKey::PendingAllocationCount, &0u32);
         Ok(())
     }
 
@@ -497,7 +503,7 @@ impl TreasuryContract {
             &amount,
         );
 
-        let mut history = env
+        let count: u32 = env
             .storage()
             .persistent()
             .get(&DataKey::AllocationCount)
@@ -664,8 +670,13 @@ impl TreasuryContract {
             &total_amount,
         );
 
-        let lp_amount = total_amount / 10;
-        let staker_amount = total_amount - lp_amount;
+        let lp_amount = total_amount.safe_div(&env, 10);
+        let staker_amount = total_amount.safe_sub(&env, lp_amount);
+
+        env.events().publish(
+            (Symbol::new(&env, "Treasury"), Symbol::new(&env, "AllocAudit")),
+            (total_amount, lp_amount, staker_amount),
+        );
 
         if lp_amount > 0 {
             env.invoke_contract::<()>(
@@ -992,7 +1003,7 @@ mod tests {
         let timelock = Address::generate(env); // simulated timelock address
         let contract_id = env.register_contract(None, TreasuryContract);
         let client = TreasuryContractClient::new(env, &contract_id);
-        client.initialize(&admin, &staking, &timelock);
+        client.initialize(&admin, &staking, &timelock, &None);
         (admin, staking, timelock, contract_id)
     }
 
@@ -1421,3 +1432,4 @@ mod tests {
         assert_eq!(result, Err(Ok(Error::OracleUnhealthy)));
     }
 }
+

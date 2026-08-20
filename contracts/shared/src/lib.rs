@@ -20,6 +20,10 @@ pub mod staking;
 pub mod ttl_utils;
 pub mod interface_id;
 pub mod validation;
+pub mod safe_math;
+
+pub const MAX_FINANCIAL_AMOUNT: i128 = 1_000_000_000_000_000;
+pub const MAX_FEE_BPS: u32 = 10_000;
 
 pub use disaster_recovery::{
     compute_checksum, push_snapshot_index, RollbackApproval, RollbackProposal, SnapshotMeta,
@@ -38,6 +42,7 @@ pub use staking::{StakeRecord, StakedEventData};
 pub use storage::{EternalStorage, StorageType, InstanceKey, PersistentKey, TempKey};
 pub use ttl_utils::{next_bump_interval, should_bump_ttl};
 pub use validation::{Validator, ValidationError, require_auth_and_validate};
+pub use safe_math::SafeMath;
 
 /// Common error codes shared across all MentorsMind contracts.
 ///

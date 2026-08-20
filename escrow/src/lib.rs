@@ -5,7 +5,7 @@ use shared::events::{
     emit_escrow_event, evt_escrow_created, evt_escrow_disputed, evt_escrow_emergency_release,
     evt_escrow_refunded, evt_escrow_released, evt_escrow_resolved, evt_escrow_stuck_reported,
 };
-use shared::{
+use shared::{SafeMath, 
     compute_checksum, push_snapshot_index, EscrowRecord, EscrowStatus, RollbackProposal,
     SnapshotMeta, StateVerificationReport, EMERGENCY_SIGNERS, EMERGENCY_THRESHOLD, MAX_SNAPSHOTS,
     StateMachine, EscrowTransitionLog, GasEstimate, Validator,
@@ -781,10 +781,8 @@ impl EscrowContract {
             base_bps
         };
         let fee = amount
-            .checked_mul(effective_bps as i128)
-            .expect("Overflow")
-            .checked_div(10_000)
-            .expect("Division error");
+            .safe_mul(&env, effective_bps as i128)
+            .safe_div(&env, 10_000);
         (fee, tier, base_bps, effective_bps)
     }
 
@@ -808,10 +806,8 @@ impl EscrowContract {
                     .get(&DataKey::FeeBps)
                     .unwrap_or(DEFAULT_FEE_BPS);
                 amount
-                    .checked_mul(fee_bps as i128)
-                    .expect("Overflow")
-                    .checked_div(10_000)
-                    .expect("Division error")
+                    .safe_mul(&env, fee_bps as i128)
+                    .safe_div(&env, 10_000)
             }
         }
     }
@@ -937,8 +933,7 @@ impl EscrowContract {
             escrow.amount
         } else {
             escrow.quoted_token_amount
-                .checked_div(escrow.total_sessions as i128)
-                .expect("Division error")
+                .safe_div(&env, escrow.total_sessions as i128)
         };
 
         let fee_bps: u32 = env.storage().persistent().get(&DataKey::FeeBps).unwrap_or(0u32);
@@ -947,13 +942,15 @@ impl EscrowContract {
             .extend_ttl(&DataKey::FeeBps, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
 
         let platform_fee: i128 = amount_to_release
-            .checked_mul(fee_bps as i128)
-            .expect("Overflow")
-            .checked_div(10_000)
-            .expect("Division error");
+            .safe_mul(&env, fee_bps as i128)
+            .safe_div(&env, 10_000);
         let net_amount: i128 = amount_to_release
-            .checked_sub(platform_fee)
-            .expect("Underflow");
+            .safe_sub(&env, platform_fee);
+
+        env.events().publish(
+            (Symbol::new(&env, "Escrow"), Symbol::new(&env, "FeeAudit")),
+            (amount_to_release, fee_bps, platform_fee, net_amount),
+        );
 
         let treasury: Address = env
             .storage()
@@ -973,9 +970,9 @@ impl EscrowContract {
         token_client.transfer(&env.current_contract_address(), &escrow.mentor, &net_amount);
 
         escrow.sessions_completed += 1;
-        escrow.amount = escrow.amount.checked_sub(amount_to_release).expect("Underflow");
-        escrow.platform_fee = escrow.platform_fee.checked_add(platform_fee).expect("Overflow");
-        escrow.net_amount = escrow.net_amount.checked_add(net_amount).expect("Overflow");
+        escrow.amount = escrow.amount.safe_sub(&env, amount_to_release);
+        escrow.platform_fee = escrow.platform_fee.safe_add(&env, platform_fee);
+        escrow.net_amount = escrow.net_amount.safe_add(&env, net_amount);
 
         if escrow.sessions_completed == escrow.total_sessions {
             escrow.status = transition_status(&env, escrow.id, &escrow.status, &EscrowStatus::Released, &caller);
@@ -1031,8 +1028,7 @@ impl EscrowContract {
         // Calculate amount per session with remainder handling
         let per_session_amount = escrow
             .quoted_token_amount
-            .checked_div(escrow.total_sessions as i128)
-            .expect("Division error");
+            .safe_div(&env, escrow.total_sessions as i128);
 
         // For the last batch, release all remaining to handle dust
         let amount_to_release = if escrow.sessions_completed + sessions_to_release
@@ -1041,8 +1037,7 @@ impl EscrowContract {
             escrow.amount
         } else {
             per_session_amount
-                .checked_mul(sessions_to_release as i128)
-                .expect("Overflow")
+                .safe_mul(&env, sessions_to_release as i128)
         };
 
         let fee_bps: u32 = env.storage().persistent().get(&DataKey::FeeBps).unwrap_or(0u32);
@@ -1051,13 +1046,15 @@ impl EscrowContract {
             .extend_ttl(&DataKey::FeeBps, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
 
         let platform_fee: i128 = amount_to_release
-            .checked_mul(fee_bps as i128)
-            .expect("Overflow")
-            .checked_div(10_000)
-            .expect("Division error");
+            .safe_mul(&env, fee_bps as i128)
+            .safe_div(&env, 10_000);
         let net_amount: i128 = amount_to_release
-            .checked_sub(platform_fee)
-            .expect("Underflow");
+            .safe_sub(&env, platform_fee);
+
+        env.events().publish(
+            (Symbol::new(&env, "Escrow"), Symbol::new(&env, "FeeAudit")),
+            (amount_to_release, fee_bps, platform_fee, net_amount),
+        );
 
         let treasury: Address = env
             .storage()
@@ -1077,9 +1074,9 @@ impl EscrowContract {
         token_client.transfer(&env.current_contract_address(), &escrow.mentor, &net_amount);
 
         escrow.sessions_completed += sessions_to_release;
-        escrow.amount = escrow.amount.checked_sub(amount_to_release).expect("Underflow");
-        escrow.platform_fee = escrow.platform_fee.checked_add(platform_fee).expect("Overflow");
-        escrow.net_amount = escrow.net_amount.checked_add(net_amount).expect("Overflow");
+        escrow.amount = escrow.amount.safe_sub(&env, amount_to_release);
+        escrow.platform_fee = escrow.platform_fee.safe_add(&env, platform_fee);
+        escrow.net_amount = escrow.net_amount.safe_add(&env, net_amount);
 
         if escrow.sessions_completed == escrow.total_sessions {
             escrow.status = transition_status(&env, escrow.id, &escrow.status, &EscrowStatus::Released, &admin);
@@ -1150,8 +1147,7 @@ impl EscrowContract {
         let now = env.ledger().timestamp();
         let release_after = escrow
             .session_end_time
-            .checked_add(escrow.auto_release_delay)
-            .expect("Timestamp overflow");
+            .safe_add(&env, escrow.auto_release_delay);
 
         if now < release_after {
             panic!("Auto-release window has not elapsed");
@@ -1401,13 +1397,10 @@ impl EscrowContract {
         let token_client = soroban_sdk::token::Client::new(&env, &escrow.token_address);
 
         let mentor_amount = escrow.amount
-            .checked_mul(mentor_pct as i128)
-            .expect("Overflow")
-            .checked_div(100)
-            .expect("Division error");
+            .safe_mul(&env, mentor_pct as i128)
+            .safe_div(&env, 100);
         let learner_amount = escrow.amount
-            .checked_sub(mentor_amount)
-            .expect("Underflow");
+            .safe_sub(&env, mentor_amount);
 
         if mentor_amount > 0 {
             token_client.transfer(&env.current_contract_address(), &escrow.mentor, &mentor_amount);
@@ -1561,11 +1554,9 @@ impl EscrowContract {
         //   reportable  = stuck_since + GRACE_PERIOD_SECS
         let stuck_since = escrow
             .session_end_time
-            .checked_add(escrow.auto_release_delay)
-            .expect("Timestamp overflow");
+            .safe_add(&env, escrow.auto_release_delay);
         let reportable_after = stuck_since
-            .checked_add(GRACE_PERIOD_SECS)
-            .expect("Timestamp overflow");
+            .safe_add(&env, GRACE_PERIOD_SECS);
 
         let now = env.ledger().timestamp();
         if now < reportable_after {
@@ -1829,13 +1820,15 @@ impl EscrowContract {
             .extend_ttl(&DataKey::FeeBps, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
 
         let platform_fee = release_amount
-            .checked_mul(fee_bps as i128)
-            .expect("Overflow")
-            .checked_div(10_000)
-            .expect("Division error");
+            .safe_mul(&env, fee_bps as i128)
+            .safe_div(&env, 10_000);
         let net_amount: i128 = release_amount
-            .checked_sub(platform_fee)
-            .expect("Underflow");
+            .safe_sub(&env, platform_fee);
+
+        env.events().publish(
+            (Symbol::new(&env, "Escrow"), Symbol::new(&env, "FeeAudit")),
+            (release_amount, fee_bps, platform_fee, net_amount),
+        );
 
         let treasury: Address = env
             .storage()
@@ -1854,8 +1847,8 @@ impl EscrowContract {
         token_client.transfer(&env.current_contract_address(), &escrow.mentor, &net_amount);
 
         escrow.status = transition_status(env, escrow.id, &escrow.status, &EscrowStatus::Released, actor);
-        escrow.platform_fee = escrow.platform_fee.checked_add(platform_fee).expect("Overflow");
-        escrow.net_amount = escrow.net_amount.checked_add(net_amount).expect("Overflow");
+        escrow.platform_fee = escrow.platform_fee.safe_add(&env, platform_fee);
+        escrow.net_amount = escrow.net_amount.safe_add(&env, net_amount);
         escrow.amount = 0;
         env.storage().persistent().set(key, escrow);
 
@@ -2032,7 +2025,7 @@ impl EscrowContract {
         let page_size = if page_size > 50 { 50 } else { page_size };
         let mentor_key = (MENTOR_ESCROWS, mentor);
         let mentor_escrows: Vec<u64> = env.storage().persistent().get(&mentor_key).unwrap_or(Vec::new(&env));
-        let start = page.checked_mul(page_size).unwrap_or(0);
+        let start = page.safe_mul(&env, page_size);
         let mut result = Vec::new(&env);
 
         if start >= mentor_escrows.len() {
@@ -2054,7 +2047,7 @@ impl EscrowContract {
         let page_size = if page_size > 50 { 50 } else { page_size };
         let learner_key = (LEARNER_ESCROWS, learner);
         let learner_escrows: Vec<u64> = env.storage().persistent().get(&learner_key).unwrap_or(Vec::new(&env));
-        let start = page.checked_mul(page_size).unwrap_or(0);
+        let start = page.safe_mul(&env, page_size);
         let mut result = Vec::new(&env);
 
         if start >= learner_escrows.len() {
@@ -2158,10 +2151,8 @@ impl EscrowContract {
             panic!("stale oracle");
         }
         let token_amount = usd_amount
-            .checked_mul(10_000_000)
-            .expect("overflow")
-            .checked_div(price)
-            .expect("div");
+            .safe_mul(&env, 10_000_000)
+            .safe_div(&env, price);
         env.events().publish(
             (symbol_short!("Escrow"), symbol_short!("usd_rate"), learner.clone()),
             (usd_amount, price, token_amount),
@@ -2270,7 +2261,7 @@ impl EscrowContract {
 
         let total_amount = milestones
             .iter()
-            .fold(0i128, |acc, m| acc.checked_add(m.amount).expect("Amount overflow"));
+            .fold(0i128, |acc, m| acc.safe_add(&env, m.amount));
 
         Validator::new(&env)
             .require_positive(total_amount, "total_amount")
@@ -2372,11 +2363,14 @@ impl EscrowContract {
 
         let platform_fee: i128 = milestone
             .amount
-            .checked_mul(fee_bps as i128)
-            .expect("Overflow")
-            .checked_div(10_000)
-            .expect("Division error");
-        let net_amount: i128 = milestone.amount.checked_sub(platform_fee).expect("Underflow");
+            .safe_mul(&env, fee_bps as i128)
+            .safe_div(&env, 10_000);
+        let net_amount: i128 = milestone.amount.safe_sub(&env, platform_fee);
+
+        env.events().publish(
+            (Symbol::new(&env, "Escrow"), Symbol::new(&env, "FeeAudit")),
+            (milestone.amount, fee_bps, platform_fee, net_amount),
+        );
 
         let treasury: Address = env
             .storage()
@@ -2404,12 +2398,10 @@ impl EscrowContract {
             .set(milestone_index, MilestoneStatus::Completed);
         milestone_escrow.platform_fee = milestone_escrow
             .platform_fee
-            .checked_add(platform_fee)
-            .expect("Overflow");
+            .safe_add(&env, platform_fee);
         milestone_escrow.net_amount = milestone_escrow
             .net_amount
-            .checked_add(net_amount)
-            .expect("Overflow");
+            .safe_add(&env, net_amount);
 
         let all_completed = milestone_escrow
             .milestone_statuses
@@ -2526,15 +2518,12 @@ impl EscrowContract {
                 .persistent()
                 .extend_ttl(&DataKey::FeeBps, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
             platform_fee = release_amount
-                .checked_mul(fee_bps as i128)
-                .expect("Overflow")
-                .checked_div(10_000)
-                .expect("Division error");
+                .safe_mul(&env, fee_bps as i128)
+                .safe_div(&env, 10_000);
         }
 
         let net_amount: i128 = release_amount
-            .checked_sub(platform_fee)
-            .expect("Underflow");
+            .safe_sub(&env, platform_fee);
 
         let treasury: Address = env
             .storage()
@@ -2554,8 +2543,8 @@ impl EscrowContract {
         token_client.transfer(&env.current_contract_address(), &escrow.mentor, &net_amount);
 
         escrow.status = transition_status(env, escrow.id, &escrow.status, &EscrowStatus::Released, actor);
-        escrow.platform_fee = escrow.platform_fee.checked_add(platform_fee).expect("Overflow");
-        escrow.net_amount = escrow.net_amount.checked_add(net_amount).expect("Overflow");
+        escrow.platform_fee = escrow.platform_fee.safe_add(&env, platform_fee);
+        escrow.net_amount = escrow.net_amount.safe_add(&env, net_amount);
         escrow.amount = 0; // all remaining amount is released
         env.storage().persistent().set(key, escrow);
 
@@ -3229,8 +3218,7 @@ impl EscrowContract {
             .get(&DataKey::RollbackProposalCount)
             .unwrap_or(0);
         let new_id = proposal_count
-            .checked_add(1)
-            .expect("Rollback proposal count overflow");
+            .safe_add(&env, 1);
         env.storage()
             .persistent()
             .set(&DataKey::RollbackProposalCount, &new_id);
@@ -3309,8 +3297,7 @@ impl EscrowContract {
             .set(&DataKey::RollbackApproval(proposal_id, signer.clone()), &true);
         proposal.approval_count = proposal
             .approval_count
-            .checked_add(1)
-            .expect("Approval count overflow");
+            .safe_add(&env, 1);
         env.storage()
             .persistent()
             .set(&DataKey::RollbackProposal(proposal_id), &proposal);
@@ -4488,3 +4475,4 @@ mod test {
         assert_eq!(count_standard_escrow_events(&f, "refunded"), 1);
     }
 }
+
