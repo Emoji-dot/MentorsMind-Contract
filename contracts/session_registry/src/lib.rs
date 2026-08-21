@@ -1,5 +1,7 @@
 #![no_std]
 
+use shared::{interaction_commitment, ReputationProof};
+
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec};
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -54,6 +56,7 @@ pub enum DataKey {
     MentorScheduleSlot(Address, u64),
     SessionOracle,
     SessionMetadata(Symbol),
+    CompletionProof(Symbol),
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -189,6 +192,9 @@ impl SessionRegistry {
         
         record.status = status.clone();
         env.storage().persistent().set(&session_key, &record);
+        if status == SessionStatus::Completed {
+            Self::store_completion_proof(&env, &record);
+        }
         env.storage()
             .persistent()
             .extend_ttl(&session_key, TTL_THRESHOLD, TTL_BUMP);
@@ -280,6 +286,9 @@ impl SessionRegistry {
         }
         record.status = status.clone();
         env.storage().persistent().set(&session_key, &record);
+        if status == SessionStatus::Completed {
+            Self::store_completion_proof(&env, &record);
+        }
         env.events().publish(
             (
                 symbol_short!("session"),
@@ -296,6 +305,58 @@ impl SessionRegistry {
             .persistent()
             .get(&DataKey::Session(session_id))
             .expect("Session not found")
+    }
+
+    fn store_completion_proof(env: &Env, record: &SessionRecord) {
+        let proof = ReputationProof {
+            session_id: record.session_id.clone(),
+            mentor: record.mentor.clone(),
+            learner: record.learner.clone(),
+            completed_at: env.ledger().timestamp(),
+            commitment: interaction_commitment(
+                env,
+                &record.session_id,
+                &record.mentor,
+                &record.learner,
+                env.ledger().timestamp(),
+            ),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::CompletionProof(record.session_id.clone()), &proof);
+        env.storage().persistent().extend_ttl(
+            &DataKey::CompletionProof(record.session_id.clone()),
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+        env.events().publish(
+            (symbol_short!("session"), Symbol::new(env, "proof_generated")),
+            (record.session_id.clone(), proof.commitment),
+        );
+    }
+
+    pub fn get_completion_proof(env: Env, session_id: Symbol) -> ReputationProof {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CompletionProof(session_id))
+            .expect("Completion proof not found")
+    }
+
+    pub fn verify_completion_proof(env: Env, proof: ReputationProof) -> bool {
+        let stored: ReputationProof = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CompletionProof(proof.session_id.clone()))
+            .unwrap_or(proof.clone());
+        stored == proof
+            && stored.commitment
+                == interaction_commitment(
+                    &env,
+                    &stored.session_id,
+                    &stored.mentor,
+                    &stored.learner,
+                    stored.completed_at,
+                )
     }
 
     /// Get paginated session IDs for a mentor.
@@ -373,30 +434,6 @@ impl SessionRegistry {
             .persistent()
             .get(&DataKey::LearnerSessionCount(learner))
             .unwrap_or(0)
-    }
-
-    /// Get mentor availability slots.
-    /// Returns a vector of (slot_start_time, is_available) tuples.
-    /// Useful for UI/scheduling systems to find available time slots.
-    pub fn get_mentor_availability(
-        env: Env,
-        mentor: Address,
-        from: u64,
-        to: u64,
-    ) -> Vec<(u64, bool)> {
-        let mut result = Vec::new(&env);
-        
-        let start_bucket = from / SLOT_SIZE_SECS;
-        let end_bucket = (to + SLOT_SIZE_SECS - 1) / SLOT_SIZE_SECS;
-
-        for bucket in start_bucket..end_bucket {
-            let slot_start = bucket * SLOT_SIZE_SECS;
-            let slot_key = DataKey::MentorScheduleSlot(mentor.clone(), bucket);
-            let is_available = !env.storage().persistent().has(&slot_key);
-            result.push_back((slot_start, is_available));
-        }
-
-        result
     }
 
     fn require_backend(env: &Env) -> Address {
@@ -891,3 +928,4 @@ mod tests {
         );
         assert_eq!(returned_id, session3);
     }
+}

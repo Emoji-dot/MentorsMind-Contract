@@ -1,4 +1,6 @@
-use soroban_sdk::{contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env, Symbol};
+//! Shared governance voting primitives.
+
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, IntoVal, Symbol, TryIntoVal, Val};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -80,9 +82,13 @@ pub fn compute_commitment_hash(
     input.push_back((proposal_id >> 16) as u8);
     input.push_back((proposal_id >> 8) as u8);
     input.push_back(proposal_id as u8);
-    input.append(&mut voter.to_xdr(env));
+    let voter_val: Val = voter.clone().into_val(env);
+    let mut voter_bytes: Bytes = voter_val.try_into_val(env).unwrap();
+    input.append(&mut voter_bytes);
     input.push_back(if support { 1 } else { 0 });
-    input.append(&mut salt.to_xdr(env));
+    let salt_val: Val = salt.clone().into_val(env);
+    let mut salt_bytes: Bytes = salt_val.try_into_val(env).unwrap();
+    input.append(&mut salt_bytes);
     env.crypto().sha256(&input).into()
 }
 

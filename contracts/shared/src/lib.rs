@@ -23,6 +23,7 @@ pub mod storage_compatibility;
 pub mod ttl_utils;
 pub mod interface_id;
 pub mod validation;
+pub mod reputation;
 
 pub use disaster_recovery::{
     compute_checksum, push_snapshot_index, RollbackApproval, RollbackProposal, SnapshotMeta,
@@ -47,7 +48,16 @@ pub use sig_validation::{
     MetaTxAction, MetaTxPayload, SigError, EXPIRY_TOLERANCE_SECS, MAX_DEADLINE_SECS,
 };
 pub use state_machine::StateMachine;
-pub use staking::{StakeRecord, StakedEventData};
+pub use staking::{
+    StakeRecord, StakedEventData, StakingSnapshot, RewardLockup, PenaltyCalculation,
+    SuspiciousPatternFlag, StakingActionRecord, compute_reward_multiplier_bps,
+    compute_early_unstake_penalty, detect_suspicious_pattern, apply_bps_multiplier,
+    action_stake, action_unstake, action_claim,
+    MIN_STAKING_DURATION_SECS, REWARD_LOCKUP_SECS, MAX_SCALING_DURATION_SECS,
+    REWARD_MULTIPLIER_MIN_BPS, REWARD_MULTIPLIER_MAX_BPS,
+    EARLY_UNSTAKE_PENALTY_MIN_BPS, EARLY_UNSTAKE_PENALTY_MAX_BPS,
+    BASIS_POINTS, PATTERN_DETECTION_WINDOW, SUSPICIOUS_CYCLE_THRESHOLD_SECS,
+};
 pub use storage::{EternalStorage, StorageType, InstanceKey, PersistentKey, TempKey};
 pub use storage_compatibility::{
     CompatibilityError, CompatibilityReport, CompatibilityValidator, GradualMigrationStatus,
@@ -62,6 +72,10 @@ pub use ttl_utils::{
     WARNING_THRESHOLD_LEDGERS,
 };
 pub use validation::{Validator, ValidationError, require_auth_and_validate};
+pub use reputation::{
+    analyze_review_pattern, detect_sybil, interaction_commitment, BehavioralAnalysis,
+    ReputationProof, SybilDetection,
+};
 
 /// Common error codes shared across all MentorsMind contracts.
 ///
