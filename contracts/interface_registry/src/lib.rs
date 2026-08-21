@@ -9,6 +9,7 @@ pub enum DataKey {
     Interface(Symbol),
     InterfaceIds,
     InterfaceDescriptor(Symbol),
+    Quarantined(Address),
 }
 
 #[contracttype]
@@ -167,13 +168,64 @@ impl InterfaceRegistryContract {
         Self::get_version(env.clone(), Symbol::new(&env, Self::YIELD_INTERFACE))
     }
 
-    /// Verify that a contract at `address` is registered with the expected interface.
+    /// Verify that a contract at `address` is registered with the expected
+    /// interface and has not been quarantined.
     pub fn verify(env: Env, address: Address, expected_interface: Symbol) -> bool {
+        if Self::is_quarantined(env.clone(), address.clone()) {
+            return false;
+        }
         let key = DataKey::Interface(expected_interface);
         match env.storage().persistent().get::<_, InterfaceData>(&key) {
             Some(data) => data.contract == address,
             None => false,
         }
+    }
+
+    /// Emergency isolation: mark `contract` as quarantined so `verify` (and
+    /// therefore every consumer that gates cross-contract calls on it, e.g.
+    /// `CrossContractAuth::require_authorized_contract`) rejects it, even if
+    /// it remains registered under an interface. Admin-only.
+    pub fn quarantine_contract(env: Env, contract: Address) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Quarantined(contract.clone()), &true);
+
+        env.events()
+            .publish((Symbol::new(&env, "contract_quarantined"),), (contract, admin));
+    }
+
+    /// Lift a quarantine previously placed on `contract`. Admin-only.
+    pub fn unquarantine_contract(env: Env, contract: Address) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Quarantined(contract.clone()));
+
+        env.events().publish(
+            (Symbol::new(&env, "contract_unquarantined"),),
+            (contract, admin),
+        );
+    }
+
+    /// Whether `contract` is currently quarantined.
+    pub fn is_quarantined(env: Env, contract: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Quarantined(contract))
+            .unwrap_or(false)
     }
 
     /// Panics if the contract at `address` is not registered with the expected interface.

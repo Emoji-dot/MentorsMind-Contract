@@ -153,6 +153,31 @@ impl EternalStorage {
     {
         env.storage().temporary().remove(key);
     }
+
+    // -----------------------------------------------------------------------
+    // TTL Extension helpers
+    // -----------------------------------------------------------------------
+
+    /// Extend instance storage using the unified TTL policy.
+    pub fn extend_instance_ttl(env: &Env) {
+        crate::ttl_utils::TTLManager::extend_instance(env);
+    }
+
+    /// Extend a persistent storage entry using the unified TTL policy.
+    pub fn extend_persistent_ttl<K>(env: &Env, key: &K)
+    where
+        K: IntoVal<Env, Val>,
+    {
+        crate::ttl_utils::TTLManager::extend_persistent(env, key);
+    }
+
+    /// Extend a temporary storage entry using the unified TTL policy.
+    pub fn extend_temporary_ttl<K>(env: &Env, key: &K)
+    where
+        K: IntoVal<Env, Val>,
+    {
+        crate::ttl_utils::TTLManager::extend_temporary(env, key);
+    }
 }
 
 // ---------------------------------------------------------------------------

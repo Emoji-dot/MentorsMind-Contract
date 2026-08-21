@@ -5,14 +5,17 @@ use shared::events::{
     emit_escrow_event, evt_escrow_created, evt_escrow_disputed, evt_escrow_emergency_release,
     evt_escrow_refunded, evt_escrow_released, evt_escrow_resolved, evt_escrow_stuck_reported,
 };
-use shared::{SafeMath, 
-    compute_checksum, push_snapshot_index, EscrowRecord, EscrowStatus, RollbackProposal,
-    SnapshotMeta, StateVerificationReport, EMERGENCY_SIGNERS, EMERGENCY_THRESHOLD, MAX_SNAPSHOTS,
-    StateMachine, EscrowTransitionLog, GasEstimate, Validator,
+use shared::{
+    compute_checksum, push_snapshot_index, CrossContractAuth, EscrowRecord, EscrowStatus,
+    RollbackProposal, SnapshotMeta, StateVerificationReport, EMERGENCY_SIGNERS,
+    EMERGENCY_THRESHOLD, MAX_SNAPSHOTS, StateMachine, EscrowTransitionLog, GasEstimate, Validator,
 };
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, Bytes, Env, Symbol, Vec,
     IntoVal, BytesN,
+};
+use shared::{
+    AdminTransfer, AdminChangeProposal, MIN_ADMIN_TIMELOCK_SECS, ADMIN_COOLING_OFF_SECS, SharedError
 };
 
 #[contracttype]
@@ -173,6 +176,26 @@ pub struct EmergencyReleaseExecutedEventData {
 }
 
 // ---------------------------------------------------------------------------
+// Admin Events
+// ---------------------------------------------------------------------------
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminChangeProposedEventData {
+    pub contract: Address,
+    pub old_admin: Address,
+    pub new_admin: Address,
+    pub effective_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminChangeAcceptedEventData {
+    pub contract: Address,
+    pub new_admin: Address,
+}
+
+// ---------------------------------------------------------------------------
 // Graduated fee schedule (Issue #676)
 // ---------------------------------------------------------------------------
 
@@ -255,6 +278,11 @@ pub enum DataKey {
     StakingContract,
     ReputationContract,
     InsuranceContract,
+    /// Interface registry consulted to authenticate cross-contract peers
+    /// (staking/reputation/insurance) before they're wired in. Optional:
+    /// absent config skips verification so tests/early deployments work
+    /// without a deployed registry.
+    InterfaceRegistry,
     /// Address of the MultisigAdmin contract used for emergency release approvals.
     MultisigAdmin,
     /// Count of failed auto-release attempts for a given escrow_id.
@@ -280,6 +308,10 @@ pub enum DataKey {
     RollbackProposalCount,
     /// Store a vector of escrow transition logs.
     TransitionLog(u64),
+    /// Pending admin change tracking.
+    PendingAdminTransfer,
+    /// Last admin change timestamp for cooling-off enforcement.
+    LastAdminChange,
 }
 
 // ---------------------------------------------------------------------------
@@ -450,6 +482,105 @@ impl EscrowContract {
                 },
             );
         }
+    }
+
+    /// Propose a new admin for the Escrow contract.
+    /// The new admin can only be accepted after the `MIN_ADMIN_TIMELOCK_SECS` has passed.
+    /// Also enforces `ADMIN_COOLING_OFF_SECS` between consecutive admin changes.
+    pub fn propose_admin_change(env: Env, new_admin: Address) {
+        let current_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Admin, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        current_admin.require_auth();
+
+        let last_change: u64 = env.storage().persistent().get(&DataKey::LastAdminChange).unwrap_or(0);
+        let current_time = env.ledger().timestamp();
+
+        if current_time < last_change + ADMIN_COOLING_OFF_SECS {
+            panic!("Cooling-off period active");
+        }
+
+        let effective_at = current_time.checked_add(MIN_ADMIN_TIMELOCK_SECS).unwrap();
+        
+        let pending = AdminTransfer {
+            new_admin: new_admin.clone(),
+            effective_at,
+            status: AdminChangeProposal::Proposed,
+        };
+
+        env.storage().persistent().set(&DataKey::PendingAdminTransfer, &pending);
+        env.storage().persistent().extend_ttl(&DataKey::PendingAdminTransfer, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("proposed")),
+            AdminChangeProposedEventData {
+                contract: env.current_contract_address(),
+                old_admin: current_admin,
+                new_admin,
+                effective_at,
+            },
+        );
+    }
+
+    /// Accept the admin role if a pending proposal exists and the timelock has expired.
+    pub fn accept_admin_role(env: Env, new_admin: Address) {
+        new_admin.require_auth();
+
+        let mut pending: AdminTransfer = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingAdminTransfer)
+            .expect("No pending admin transfer");
+
+        if pending.new_admin != new_admin {
+            panic!("Unauthorized to accept role");
+        }
+
+        if env.ledger().timestamp() < pending.effective_at {
+            panic!("Timelock not expired");
+        }
+
+        if pending.status != AdminChangeProposal::Proposed {
+            panic!("Invalid proposal state");
+        }
+
+        pending.status = AdminChangeProposal::Accepted;
+        
+        env.storage().persistent().set(&DataKey::Admin, &new_admin);
+        env.storage().persistent().extend_ttl(&DataKey::Admin, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        
+        env.storage().persistent().set(&DataKey::LastAdminChange, &env.ledger().timestamp());
+        env.storage().persistent().extend_ttl(&DataKey::LastAdminChange, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        
+        env.storage().persistent().remove(&DataKey::PendingAdminTransfer);
+
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("accepted")),
+            AdminChangeAcceptedEventData {
+                contract: env.current_contract_address(),
+                new_admin,
+            },
+        );
+    }
+
+    /// Immediately revokes the current admin and assigns a new one.
+    /// Can only be called by the multisig admin contract.
+    pub fn revoke_admin_emergency(env: Env, new_admin: Address) {
+        let multisig: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultisigAdmin)
+            .expect("Multisig not configured");
+        multisig.require_auth();
+        
+        env.storage().persistent().set(&DataKey::Admin, &new_admin);
+        env.storage().persistent().extend_ttl(&DataKey::Admin, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        env.storage().persistent().remove(&DataKey::PendingAdminTransfer);
     }
 
     /// Update the platform fee — admin only, capped at 1 000 bps (10%).
@@ -663,6 +794,38 @@ impl EscrowContract {
         env.storage().persistent().get(&DataKey::FeeSchedule)
     }
 
+    /// Set the interface registry consulted to authenticate cross-contract
+    /// peers (staking/reputation/insurance) before they're wired in
+    /// (admin only). See issue #818 (cross-contract authentication bypass).
+    pub fn set_interface_registry(env: Env, admin: Address, registry: Address) {
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("Caller not authorized");
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::InterfaceRegistry, &registry);
+    }
+
+    /// Rejects `candidate` unless it verifies against `interface_id` in the
+    /// configured interface registry. A no-op when no registry is
+    /// configured, so tests/early deployments keep working without one.
+    fn _require_authorized_peer(env: &Env, candidate: &Address, interface_id: Symbol) {
+        if let Some(registry) = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::InterfaceRegistry)
+        {
+            CrossContractAuth::require_authorized_contract(env, &registry, candidate, interface_id);
+        }
+    }
+
     /// Set the staking contract address used to read mentor tiers (admin only).
     pub fn set_staking_contract(env: Env, admin: Address, staking: Address) {
         let stored_admin: Address = env
@@ -677,6 +840,7 @@ impl EscrowContract {
         if admin != stored_admin {
             panic!("Caller not authorized");
         }
+        Self::_require_authorized_peer(&env, &staking, Symbol::new(&env, "staking_v1"));
 
         env.storage().persistent().set(&DataKey::StakingContract, &staking);
         env.storage()
@@ -701,6 +865,7 @@ impl EscrowContract {
         if admin != stored_admin {
             panic!("Caller not authorized");
         }
+        Self::_require_authorized_peer(&env, &reputation, Symbol::new(&env, "reputation_v1"));
 
         env.storage()
             .persistent()
@@ -727,6 +892,7 @@ impl EscrowContract {
         if admin != stored_admin {
             panic!("Caller not authorized");
         }
+        Self::_require_authorized_peer(&env, &insurance, Symbol::new(&env, "insurance_v1"));
 
         env.storage()
             .persistent()
