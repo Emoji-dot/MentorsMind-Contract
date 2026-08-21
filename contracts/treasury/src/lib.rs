@@ -1745,3 +1745,4 @@ impl TreasuryContract {
         assert_eq!(result, Err(Ok(Error::OracleCircuitBreaker)));
     }
 }
+

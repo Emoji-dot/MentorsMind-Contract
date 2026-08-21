@@ -581,9 +581,8 @@ impl StakingContract {
 
         let now = env.ledger().timestamp();
         let lock_seconds = (lock_period_days as u64)
-            .checked_mul(86_400u64)
-            .expect("Overflow");
-        let unlock_at = now.checked_add(lock_seconds).expect("Timestamp overflow");
+            .safe_mul(&env, 86_400u64);
+        let unlock_at = now.safe_add(&env, lock_seconds);
         let tier = Self::compute_tier(&env, amount, &mentor);
 
         let record = StakeRecord {
@@ -634,7 +633,7 @@ impl StakingContract {
             .persistent()
             .get(&DataKey::EpochId)
             .unwrap_or(0);
-        let entry_epoch = current_epoch.checked_add(1).expect("Overflow");
+        let entry_epoch = current_epoch.safe_add(&env, 1);
         env.storage()
             .persistent()
             .set(&DataKey::StakerEpochEntry(mentor.clone()), &entry_epoch);
@@ -924,7 +923,7 @@ impl StakingContract {
             .unwrap_or(0);
         env.storage().persistent().set(
             &DataKey::TotalStaked,
-            &(total_staked.checked_sub(record.amount).expect("Underflow")),
+            &(total_staked.safe_sub(&env, record.amount)),
         );
 
         // -------------------------------------------------------------------
@@ -1255,7 +1254,7 @@ impl StakingContract {
             .persistent()
             .set(&DataKey::EpochReward(current_epoch), &combined_reward);
 
-        let next_epoch = current_epoch.checked_add(1).expect("Overflow");
+        let next_epoch = current_epoch.safe_add(&env, 1);
         env.storage()
             .persistent()
             .set(&DataKey::EpochId, &next_epoch);
@@ -1398,9 +1397,13 @@ impl StakingContract {
                     .persistent()
                     .get::<_, StakeRecord>(&DataKey::Stake(staker.clone()))
                 {
-                    let share = (record.amount * amount) / total_staked;
+                    let share = record.amount.safe_mul(&env, amount).safe_div(&env, total_staked);
+                    env.events().publish(
+                        (Symbol::new(&env, "Staking"), Symbol::new(&env, "RewardAudit")),
+                        (staker.clone(), record.amount, total_staked, share),
+                    );
                     if share > 0 {
-                        batch_updates.push_back((staker, share));
+                        batch_updates.push_back((staker.clone(), share));
                     }
                 }
             }
@@ -1415,7 +1418,7 @@ impl StakingContract {
                 .unwrap_or(0);
             env.storage()
                 .persistent()
-                .set(&DataKey::PendingRewards(staker.clone()), &(pending + share));
+                .set(&DataKey::PendingRewards(staker.clone()), &pending.safe_add(&env, share));
         }
     }
 
@@ -1818,7 +1821,7 @@ impl StakingContract {
         
         let mut record: LPRecord = env.storage().persistent().get(&DataKey::LiquidityProviderRecord(lp_holder.clone())).unwrap();
         let now = env.ledger().timestamp();
-        let time_staked = now - record.last_reward_at;
+        let time_staked = now.safe_sub(&env, record.last_reward_at);
         
         if time_staked == 0 {
             return Ok(());
@@ -1826,7 +1829,9 @@ impl StakingContract {
 
         // Calculate rewards: proportional to time and amount
         // Assuming a rate, e.g., 1 reward token per 1000 LP tokens per day
-        let reward = ((record.lp_token_amount as u128 * time_staked as u128) / (1000 * 86400)) as i128;
+        let reward = record.lp_token_amount
+            .safe_mul(&env, time_staked as i128)
+            .safe_div(&env, 1000 * 86400);
         
         if reward > 0 {
             let pool_balance: i128 = env.storage().persistent().get(&DataKey::LPRewardPool).unwrap_or(0);
@@ -1834,11 +1839,11 @@ impl StakingContract {
                  // Adjust to pool balance or return error
                  // For now, let's just pay what's in the pool
                  let actual_reward = reward.min(pool_balance);
-                 env.storage().persistent().set(&DataKey::LPRewardPool, &(pool_balance - actual_reward));
+                 env.storage().persistent().set(&DataKey::LPRewardPool, &(pool_balance.safe_sub(&env, actual_reward)));
                  let token_client = token::Client::new(&env, &mnt_token);
                  token_client.transfer(&env.current_contract_address(), &lp_holder, &actual_reward);
             } else {
-                 env.storage().persistent().set(&DataKey::LPRewardPool, &(pool_balance - reward));
+                 env.storage().persistent().set(&DataKey::LPRewardPool, &(pool_balance.safe_sub(&env, reward)));
                  let token_client = token::Client::new(&env, &mnt_token);
                  token_client.transfer(&env.current_contract_address(), &lp_holder, &reward);
             }
@@ -2438,7 +2443,7 @@ impl StakingContract {
             .persistent()
             .get(&DataKey::StakeRollbackProposalCount)
             .unwrap_or(0);
-        let new_id = count.checked_add(1).expect("Staking rollback count overflow");
+        let new_id = count.safe_add(&env, 1);
         env.storage()
             .persistent()
             .set(&DataKey::StakeRollbackProposalCount, &new_id);
@@ -2514,8 +2519,7 @@ impl StakingContract {
         );
         proposal.approval_count = proposal
             .approval_count
-            .checked_add(1)
-            .expect("Approval count overflow");
+            .safe_add(&env, 1);
         env.storage()
             .persistent()
             .set(&DataKey::StakeRollbackProposal(proposal_id), &proposal);
@@ -3274,3 +3278,4 @@ mod test {
         assert_eq!(f.client().get_tier(&mentor), 3);
     }
 }
+

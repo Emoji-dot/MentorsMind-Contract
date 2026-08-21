@@ -138,6 +138,25 @@ impl<'a> Validator<'a> {
         self
     }
 
+    /// Assert that `amount` is strictly positive and <= MAX_FINANCIAL_AMOUNT.
+    pub fn require_valid_amount(mut self, amount: i128, field: &str) -> Self {
+        if amount <= 0 {
+            self.errors.push_back(ValidationError {
+                field: Symbol::new(self.env, field),
+                constraint: Symbol::new(self.env, "positive"),
+                value_provided: amount,
+            });
+        }
+        if amount > crate::MAX_FINANCIAL_AMOUNT {
+            self.errors.push_back(ValidationError {
+                field: Symbol::new(self.env, field),
+                constraint: Symbol::new(self.env, "max"),
+                value_provided: amount,
+            });
+        }
+        self
+    }
+
     /// Assert that `bps` is a valid basis-points value (`0..=10_000`).
     pub fn require_valid_bps(mut self, bps: u32, field: &str) -> Self {
         if bps > 10_000 {
