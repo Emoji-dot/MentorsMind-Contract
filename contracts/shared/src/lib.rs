@@ -19,6 +19,7 @@ pub mod sig_validation;
 pub mod state_machine;
 pub mod staking;
 pub mod storage;
+pub mod storage_compatibility;
 pub mod ttl_utils;
 pub mod interface_id;
 pub mod validation;
@@ -58,7 +59,18 @@ pub use staking::{
     BASIS_POINTS, PATTERN_DETECTION_WINDOW, SUSPICIOUS_CYCLE_THRESHOLD_SECS,
 };
 pub use storage::{EternalStorage, StorageType, InstanceKey, PersistentKey, TempKey};
-pub use ttl_utils::{next_bump_interval, should_bump_ttl};
+pub use storage_compatibility::{
+    CompatibilityError, CompatibilityReport, CompatibilityValidator, GradualMigrationStatus,
+    MigrationScript, StorageField, StorageFieldType, StorageLayoutSchema, StorageVersion,
+};
+pub use ttl_utils::{
+    next_bump_interval, should_bump_ttl, AlertLevel, DataBackupRecord, DataDependencyTracker,
+    DependencyItem, ExpirationMonitor, TTLAlert, TTLManager, TTLRecoveryManager,
+    INSTANCE_BUMP_AMOUNT, INSTANCE_LIFETIME_THRESHOLD, ONE_DAY_LEDGERS, PERSISTENT_BUMP_AMOUNT,
+    PERSISTENT_LIFETIME_THRESHOLD, SAFETY_MARGIN_LEDGERS, SEVEN_DAYS_LEDGERS,
+    TEMPORARY_BUMP_AMOUNT, TEMPORARY_LIFETIME_THRESHOLD, THIRTY_DAYS_LEDGERS,
+    WARNING_THRESHOLD_LEDGERS,
+};
 pub use validation::{Validator, ValidationError, require_auth_and_validate};
 pub use reputation::{
     analyze_review_pattern, detect_sybil, interaction_commitment, BehavioralAnalysis,

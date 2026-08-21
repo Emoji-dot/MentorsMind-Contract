@@ -1,4 +1,4 @@
-use soroban_sdk::{Address, Env, Symbol};
+use soroban_sdk::{Address, Env, IntoVal, Symbol};
 
 /// Registry capable of attesting that a given address is the legitimate,
 /// currently-authorized instance of a named system interface (e.g.

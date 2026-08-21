@@ -29,24 +29,28 @@ pub struct VoteCommitment {
     pub committed_at: u64,
 }
 
-/// A revealed vote recorded during the reveal phase.
+/// A revealed vote stored during the reveal phase.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RevealedVote {
     pub proposal_id: u32,
     pub voter: Address,
     pub support: bool,
-    pub weight: i128,
+    pub voting_weight: i128,
     pub revealed_at: u64,
 }
 
 /// The current phase of a proposal's voting lifecycle.
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
 pub enum VotePhase {
-    Commit,
-    Reveal,
-    Ended,
+    /// Commit phase: voters submit commitment hashes.
+    Commit = 1,
+    /// Reveal phase: voters reveal their actual votes.
+    Reveal = 2,
+    /// Voting has ended.
+    Ended = 3,
 }
 
 /// A flag raised when vote manipulation is detected.
@@ -65,7 +69,7 @@ pub struct ManipulationFlag {
 // Commitment hash computation
 // ---------------------------------------------------------------------------
 
-/// Compute SHA-256(proposal_id || voter || support || salt).
+/// Compute a commitment hash: sha256(proposal_id || voter || support || salt).
 pub fn compute_commitment_hash(
     env: &Env,
     proposal_id: u32,
