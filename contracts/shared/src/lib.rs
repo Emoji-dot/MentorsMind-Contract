@@ -24,6 +24,7 @@ pub mod ttl_utils;
 pub mod interface_id;
 pub mod validation;
 pub mod reputation;
+pub mod failure_tracking;
 
 pub use disaster_recovery::{
     compute_checksum, push_snapshot_index, RollbackApproval, RollbackProposal, SnapshotMeta,
@@ -76,6 +77,11 @@ pub use reputation::{
     analyze_review_pattern, detect_sybil, interaction_commitment, BehavioralAnalysis,
     ReputationProof, SybilDetection,
 };
+pub use failure_tracking::{
+    ReleaseFailure, FailureClassification, ExponentialBackoff, RecoveryState,
+    calculate_backoff_delay, classify_failure, calculate_next_retry, compute_failure_hash,
+};
+
 
 /// Common error codes shared across all MentorsMind contracts.
 ///
