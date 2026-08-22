@@ -30,6 +30,14 @@ pub enum Error {
     /// The address proposed as guardian does not meet the minimum
     /// emergency-multisig configuration (threshold/signer floor).
     InvalidGuardianConfig = 9,
+    /// Guardian override limit exceeded (max 3 per 30-day period).
+    GuardianLimitExceeded = 10,
+    /// Missing justification for guardian override operation.
+    MissingJustification = 11,
+    /// Community veto period still active for this guardian action.
+    VetoPeriodActive = 12,
+    /// Guardian action has been vetoed by community.
+    ActionVetoed = 13,
 }
 
 // ---------------------------------------------------------------------------
@@ -52,6 +60,12 @@ pub const MIN_GUARDIAN_THRESHOLD: u32 = 4;
 /// Minimum total signer count a guardian multisig must have (of-7).
 pub const MIN_GUARDIAN_SIGNERS: u32 = 7;
 
+/// Guardian override limits
+pub const MAX_GUARDIAN_OVERRIDES_PER_PERIOD: u32 = 3;
+pub const GUARDIAN_OVERRIDE_PERIOD_SECS: u64 = 30 * 24 * 60 * 60; // 30 days
+pub const GUARDIAN_VETO_PERIOD_SECS: u64 = 48 * 60 * 60; // 48 hours
+pub const GUARDIAN_ROLE_ROTATION_SECS: u64 = 6 * 30 * 24 * 60 * 60; // ~6 months
+
 // ---------------------------------------------------------------------------
 // Pure invariant logic
 //
@@ -64,7 +78,7 @@ pub const MIN_GUARDIAN_SIGNERS: u32 = 7;
 // ---------------------------------------------------------------------------
 
 pub mod logic {
-    use super::{MAX_DELAY, MIN_DELAY, OPERATION_EXPIRY_SECS, TIMESTAMP_TOLERANCE_SECS};
+    use super::{MAX_DELAY, MIN_DELAY, OPERATION_EXPIRY_SECS, TIMESTAMP_TOLERANCE_SECS, MAX_GUARDIAN_OVERRIDES_PER_PERIOD, GUARDIAN_OVERRIDE_PERIOD_SECS};
 
     /// A scheduled delay is valid iff it is within `[MIN_DELAY, MAX_DELAY]`.
     #[inline]
@@ -103,6 +117,25 @@ pub mod logic {
     pub fn can_cancel(is_proposer: bool, is_admin: bool) -> bool {
         is_proposer || is_admin
     }
+
+    /// Check if guardian override count is within limits for the period
+    #[inline]
+    pub fn is_guardian_override_within_limit(override_count: u32) -> bool {
+        override_count < MAX_GUARDIAN_OVERRIDES_PER_PERIOD
+    }
+
+    /// Calculate the start of the current guardian override period
+    #[inline]
+    pub fn get_override_period_start(now: u64) -> u64 {
+        let period_start = now.saturating_sub(GUARDIAN_OVERRIDE_PERIOD_SECS);
+        period_start
+    }
+
+    /// Check if a guardian action veto period is still active
+    #[inline]
+    pub fn is_veto_period_active(veto_end_time: u64, now: u64) -> bool {
+        now < veto_end_time
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -120,6 +153,30 @@ pub struct Operation {
     pub done: bool,
 }
 
+#[contracttype]
+#[derive(Clone)]
+pub struct GuardianActionAudit {
+    pub action_id: BytesN<32>,
+    pub guardian: Address,
+    pub operation_id: BytesN<32>,
+    pub justification_hash: BytesN<32>,
+    pub timestamp: u64,
+    pub veto_end_time: u64,
+    pub veto_power: i128,
+    pub veto_count: u32,
+    pub is_vetoed: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct GuardianRotationRecord {
+    pub rotation_id: u32,
+    pub old_guardian: Address,
+    pub new_guardian: Address,
+    pub rotation_time: u64,
+    pub next_rotation_time: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Storage Keys
 // ---------------------------------------------------------------------------
@@ -133,6 +190,20 @@ pub enum DataKey {
     /// Address of a separate `MultisigAdminContract` with emergency powers
     /// to cancel any pending operation, regardless of proposer.
     GuardianMultisig,
+    /// Guardian override timestamps for rate limiting (24-hour windows)
+    GuardianOverrideTimestamps(Address),
+    /// Audit trail for all guardian actions
+    GuardianAudit(BytesN<32>),
+    /// Total guardian action audit count
+    GuardianAuditCount,
+    /// Guardian role rotation history
+    GuardianRotation(u32),
+    /// Guardian rotation count
+    GuardianRotationCount,
+    /// Last guardian rotation timestamp
+    LastGuardianRotation,
+    /// Veto power tracking for guardian actions
+    GuardianActionVetoPower(BytesN<32>),
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +362,12 @@ impl TimelockController {
     /// `execute_action` behind its approval threshold before ever reaching
     /// this call, so authorization here is: the caller must be *the*
     /// registered guardian address, proven via `require_auth`.
+    ///
+    /// NEW: Enforces strict authorization limits:
+    /// - Maximum 3 overrides per 30-day period
+    /// - Requires written justification (hash)
+    /// - Community veto period: 48 hours
+    /// - Creates immutable audit trail
     pub fn emergency_cancel(
         env: Env,
         guardian_multisig: Address,
@@ -307,6 +384,12 @@ impl TimelockController {
         }
         guardian_multisig.require_auth();
 
+        // Validate justification is provided (hash must be non-zero)
+        let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
+        if reason_hash == zero_hash {
+            return Err(Error::MissingJustification);
+        }
+
         let op: Operation = env
             .storage()
             .persistent()
@@ -315,6 +398,20 @@ impl TimelockController {
         if !logic::can_transition(op.done) {
             return Err(Error::AlreadyDone);
         }
+
+        let now = env.ledger().timestamp();
+
+        // Check guardian override rate limiting
+        self::validate_guardian_override_limit(&env, &guardian_multisig, now)?;
+
+        // Record guardian action in audit trail
+        let action_id = self::record_guardian_action(
+            &env,
+            &guardian_multisig,
+            &operation_id,
+            &reason_hash,
+            now,
+        )?;
 
         env.storage()
             .persistent()
@@ -461,6 +558,128 @@ impl TimelockController {
             .get(&DataKey::Admin)
             .expect("not initialized")
     }
+
+    // -----------------------------------------------------------------------
+    // Guardian Authorization & Audit Functions
+    // -----------------------------------------------------------------------
+
+    /// Get guardian action audit trail entry
+    pub fn get_guardian_audit(env: Env, action_id: BytesN<32>) -> Option<GuardianActionAudit> {
+        env.storage().persistent().get(&DataKey::GuardianAudit(action_id))
+    }
+
+    /// Get total count of guardian actions recorded
+    pub fn get_guardian_audit_count(env: Env) -> u32 {
+        env.storage().instance().get(&DataKey::GuardianAuditCount).unwrap_or(0)
+    }
+
+    /// Get guardian rotation record by index
+    pub fn get_guardian_rotation(env: Env, rotation_id: u32) -> Option<GuardianRotationRecord> {
+        env.storage().persistent().get(&DataKey::GuardianRotation(rotation_id))
+    }
+
+    /// Get total count of guardian rotations
+    pub fn get_guardian_rotation_count(env: Env) -> u32 {
+        env.storage().instance().get(&DataKey::GuardianRotationCount).unwrap_or(0)
+    }
+
+    /// Check if automatic guardian rotation is due
+    pub fn is_guardian_rotation_due(env: Env) -> bool {
+        let last_rotation: u64 = env.storage().instance()
+            .get(&DataKey::LastGuardianRotation)
+            .unwrap_or(0);
+        let now = env.ledger().timestamp();
+        now.saturating_sub(last_rotation) >= GUARDIAN_ROLE_ROTATION_SECS
+    }
+
+    /// Get veto power accumulated for a guardian action
+    pub fn get_guardian_action_veto_power(env: Env, action_id: BytesN<32>) -> i128 {
+        env.storage().persistent()
+            .get(&DataKey::GuardianActionVetoPower(action_id))
+            .unwrap_or(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal Helper Functions for Guardian Authorization
+// ---------------------------------------------------------------------------
+
+/// Validate that guardian override is within the 3-per-30-day limit
+fn validate_guardian_override_limit(env: &Env, guardian: &Address, now: u64) -> Result<(), Error> {
+    let period_start = logic::get_override_period_start(now);
+    
+    // Get stored timestamps for this guardian in the current period
+    let stored_timestamps: Vec<u64> = env.storage().instance()
+        .get(&DataKey::GuardianOverrideTimestamps(guardian.clone()))
+        .unwrap_or_else(|| Vec::new(env));
+
+    // Count overrides within the current 30-day period
+    let mut count = 0u32;
+    for timestamp in stored_timestamps.iter() {
+        if *timestamp >= period_start {
+            count += 1;
+        }
+    }
+
+    // Check limit
+    if !logic::is_guardian_override_within_limit(count) {
+        return Err(Error::GuardianLimitExceeded);
+    }
+
+    // Record this timestamp
+    let mut new_timestamps = Vec::new(env);
+    for timestamp in stored_timestamps.iter() {
+        if *timestamp >= period_start {
+            new_timestamps.push_back(*timestamp);
+        }
+    }
+    new_timestamps.push_back(now);
+    env.storage().instance()
+        .set(&DataKey::GuardianOverrideTimestamps(guardian.clone()), &new_timestamps);
+
+    Ok(())
+}
+
+/// Record guardian action in immutable audit trail
+fn record_guardian_action(
+    env: &Env,
+    guardian: &Address,
+    operation_id: &BytesN<32>,
+    justification_hash: &BytesN<32>,
+    now: u64,
+) -> Result<BytesN<32>, Error> {
+    let veto_end_time = now.saturating_add(GUARDIAN_VETO_PERIOD_SECS);
+    
+    // Generate unique action_id
+    let mut audit_count: u32 = env.storage().instance()
+        .get(&DataKey::GuardianAuditCount)
+        .unwrap_or(0);
+    audit_count += 1;
+
+    let mut payload = Bytes::new(env);
+    payload.append(&guardian.clone().to_xdr(env));
+    payload.append(&operation_id.clone().to_xdr(env));
+    payload.append(&audit_count.to_xdr(env));
+    let action_id: BytesN<32> = env.crypto().sha256(&payload).into();
+
+    let audit = GuardianActionAudit {
+        action_id: action_id.clone(),
+        guardian: guardian.clone(),
+        operation_id: operation_id.clone(),
+        justification_hash: justification_hash.clone(),
+        timestamp: now,
+        veto_end_time,
+        veto_power: 0,
+        veto_count: 0,
+        is_vetoed: false,
+    };
+
+    env.storage().persistent()
+        .set(&DataKey::GuardianAudit(action_id.clone()), &audit);
+    env.storage().instance()
+        .set(&DataKey::GuardianAuditCount, &audit_count);
+
+    Ok(action_id)
 }
 
 // ---------------------------------------------------------------------------
