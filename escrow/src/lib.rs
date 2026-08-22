@@ -9,6 +9,9 @@ use shared::{
     compute_checksum, push_snapshot_index, CrossContractAuth, EscrowRecord, EscrowStatus,
     RollbackProposal, SnapshotMeta, StateVerificationReport, EMERGENCY_SIGNERS,
     EMERGENCY_THRESHOLD, MAX_SNAPSHOTS, StateMachine, EscrowTransitionLog, GasEstimate, Validator,
+    ReleaseFailure, FailureClassification, RecoveryState, calculate_backoff_delay,
+    classify_failure, calculate_next_retry, compute_failure_hash, MAX_AUTO_RELEASE_ATTEMPTS,
+    MANUAL_RECOVERY_THRESHOLD,
 };
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, Bytes, Env, Symbol, Vec,
@@ -285,8 +288,8 @@ pub enum DataKey {
     InterfaceRegistry,
     /// Address of the MultisigAdmin contract used for emergency release approvals.
     MultisigAdmin,
-    /// Count of failed auto-release attempts for a given escrow_id.
-    AutoReleaseAttempts(u64),
+    /// PER-ESCROW failure tracking with exponential backoff (replaced global tracking)
+    FailureRecord(u64),
     /// Watchlist of escrow IDs reported as stuck (after grace period elapsed).
     StuckEscrows,
     // -----------------------------------------------------------------------
@@ -341,11 +344,6 @@ const MAX_FINANCIAL_AMOUNT: i128 = 1_000_000_000_000_000; // 100M tokens @ 7 dec
 
 /// Default auto-release delay: 72 hours in seconds.
 const DEFAULT_AUTO_RELEASE_DELAY: u64 = 72 * 60 * 60;
-
-/// Maximum number of failed auto-release attempts before the emergency
-/// release path is enabled. After this many failures, any admin with
-/// multi-sig approval can bypass cross-contract checks and force-release.
-const MAX_FAILED_ATTEMPTS: u32 = 3;
 
 /// Grace period (in seconds) after `session_end_time + auto_release_delay`
 /// before an escrow can be reported as "stuck" by any caller. This gives
@@ -1319,32 +1317,43 @@ impl EscrowContract {
             panic!("Auto-release window has not elapsed");
         }
 
-        // ---- Failure-recovery gate ----
-        let attempts = Self::_get_auto_release_attempts(&env, escrow_id);
-        if attempts >= MAX_FAILED_ATTEMPTS {
+        // ---- Failure-recovery gate with per-escrow backoff ----
+        let mut failure = Self::_get_or_init_failure_record(&env, escrow_id, now);
+        
+        // Check if max attempts exceeded
+        if failure.attempt_number >= MAX_AUTO_RELEASE_ATTEMPTS {
             panic!(
-                "Auto-release disabled: {} failed attempts; use emergency_release",
-                attempts
+                "Auto-release permanently disabled: {} attempts exhausted; manual recovery required",
+                failure.attempt_number
+            );
+        }
+
+        // Check if we're still in backoff period
+        if now < failure.next_retry_time {
+            panic!(
+                "Auto-release in exponential backoff; next retry at {}",
+                failure.next_retry_time
             );
         }
 
         // ---- Cross-contract prechecks wrapped in try_invoke ----
-        //
-        // These calls (reputation update, insurance check) are external
-        // dependencies that can panic for non-deterministic reasons.  We
-        // use `try_invoke_contract` so that we can count the failure and
-        // keep a recovery path via `emergency_release` after 3 strikes.
         let prechecks_ok = Self::_try_run_auto_release_prechecks(&env, &escrow);
         if !prechecks_ok {
-            let new_attempts = Self::_increment_auto_release_attempts(&env, escrow_id);
-            if new_attempts >= MAX_FAILED_ATTEMPTS {
-                panic!(
-                    "Auto-release prechecks failed ({} attempts); emergency_release required",
-                    new_attempts
-                );
+            failure.attempt_number += 1;
+            failure.last_failure_time = now;
+            failure.next_retry_time = calculate_next_retry(&env, &failure);
+            failure.recovery_state = if failure.attempt_number >= MAX_AUTO_RELEASE_ATTEMPTS {
+                RecoveryState::AwaitingManualRecovery
             } else {
-                panic!("Auto-release prechecks failed (attempt {}/{})", new_attempts, MAX_FAILED_ATTEMPTS);
-            }
+                RecoveryState::Retrying
+            };
+            
+            Self::_set_failure_record(&env, escrow_id, &failure);
+            
+            panic!(
+                "Auto-release prechecks failed (attempt {}/{}); next retry: {}",
+                failure.attempt_number, MAX_AUTO_RELEASE_ATTEMPTS, failure.next_retry_time
+            );
         }
 
         // Emit a dedicated `auto_released` event before the internal release
@@ -1355,16 +1364,52 @@ impl EscrowContract {
 
         Self::_do_release(&env, &mut escrow, &key, &env.current_contract_address());
 
-        // Success: reset the failure counter so transient errors don't
-        // permanently disable the escrow.
+        // Success: clear the failure record
         env.storage()
             .persistent()
-            .remove(&DataKey::AutoReleaseAttempts(escrow_id));
+            .remove(&DataKey::FailureRecord(escrow_id));
     }
 
     // -----------------------------------------------------------------------
-    // Auto-release failure recovery helpers
+    // Per-Escrow Failure Tracking with Exponential Backoff
     // -----------------------------------------------------------------------
+
+    /// Get or initialize a failure record for an escrow
+    fn _get_or_init_failure_record(env: &Env, escrow_id: u64, now: u64) -> ReleaseFailure {
+        match env.storage().persistent().get::<_, ReleaseFailure>(&DataKey::FailureRecord(escrow_id)) {
+            Some(record) => record,
+            None => ReleaseFailure {
+                escrow_id,
+                attempt_number: 0,
+                max_attempts: MAX_AUTO_RELEASE_ATTEMPTS,
+                classification: FailureClassification::Unknown,
+                last_failure_time: 0,
+                next_retry_time: 0,
+                error_hash: BytesN::from_array(env, &[0u8; 32]),
+                recovery_state: RecoveryState::Retrying,
+                manual_recovery_at: 0,
+                manual_recovery_reason: BytesN::from_array(env, &[0u8; 32]),
+            },
+        }
+    }
+
+    /// Store a failure record
+    fn _set_failure_record(env: &Env, escrow_id: u64, failure: &ReleaseFailure) {
+        env.storage().persistent().set(&DataKey::FailureRecord(escrow_id), failure);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::FailureRecord(escrow_id), ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+    }
+
+    /// Get failure record for an escrow (if any)
+    fn _get_failure_record(env: &Env, escrow_id: u64) -> Option<ReleaseFailure> {
+        env.storage().persistent().get(&DataKey::FailureRecord(escrow_id))
+    }
+
+    /// Clear failure record (on successful release)
+    fn _clear_failure_record(env: &Env, escrow_id: u64) {
+        env.storage().persistent().remove(&DataKey::FailureRecord(escrow_id));
+    }
 
     /// Run the cross-contract prechecks for auto-release inside a
     /// `try_invoke_contract` guard.  Returns `true` if all prechecks
@@ -1392,8 +1437,6 @@ impl EscrowContract {
                 )
                     .into_val(env),
             );
-            // try_invoke_contract returns Result<Result<R, InvokeError>, _>
-            // "double Result"; flatten both to check all-Ok.
             let ok = match result {
                 Ok(inner_result) => inner_result.is_ok(),
                 Err(_) => false,
@@ -1455,31 +1498,6 @@ impl EscrowContract {
         }
 
         true
-    }
-
-    /// Read the current auto-release failure count for `escrow_id`.
-    fn _get_auto_release_attempts(env: &Env, escrow_id: u64) -> u32 {
-        env.storage()
-            .persistent()
-            .get::<_, u32>(&DataKey::AutoReleaseAttempts(escrow_id))
-            .unwrap_or(0)
-    }
-
-    /// Atomically increment the auto-release failure count for `escrow_id`
-    /// and return the new count.
-    fn _increment_auto_release_attempts(env: &Env, escrow_id: u64) -> u32 {
-        let key = DataKey::AutoReleaseAttempts(escrow_id);
-        let current = env
-            .storage()
-            .persistent()
-            .get::<_, u32>(&key)
-            .unwrap_or(0);
-        let new_count = current.saturating_add(1);
-        env.storage().persistent().set(&key, &new_count);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-        new_count
     }
 
     /// Open a dispute (called by mentor or learner).
@@ -1842,12 +1860,19 @@ impl EscrowContract {
     ) {
         caller.require_auth();
 
-        // ---- 1. Attempt-count gate: must have reached MAX_FAILED_ATTEMPTS ----
-        let attempts = Self::_get_auto_release_attempts(&env, escrow_id);
-        if attempts < MAX_FAILED_ATTEMPTS {
+        // ---- 1. Check failure record requires MAX_AUTO_RELEASE_ATTEMPTS ----
+        let failure = match Self::_get_failure_record(&env, escrow_id) {
+            Some(f) => f,
+            None => panic!(
+                "No failure record found; emergency release requires {} failed auto-release attempts",
+                MAX_AUTO_RELEASE_ATTEMPTS
+            ),
+        };
+
+        if failure.attempt_number < MAX_AUTO_RELEASE_ATTEMPTS {
             panic!(
                 "Emergency release requires {} failed attempts; have {}",
-                MAX_FAILED_ATTEMPTS, attempts
+                MAX_AUTO_RELEASE_ATTEMPTS, failure.attempt_number
             );
         }
 
@@ -1941,7 +1966,7 @@ impl EscrowContract {
         // ---- 4. Clean up recovery state & emit audit event ----
         env.storage()
             .persistent()
-            .remove(&DataKey::AutoReleaseAttempts(escrow_id));
+            .remove(&DataKey::FailureRecord(escrow_id));
         Self::_remove_from_stuck_watchlist(&env, escrow_id);
 
         let event_payload = EmergencyReleaseExecutedEventData {
@@ -1962,6 +1987,89 @@ impl EscrowContract {
                 escrow_id,
             ),
             event_payload,
+        );
+    }
+
+    /// Manual recovery for escrows stuck after 5+ consecutive auto-release failures.
+    /// Admin can intervene and release funds directly, bypassing auto-release prechecks.
+    ///
+    /// Requirements:
+    /// 1. Escrow must have ≥ 5 failed auto-release attempts
+    /// 2. Escrow must have < 10 failed attempts (max threshold not yet hit)
+    /// 3. Admin must provide justification hash
+    /// 4. Caller must be the admin
+    pub fn manual_recovery_release(
+        env: Env,
+        escrow_id: u64,
+        recovery_reason_hash: BytesN<32>,
+    ) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+
+        // ---- 1. Check failure record exists and is in recovery window ----
+        let mut failure = match Self::_get_failure_record(&env, escrow_id) {
+            Some(f) => f,
+            None => panic!("No failure record found; escrow may not have auto-release issues"),
+        };
+
+        if failure.attempt_number < MANUAL_RECOVERY_THRESHOLD {
+            panic!(
+                "Manual recovery not yet available; {} more failures required",
+                MANUAL_RECOVERY_THRESHOLD.saturating_sub(failure.attempt_number)
+            );
+        }
+
+        if failure.attempt_number >= MAX_AUTO_RELEASE_ATTEMPTS {
+            panic!(
+                "Escrow permanently blocked; max attempts ({}) reached",
+                MAX_AUTO_RELEASE_ATTEMPTS
+            );
+        }
+
+        // ---- 2. Load and release escrow (no cross-contract prechecks) ----
+        let key = (symbol_short!("ESCROW"), escrow_id);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("Escrow not found");
+
+        if escrow.status != EscrowStatus::Active {
+            panic!("Escrow not active; manual recovery only for active escrows");
+        }
+
+        // Use simplified release to avoid repeating the same prechecks that failed
+        Self::_do_release_simple(&env, &mut escrow, &key, &admin);
+
+        // ---- 3. Update failure record to mark recovery ----
+        let now = env.ledger().timestamp();
+        failure.recovery_state = RecoveryState::Recovered;
+        failure.manual_recovery_at = now;
+        failure.manual_recovery_reason = recovery_reason_hash.clone();
+        Self::_set_failure_record(&env, escrow_id, &failure);
+
+        // ---- 4. Emit audit event ----
+        env.events().publish(
+            (
+                Symbol::new(&env, "Escrow"),
+                Symbol::new(&env, "ManualRecoveryExecuted"),
+                escrow_id,
+            ),
+            (
+                escrow_id,
+                admin.clone(),
+                recovery_reason_hash,
+                failure.attempt_number,
+                now,
+            ),
         );
     }
 
@@ -2066,10 +2174,34 @@ impl EscrowContract {
     // Queries
     // -----------------------------------------------------------------------
 
-    /// Return the number of failed auto-release attempts recorded for
-    /// `escrow_id`.  Returns `0` if no attempts have been made.
-    pub fn get_auto_release_attempts(env: Env, escrow_id: u64) -> u32 {
-        Self::_get_auto_release_attempts(&env, escrow_id)
+    /// Get the failure record for an escrow (including backoff timing and recovery state)
+    pub fn get_failure_record(env: Env, escrow_id: u64) -> Option<ReleaseFailure> {
+        Self::_get_failure_record(&env, escrow_id)
+    }
+
+    /// Check if an escrow is currently in exponential backoff
+    pub fn is_escrow_in_backoff(env: Env, escrow_id: u64) -> bool {
+        if let Some(failure) = Self::_get_failure_record(&env, escrow_id) {
+            let now = env.ledger().timestamp();
+            now < failure.next_retry_time && failure.attempt_number > 0
+        } else {
+            false
+        }
+    }
+
+    /// Check if manual recovery is available for an escrow
+    pub fn is_manual_recovery_available(env: Env, escrow_id: u64) -> bool {
+        if let Some(failure) = Self::_get_failure_record(&env, escrow_id) {
+            failure.attempt_number >= MANUAL_RECOVERY_THRESHOLD
+                && failure.attempt_number < MAX_AUTO_RELEASE_ATTEMPTS
+        } else {
+            false
+        }
+    }
+
+    /// Get next scheduled retry time for an escrow in backoff
+    pub fn get_next_retry_time(env: Env, escrow_id: u64) -> Option<u64> {
+        Self::_get_failure_record(&env, escrow_id).map(|f| f.next_retry_time)
     }
 
     /// Return the current stuck-escrows watchlist as a `Vec<u64>` of
