@@ -25,6 +25,7 @@ pub mod interface_id;
 pub mod validation;
 pub mod reputation;
 pub mod failure_tracking;
+pub mod atomic_state;
 
 pub use disaster_recovery::{
     compute_checksum, push_snapshot_index, RollbackApproval, RollbackProposal, SnapshotMeta,
@@ -80,6 +81,12 @@ pub use reputation::{
 pub use failure_tracking::{
     ReleaseFailure, FailureClassification, ExponentialBackoff, RecoveryState,
     calculate_backoff_delay, classify_failure, calculate_next_retry, compute_failure_hash,
+};
+pub use atomic_state::{
+    StateTransitionContext, PreConditionCheck, PostConditionCheck, CrossContractStateCheck,
+    StateTransitionProof, InvalidStateRecord, AtomicStateValidator, compute_transition_proof_hash,
+    all_checkpoints_passed, is_transition_expired, STATE_TRANSITION_TIMEOUT_SECS,
+    STATE_TRANSITION_LOCK_TTL, MAX_CHECKPOINT_COUNT,
 };
 
 
