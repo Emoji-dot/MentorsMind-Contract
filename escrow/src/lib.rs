@@ -6,13 +6,16 @@ use shared::events::{
     evt_escrow_refunded, evt_escrow_released, evt_escrow_resolved, evt_escrow_stuck_reported,
 };
 use shared::{
-    compute_checksum, push_snapshot_index, CrossContractAuth, EscrowRecord, EscrowStatus,
+    compute_checksum, push_snapshot_index, CrossContractAuth, EscrowRecord,
     RollbackProposal, SnapshotMeta, StateVerificationReport, EMERGENCY_SIGNERS,
     EMERGENCY_THRESHOLD, MAX_SNAPSHOTS, StateMachine, EscrowTransitionLog, GasEstimate, Validator,
     ReleaseFailure, FailureClassification, RecoveryState, calculate_backoff_delay,
     classify_failure, calculate_next_retry, compute_failure_hash, MAX_AUTO_RELEASE_ATTEMPTS,
-    MANUAL_RECOVERY_THRESHOLD,
+    MANUAL_RECOVERY_THRESHOLD, EmergencyAction, EmergencyAdminRole, EmergencyAuditRecord,
+    EmergencyCircuitBreaker, EmergencyMultisig, MultisigValidation, SafeMath,
+    EMERGENCY_ADMIN_TTL_SECS, EMERGENCY_MSIG_THRESHOLD,
 };
+pub use shared::EscrowStatus;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, Bytes, Env, Symbol, Vec,
     IntoVal, BytesN,
@@ -169,13 +172,29 @@ pub struct EscrowStuckReportedEventData {
     pub stuck_since: u64,
 }
 
-/// Event data emitted when an emergency release is executed via multi-sig admin.
+/// Event data emitted when an emergency release is executed via 4-of-7 multisig.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EmergencyReleaseExecutedEventData {
     pub escrow_id: u64,
     pub admin: Address,
     pub reason_hash: BytesN<32>,
+    pub action_id: u32,
+    pub amount: i128,
+    pub participant_signers: Vec<Address>,
+}
+
+/// Event data for emergency action proposals / approvals / failures.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmergencyActionAuditEventData {
+    pub action_id: u32,
+    pub escrow_id: u64,
+    pub actor: Address,
+    pub reason_hash: BytesN<32>,
+    pub params_hash: BytesN<32>,
+    pub approval_count: u32,
+    pub success: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -303,6 +322,24 @@ pub enum DataKey {
     SnapshotIndex,
     /// Vec<Address> of up to 7 emergency multi-sig signers.
     EmergencySigners,
+    /// EmergencyMultisig config (signers + threshold).
+    EmergencyMultisigConfig,
+    /// EmergencyAction proposal `n`.
+    EmergencyProposal(u32),
+    /// Boolean approval flag for (emergency_action_id, signer).
+    EmergencyApproval(u32, Address),
+    /// Auto-incremented emergency action proposal counter.
+    EmergencyProposalCount,
+    /// Immutable audit record for emergency action `n`.
+    EmergencyAudit(u32),
+    /// Params-hash → permanently failed (blocks retry with same parameters).
+    EmergencyFailedParams(BytesN<32>),
+    /// Time-bound emergency admin role.
+    EmergencyAdmin,
+    /// Circuit breaker rolling window state.
+    EmergencyCircuit,
+    /// Total active escrow pool amount (maintained for circuit-breaker checks).
+    ActivePoolTotal,
     /// RollbackProposal for proposal `n`.
     RollbackProposal(u32),
     /// Boolean approval flag for (proposal_id, signer) pair.
@@ -1349,11 +1386,22 @@ impl EscrowContract {
             };
             
             Self::_set_failure_record(&env, escrow_id, &failure);
-            
-            panic!(
-                "Auto-release prechecks failed (attempt {}/{}); next retry: {}",
-                failure.attempt_number, MAX_AUTO_RELEASE_ATTEMPTS, failure.next_retry_time
+
+            // Do NOT panic here — panicking would roll back the failure record.
+            // Emit an audit event and return so the attempt counter persists.
+            env.events().publish(
+                (
+                    Symbol::new(&env, "Escrow"),
+                    Symbol::new(&env, "AutoReleaseFailed"),
+                    escrow_id,
+                ),
+                (
+                    failure.attempt_number,
+                    MAX_AUTO_RELEASE_ATTEMPTS,
+                    failure.next_retry_time,
+                ),
             );
+            return;
         }
 
         // Emit a dedicated `auto_released` event before the internal release
@@ -1799,8 +1847,8 @@ impl EscrowContract {
     // Emergency Release (Multi-sig Admin Bypass)
     // -----------------------------------------------------------------------
 
-    /// Set the MultisigAdmin contract address used for emergency release
-    /// approvals.  Admin only.
+    /// Set the MultisigAdmin contract address used for optional cross-contract
+    /// emergency signature validation. Admin only.
     pub fn set_multisig_admin(env: Env, admin: Address, multisig_admin: Address) {
         let stored_admin: Address = env
             .storage()
@@ -1825,42 +1873,69 @@ impl EscrowContract {
         );
     }
 
-    /// Execute an emergency release, bypassing all cross-contract checks
-    /// (reputation, insurance, graduated-fee tier lookup).
+    /// Grant or renew the time-bound emergency-admin role (72h TTL).
     ///
-    /// This is the **last-resort** recovery path for escrows whose
-    /// `try_auto_release` has been permanently disabled after
-    /// `MAX_FAILED_ATTEMPTS` (3) consecutive failures.
+    /// Only the contract admin may grant/renew. The role is limited to the
+    /// `emergency_release` scope and automatically expires unless renewed.
+    pub fn grant_emergency_admin(env: Env, admin: Address, emergency_admin: Address) {
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("Caller not authorized");
+        }
+        let now = env.ledger().timestamp();
+        let expires_at = MultisigValidation::compute_admin_expiry(now)
+            .expect("emergency admin expiry overflow");
+        let role = EmergencyAdminRole {
+            admin: emergency_admin.clone(),
+            granted_at: now,
+            expires_at,
+            scope: Symbol::new(&env, "emergency_release"),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::EmergencyAdmin, &role);
+        env.storage().persistent().extend_ttl(
+            &DataKey::EmergencyAdmin,
+            ESCROW_TTL_THRESHOLD,
+            ESCROW_TTL_BUMP,
+        );
+        env.events().publish(
+            (
+                Symbol::new(&env, "Escrow"),
+                Symbol::new(&env, "EmergencyAdminGranted"),
+            ),
+            (emergency_admin, expires_at, EMERGENCY_ADMIN_TTL_SECS),
+        );
+    }
+
+    /// Propose an emergency release action (starts the 24h timelock).
     ///
-    /// # Requirements
-    /// 1. The escrow must have **at least** `MAX_FAILED_ATTEMPTS` failed
-    ///    auto-release attempts recorded in `DataKey::AutoReleaseAttempts`.
-    /// 2. A valid, threshold-passing proposal from the `MultisigAdmin`
-    ///    contract must be supplied.  The minimum effective threshold is
-    ///    **2-of-3 signers**; the multisig contract's own threshold is
-    ///    used (and must be ≥ 2).
-    /// 3. The proposal's `target` must equal this contract's address,
-    ///    its `function` must be `"emergency_release"`, and its first
-    ///    argument must equal `escrow_id`.
-    ///
-    /// # Bypassed checks
-    /// * Reputation `on_session_released` cross-contract call
-    /// * Insurance `verify_coverage_on_release` cross-contract call
-    /// * Graduated-fee staking-tier lookup (falls back to flat `FeeBps`)
-    ///
-    /// # Fee handling
-    /// Uses the flat `FeeBps` rate (or `DEFAULT_FEE_BPS` if unset) so the
-    /// release cannot be blocked by a fee-schedule arithmetic overflow.
-    pub fn emergency_release(
+    /// `proposer` must be a registered emergency signer. The proposer's
+    /// approval is recorded as the first of the required 4-of-7 signatures.
+    /// Failed parameter hashes are permanently blocked from re-proposal.
+    pub fn propose_emergency_action(
         env: Env,
-        caller: Address,
+        proposer: Address,
         escrow_id: u64,
         reason_hash: BytesN<32>,
-        multisig_action_id: u32,
-    ) {
-        caller.require_auth();
+    ) -> u32 {
+        proposer.require_auth();
 
-        // ---- 1. Check failure record requires MAX_AUTO_RELEASE_ATTEMPTS ----
+        let signers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmergencySigners)
+            .expect("Emergency signers not configured");
+        if !MultisigValidation::is_emergency_signer(&signers, &proposer) {
+            panic!("Proposer is not an emergency signer");
+        }
+
+        // Failure gate: escrow must have hit MAX_AUTO_RELEASE_ATTEMPTS.
         let failure = match Self::_get_failure_record(&env, escrow_id) {
             Some(f) => f,
             None => panic!(
@@ -1868,7 +1943,6 @@ impl EscrowContract {
                 MAX_AUTO_RELEASE_ATTEMPTS
             ),
         };
-
         if failure.attempt_number < MAX_AUTO_RELEASE_ATTEMPTS {
             panic!(
                 "Emergency release requires {} failed attempts; have {}",
@@ -1876,105 +1950,328 @@ impl EscrowContract {
             );
         }
 
-        // ---- 2. Multi-sig approval verification ----
-        let multisig_addr: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::MultisigAdmin)
-            .expect("MultisigAdmin not configured");
-
-        let proposal: ProposalRecordMirror = MultisigClient::new(&env, &multisig_addr)
-            .get_proposal(&multisig_action_id);
-
-        // Validate proposal state
-        if proposal.cancelled {
-            panic!("Multisig proposal has been cancelled");
-        }
-        if proposal.executed {
-            panic!("Multisig proposal has already been executed");
-        }
-        let now = env.ledger().timestamp();
-        if now > proposal.expiry {
-            panic!("Multisig proposal has expired");
-        }
-
-        // Validate target + function match this invocation
-        if proposal.target != env.current_contract_address() {
-            panic!("Multisig proposal target does not match escrow contract");
-        }
-        if proposal.function != Symbol::new(&env, "emergency_release") {
-            panic!("Multisig proposal function is not emergency_release");
-        }
-
-        // Validate first arg is the escrow_id being released.
-        // Val does not implement PartialEq directly, so we compare the
-        // decoded u64 payload (both args are known to be u64 encoded).
-        use soroban_sdk::TryFromVal;
-        let first_arg_matches = proposal
-            .args
-            .get(0)
-            .and_then(|raw_val| {
-                let decoded = u64::try_from_val(&env, &raw_val).ok()?;
-                Some(decoded == escrow_id)
-            })
-            .unwrap_or(false);
-        if !first_arg_matches {
-            panic!("Multisig proposal escrow_id mismatch");
-        }
-
-        // Enforce minimum 2-of-3 threshold: the effective approval count
-        // must be ≥ 2 regardless of what the multisig threshold says.
-        // The multisig contract's own threshold is also checked via
-        // `get_threshold` and must be satisfied.
-        let multisig_threshold: u32 =
-            MultisigClient::new(&env, &multisig_addr).get_threshold();
-        let effective_threshold = multisig_threshold.max(2u32);
-        if proposal.approval_count < effective_threshold {
-            panic!(
-                "Insufficient multi-sig approvals: have {}, need {}",
-                proposal.approval_count, effective_threshold
-            );
-        }
-        if proposal.approval_count < multisig_threshold {
-            panic!(
-                "Multisig threshold not met: have {}, need {}",
-                proposal.approval_count, multisig_threshold
-            );
-        }
-
-        // ---- 3. Load escrow & release (no cross-contract prechecks) ----
         let key = (symbol_short!("ESCROW"), escrow_id);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-
-        let mut escrow: Escrow = env
+        let escrow: Escrow = env
             .storage()
             .persistent()
             .get(&key)
             .expect("Escrow not found");
-
         if escrow.status != EscrowStatus::Active {
             panic!("Escrow not active");
         }
 
-        // Use flat-fee fallback to avoid any fee-schedule / tier-lookup
-        // failures that might have contributed to the escrow getting
-        // stuck in the first place.
-        Self::_do_release_simple(&env, &mut escrow, &key, &caller);
+        let action_type = Symbol::new(&env, "emergency_release");
+        let params_hash = MultisigValidation::compute_params_hash(
+            &env,
+            &action_type,
+            escrow_id,
+            escrow.amount,
+            &reason_hash,
+        );
 
-        // ---- 4. Clean up recovery state & emit audit event ----
+        // Permanently block retries of previously failed parameter sets.
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::EmergencyFailedParams(params_hash.clone()))
+            .unwrap_or(false)
+        {
+            panic!("Emergency attempt with these parameters permanently failed; cannot retry");
+        }
+
+        let now = env.ledger().timestamp();
+        let execute_after = MultisigValidation::compute_execute_after(now)
+            .expect("execute_after overflow");
+
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmergencyProposalCount)
+            .unwrap_or(0);
+        let new_id = count.safe_add(&env, 1);
         env.storage()
             .persistent()
-            .remove(&DataKey::FailureRecord(escrow_id));
-        Self::_remove_from_stuck_watchlist(&env, escrow_id);
+            .set(&DataKey::EmergencyProposalCount, &new_id);
 
-        let event_payload = EmergencyReleaseExecutedEventData {
+        let mut approvals = Vec::new(&env);
+        MultisigValidation::aggregate_signatures(&mut approvals, proposer.clone());
+
+        let action = EmergencyAction {
+            id: new_id,
+            action_type: action_type.clone(),
             escrow_id,
-            admin: caller.clone(),
+            amount: escrow.amount,
+            proposer: proposer.clone(),
             reason_hash: reason_hash.clone(),
+            params_hash: params_hash.clone(),
+            proposed_at: now,
+            execute_after,
+            approval_count: 1,
+            signers: approvals,
+            executed: false,
+            failed: false,
         };
 
+        env.storage()
+            .persistent()
+            .set(&DataKey::EmergencyProposal(new_id), &action);
+        env.storage().persistent().extend_ttl(
+            &DataKey::EmergencyProposal(new_id),
+            ESCROW_TTL_THRESHOLD,
+            ESCROW_TTL_BUMP,
+        );
+        env.storage().persistent().set(
+            &DataKey::EmergencyApproval(new_id, proposer.clone()),
+            &true,
+        );
+
+        let audit_evt = EmergencyActionAuditEventData {
+            action_id: new_id,
+            escrow_id,
+            actor: proposer,
+            reason_hash,
+            params_hash,
+            approval_count: 1,
+            success: true,
+        };
+        env.events().publish(
+            (
+                Symbol::new(&env, "Escrow"),
+                Symbol::new(&env, "EmergencyProposed"),
+                new_id,
+            ),
+            audit_evt,
+        );
+        new_id
+    }
+
+    /// Cast an approval on an open emergency action (signature aggregation).
+    ///
+    /// Requires the signer to be a registered emergency signer. Double-signing
+    /// panics. Approvals stop being accepted once the exact 4-of-7 threshold
+    /// has already been reached.
+    pub fn approve_emergency_action(env: Env, signer: Address, action_id: u32) {
+        signer.require_auth();
+
+        let registered: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmergencySigners)
+            .expect("Emergency signers not configured");
+        if !MultisigValidation::is_emergency_signer(&registered, &signer) {
+            panic!("Signer is not an emergency signer");
+        }
+
+        let mut action: EmergencyAction = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmergencyProposal(action_id))
+            .expect("Emergency proposal not found");
+        if action.executed {
+            panic!("Emergency action already executed");
+        }
+        if action.failed {
+            panic!("Emergency action permanently failed");
+        }
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::EmergencyApproval(action_id, signer.clone()))
+            .unwrap_or(false)
+        {
+            panic!("Already approved");
+        }
+        if action.approval_count >= EMERGENCY_MSIG_THRESHOLD {
+            panic!("Emergency action already has exact 4-of-7 approvals");
+        }
+
+        env.storage().persistent().set(
+            &DataKey::EmergencyApproval(action_id, signer.clone()),
+            &true,
+        );
+        action.approval_count =
+            MultisigValidation::aggregate_signatures(&mut action.signers, signer.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::EmergencyProposal(action_id), &action);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "Escrow"),
+                Symbol::new(&env, "EmergencyApproved"),
+                action_id,
+            ),
+            (signer, action.approval_count, action.signers.clone()),
+        );
+    }
+
+    /// Execute a fully-approved emergency action after the 24h timelock.
+    ///
+    /// Returns `true` on successful release. Returns `false` when the attempt
+    /// is permanently recorded as failed (insufficient signatures, timelock,
+    /// circuit breaker, expired admin, etc.) so the params hash cannot be
+    /// retried. Panics only for missing proposals / already-terminal state.
+    ///
+    /// Requirements for success:
+    /// 1. Exact 4-of-7 valid emergency signatures aggregated on the proposal
+    /// 2. `now >= execute_after` (minimum 24h delay)
+    /// 3. Caller is a non-expired emergency admin with `emergency_release` scope
+    /// 4. Release amount fits under the 10%/24h circuit breaker
+    /// 5. Params hash has not been permanently failed
+    pub fn execute_emergency_action(env: Env, caller: Address, action_id: u32) -> bool {
+        caller.require_auth();
+
+        let mut action: EmergencyAction = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmergencyProposal(action_id))
+            .expect("Emergency proposal not found");
+
+        if action.executed {
+            panic!("Emergency action already executed");
+        }
+        if action.failed {
+            panic!("Emergency action permanently failed");
+        }
+
+        // Block retry of permanently failed parameter sets.
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::EmergencyFailedParams(action.params_hash.clone()))
+            .unwrap_or(false)
+        {
+            panic!("Emergency attempt with these parameters permanently failed; cannot retry");
+        }
+
+        let registered: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmergencySigners)
+            .expect("Emergency signers not configured");
+
+        // Exact 4-of-7 validation.
+        if !MultisigValidation::validate_emergency_signatures(&registered, &action.signers) {
+            Self::_record_emergency_failure(&env, &mut action, &caller);
+            return false;
+        }
+
+        let now = env.ledger().timestamp();
+        if !MultisigValidation::timelock_elapsed(now, action.execute_after) {
+            Self::_record_emergency_failure(&env, &mut action, &caller);
+            return false;
+        }
+
+        // Time-bound emergency admin with limited scope.
+        let role: EmergencyAdminRole = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmergencyAdmin)
+        {
+            Some(r) => r,
+            None => {
+                Self::_record_emergency_failure(&env, &mut action, &caller);
+                return false;
+            }
+        };
+        if role.admin != caller
+            || !MultisigValidation::is_emergency_admin_active(&role, now)
+            || role.scope != Symbol::new(&env, "emergency_release")
+        {
+            Self::_record_emergency_failure(&env, &mut action, &caller);
+            return false;
+        }
+
+        // Circuit breaker: max 10% of active pool per 24h.
+        let pool_total = Self::_active_pool_total(&env);
+        let circuit: EmergencyCircuitBreaker = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmergencyCircuit)
+            .unwrap_or(EmergencyCircuitBreaker {
+                window_start: now,
+                released_in_window: 0,
+            });
+        let updated_circuit = match MultisigValidation::check_circuit_breaker(
+            &circuit,
+            now,
+            pool_total,
+            action.amount,
+        ) {
+            Ok(c) => c,
+            Err(()) => {
+                Self::_record_emergency_failure(&env, &mut action, &caller);
+                return false;
+            }
+        };
+
+        // Perform the release.
+        let key = (symbol_short!("ESCROW"), action.escrow_id);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        let mut escrow: Escrow = match env.storage().persistent().get(&key) {
+            Some(e) => e,
+            None => {
+                Self::_record_emergency_failure(&env, &mut action, &caller);
+                return false;
+            }
+        };
+        if escrow.status != EscrowStatus::Active || escrow.amount != action.amount {
+            Self::_record_emergency_failure(&env, &mut action, &caller);
+            return false;
+        }
+
+        Self::_do_release_simple(&env, &mut escrow, &key, &caller);
+
+        action.executed = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::EmergencyProposal(action_id), &action);
+        env.storage()
+            .persistent()
+            .set(&DataKey::EmergencyCircuit, &updated_circuit);
+        env.storage().persistent().extend_ttl(
+            &DataKey::EmergencyCircuit,
+            ESCROW_TTL_THRESHOLD,
+            ESCROW_TTL_BUMP,
+        );
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::FailureRecord(action.escrow_id));
+        Self::_remove_from_stuck_watchlist(&env, action.escrow_id);
+
+        // Immutable audit record with participant signatures.
+        let audit = EmergencyAuditRecord {
+            action_id,
+            action_type: action.action_type.clone(),
+            escrow_id: action.escrow_id,
+            amount: action.amount,
+            proposer: action.proposer.clone(),
+            participant_signers: action.signers.clone(),
+            reason_hash: action.reason_hash.clone(),
+            params_hash: action.params_hash.clone(),
+            timestamp: now,
+            success: true,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::EmergencyAudit(action_id), &audit);
+        env.storage().persistent().extend_ttl(
+            &DataKey::EmergencyAudit(action_id),
+            ESCROW_TTL_THRESHOLD,
+            ESCROW_TTL_BUMP,
+        );
+
+        let event_payload = EmergencyReleaseExecutedEventData {
+            escrow_id: action.escrow_id,
+            admin: caller.clone(),
+            reason_hash: action.reason_hash.clone(),
+            action_id,
+            amount: action.amount,
+            participant_signers: action.signers.clone(),
+        };
         emit_escrow_event(
             &env,
             evt_escrow_emergency_release(&env),
@@ -1984,11 +2281,142 @@ impl EscrowContract {
             (
                 Symbol::new(&env, "Escrow"),
                 Symbol::new(&env, "EmergencyReleased"),
-                escrow_id,
+                action.escrow_id,
             ),
             event_payload,
         );
+        true
     }
+
+    /// Compatibility entry-point for the historical `emergency_release` name.
+    ///
+    /// Delegates to `execute_emergency_action` after verifying `escrow_id` /
+    /// `reason_hash` match the stored proposal. Prefer the explicit
+    /// propose → approve → execute flow.
+    pub fn emergency_release(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        reason_hash: BytesN<32>,
+        emergency_action_id: u32,
+    ) -> bool {
+        let action: EmergencyAction = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmergencyProposal(emergency_action_id))
+            .expect("Emergency proposal not found");
+        if action.escrow_id != escrow_id {
+            panic!("Emergency action escrow_id mismatch");
+        }
+        if action.reason_hash != reason_hash {
+            panic!("Emergency action reason_hash mismatch");
+        }
+        Self::execute_emergency_action(env, caller, emergency_action_id)
+    }
+
+    /// View: fetch an emergency action proposal.
+    pub fn get_emergency_action(env: Env, action_id: u32) -> EmergencyAction {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EmergencyProposal(action_id))
+            .expect("Emergency proposal not found")
+    }
+
+    /// View: fetch immutable emergency audit record.
+    pub fn get_emergency_audit(env: Env, action_id: u32) -> EmergencyAuditRecord {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EmergencyAudit(action_id))
+            .expect("Emergency audit not found")
+    }
+
+    /// View: current emergency admin role (may be expired).
+    pub fn get_emergency_admin(env: Env) -> Option<EmergencyAdminRole> {
+        env.storage().persistent().get(&DataKey::EmergencyAdmin)
+    }
+
+    /// View: emergency multisig configuration.
+    pub fn get_emergency_multisig(env: Env) -> Option<EmergencyMultisig> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EmergencyMultisigConfig)
+    }
+
+    /// Permanently log a failed emergency attempt and mark the params hash
+    /// so the same parameters can never be retried. Must not panic — the
+    /// failure record has to commit.
+    fn _record_emergency_failure(
+        env: &Env,
+        action: &mut EmergencyAction,
+        caller: &Address,
+    ) {
+        action.failed = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::EmergencyProposal(action.id), action);
+        env.storage().persistent().set(
+            &DataKey::EmergencyFailedParams(action.params_hash.clone()),
+            &true,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::EmergencyFailedParams(action.params_hash.clone()),
+            ESCROW_TTL_THRESHOLD,
+            ESCROW_TTL_BUMP,
+        );
+
+        let audit = EmergencyAuditRecord {
+            action_id: action.id,
+            action_type: action.action_type.clone(),
+            escrow_id: action.escrow_id,
+            amount: action.amount,
+            proposer: action.proposer.clone(),
+            participant_signers: action.signers.clone(),
+            reason_hash: action.reason_hash.clone(),
+            params_hash: action.params_hash.clone(),
+            timestamp: env.ledger().timestamp(),
+            success: false,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::EmergencyAudit(action.id), &audit);
+
+        env.events().publish(
+            (
+                Symbol::new(env, "Escrow"),
+                Symbol::new(env, "EmergencyFailed"),
+                action.id,
+            ),
+            EmergencyActionAuditEventData {
+                action_id: action.id,
+                escrow_id: action.escrow_id,
+                actor: caller.clone(),
+                reason_hash: action.reason_hash.clone(),
+                params_hash: action.params_hash.clone(),
+                approval_count: action.approval_count,
+                success: false,
+            },
+        );
+    }
+
+    /// Sum amounts across all currently Active escrows (circuit-breaker pool).
+    fn _active_pool_total(env: &Env) -> i128 {
+        let count: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowCount)
+            .unwrap_or(0);
+        let mut total: i128 = 0;
+        for i in 1u64..=count {
+            let key = (symbol_short!("ESCROW"), i);
+            if let Some(escrow) = env.storage().persistent().get::<_, Escrow>(&key) {
+                if escrow.status == EscrowStatus::Active && escrow.amount > 0 {
+                    total = total.safe_add(env, escrow.amount);
+                }
+            }
+        }
+        total
+    }
+
 
     /// Manual recovery for escrows stuck after 5+ consecutive auto-release failures.
     /// Admin can intervene and release funds directly, bypassing auto-release prechecks.
@@ -2177,6 +2605,13 @@ impl EscrowContract {
     /// Get the failure record for an escrow (including backoff timing and recovery state)
     pub fn get_failure_record(env: Env, escrow_id: u64) -> Option<ReleaseFailure> {
         Self::_get_failure_record(&env, escrow_id)
+    }
+
+    /// Compatibility view: number of recorded auto-release failures for an escrow.
+    pub fn get_auto_release_attempts(env: Env, escrow_id: u64) -> u32 {
+        Self::_get_failure_record(&env, escrow_id)
+            .map(|f| f.attempt_number)
+            .unwrap_or(0)
     }
 
     /// Check if an escrow is currently in exponential backoff
@@ -3132,12 +3567,13 @@ impl EscrowContract {
 
     /// Register the emergency multi-sig signer set (admin only).
     ///
-    /// Must supply exactly 7 addresses.  Any change to this list resets the
-    /// signer registry; existing open proposals are still validated against
-    /// the signer set that was active when they were *approved*.
+    /// Must supply exactly 7 distinct addresses with an implicit 4-of-7
+    /// threshold. Stores both the raw signer list and the
+    /// `EmergencyMultisig` config used by emergency release validation.
     ///
     /// # Errors
-    /// Panics if `signers.len() != 7` or the caller is not the stored admin.
+    /// Panics if `signers` fails 4-of-7 config validation or the caller is
+    /// not the stored admin.
     pub fn set_emergency_signers(env: Env, admin: Address, signers: Vec<Address>) {
         let stored_admin: Address = env
             .storage()
@@ -3148,14 +3584,26 @@ impl EscrowContract {
         if admin != stored_admin {
             panic!("Caller not authorized");
         }
-        if signers.len() != EMERGENCY_SIGNERS {
-            panic!("Must provide exactly 7 emergency signers");
+        if !MultisigValidation::is_valid_emergency_config(&signers, EMERGENCY_MSIG_THRESHOLD) {
+            panic!("Must provide exactly 7 distinct emergency signers with threshold 4");
         }
+        let config = EmergencyMultisig {
+            signers: signers.clone(),
+            threshold: EMERGENCY_MSIG_THRESHOLD,
+        };
         env.storage()
             .persistent()
             .set(&DataKey::EmergencySigners, &signers);
+        env.storage()
+            .persistent()
+            .set(&DataKey::EmergencyMultisigConfig, &config);
         env.storage().persistent().extend_ttl(
             &DataKey::EmergencySigners,
+            ESCROW_TTL_THRESHOLD,
+            ESCROW_TTL_BUMP,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::EmergencyMultisigConfig,
             ESCROW_TTL_THRESHOLD,
             ESCROW_TTL_BUMP,
         );

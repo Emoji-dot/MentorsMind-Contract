@@ -188,13 +188,13 @@ pub struct DataDependencyTracker;
 
 impl DataDependencyTracker {
     /// Compute a deterministic 32-byte hash identifier for any serializable key.
-    pub fn hash_key<K: ToXdr>(env: &Env, key: &K) -> BytesN<32> {
-        let serialized = key.to_xdr(env);
+    pub fn hash_key<K: ToXdr + Clone>(env: &Env, key: &K) -> BytesN<32> {
+        let serialized = key.clone().to_xdr(env);
         env.crypto().sha256(&serialized).into()
     }
 
     /// Register a dependency key for an operation into temporary tracking storage.
-    pub fn register_dependency<K: ToXdr>(
+    pub fn register_dependency<K: ToXdr + Clone>(
         env: &Env,
         operation_id: Symbol,
         key: &K,
@@ -202,12 +202,12 @@ impl DataDependencyTracker {
         let key_hash = Self::hash_key(env, key);
         let current_ledger = env.ledger().sequence();
         let item = DependencyItem {
-            key_hash,
+            key_hash: key_hash.clone(),
             registered_at: current_ledger,
         };
 
         // Store under temporary storage namespace
-        let dep_storage_key = (symbol_short!("dep_trk"), operation_id, key_hash.clone());
+        let dep_storage_key = (symbol_short!("dep_trk"), operation_id.clone(), key_hash.clone());
         env.storage().temporary().set(&dep_storage_key, &item);
         TTLManager::extend_temporary(env, &dep_storage_key);
 
@@ -218,7 +218,7 @@ impl DataDependencyTracker {
     }
 
     /// Verify if a dependency is currently registered and active for an operation.
-    pub fn is_dependency_active<K: ToXdr>(
+    pub fn is_dependency_active<K: ToXdr + Clone>(
         env: &Env,
         operation_id: Symbol,
         key: &K,
@@ -229,7 +229,7 @@ impl DataDependencyTracker {
     }
 
     /// Clear a dependency when an operation completes.
-    pub fn clear_dependency<K: ToXdr>(
+    pub fn clear_dependency<K: ToXdr + Clone>(
         env: &Env,
         operation_id: Symbol,
         key: &K,
