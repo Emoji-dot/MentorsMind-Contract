@@ -61,6 +61,7 @@ members = [
     "contracts/velocity_limits",
     "contracts/verification",
     "contracts/vesting",
+    "benchmarks",
     "tests",
     "tools",
 ]

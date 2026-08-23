@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(deprecated)] // Temporarily allow deprecated Events::publish until we migrate to #[contractevent]
 
 use shared::{
     compute_checksum, push_snapshot_index, MultisigValidation, RollbackProposal, SnapshotMeta,

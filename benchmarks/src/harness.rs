@@ -67,7 +67,7 @@ pub struct CostSnapshot {
 ///
 /// Uses soroban-sdk v25+ budget API. The API has changed significantly.
 /// For now, return dummy values while we figure out the correct API.
-pub fn measure<F: FnOnce()>(env: &Env, f: F) -> CostSnapshot {
+pub fn measure<F: FnOnce()>(_env: &Env, f: F) -> CostSnapshot {
     // For now, just execute the function and return dummy values
     // This allows benchmarks to run while we investigate the correct API
     f();

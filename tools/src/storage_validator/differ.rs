@@ -28,7 +28,7 @@
 
 use std::collections::HashMap;
 
-use crate::storage_validator::types::{
+use crate::types::{
     DiffKind, EnumSchema, MigrationReport, SchemaDiff, SchemaSnapshot, Severity, StructSchema,
 };
 

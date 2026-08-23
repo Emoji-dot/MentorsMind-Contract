@@ -21,7 +21,7 @@
 /// ```
 use std::path::Path;
 
-use crate::storage_validator::types::{
+use crate::types::{
     ContractSchema, EnumSchema, FieldDef, StorageTier, StructSchema, VariantDef,
 };
 

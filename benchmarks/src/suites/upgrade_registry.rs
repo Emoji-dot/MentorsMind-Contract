@@ -7,8 +7,13 @@ use crate::harness::{measure, wasm_size, BenchResult};
 use mentorminds_upgrade_registry::{UpgradeRegistryContract, UpgradeRegistryContractClient};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
-    Address, BytesN, Env, Symbol, Vec as SorobanVec,
+    Address, Bytes, BytesN, Env, Symbol, Vec as SorobanVec,
 };
+
+const UPGRADE_WASM: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../target/wasm32v1-none/release/mentorminds_upgrade_registry.wasm"
+));
 
 const CONTRACT: &str = "upgrade_registry";
 const WASM_CRATE: &str = "mentorminds_upgrade_registry";
@@ -23,6 +28,7 @@ struct Fixture {
     admin: Address,
     signer1: Address,
     signer2: Address,
+    wasm_hash: BytesN<32>,
 }
 
 fn dummy_hash(env: &Env) -> BytesN<32> {
@@ -41,7 +47,10 @@ impl Fixture {
         let signer2 = Address::generate(&env);
 
         let client = UpgradeRegistryContractClient::new(&env, &registry_id);
-        client.initialize(&admin);
+        client.initialize(&admin, &86_400u64);
+        let wasm_hash = env
+            .deployer()
+            .upload_contract_wasm(Bytes::from_slice(&env, UPGRADE_WASM));
 
         // Set up M-of-N signers for upgrade operations
         let mut signers = SorobanVec::new(&env);
@@ -54,7 +63,14 @@ impl Fixture {
         
         client.set_upgrade_signers(&signers, &2u32, &approvers);
 
-        Fixture { env, registry_id, admin, signer1, signer2 }
+        Fixture {
+            env,
+            registry_id,
+            admin,
+            signer1,
+            signer2,
+            wasm_hash,
+        }
     }
 
     fn client(&self) -> UpgradeRegistryContractClient<'_> {
@@ -79,7 +95,7 @@ pub fn run() -> Vec<BenchResult> {
         
         let snap = measure(&f.env, || {
             f.client().schedule_upgrade(
-                &dummy_hash(&f.env),
+                &f.wasm_hash,
                 &Symbol::new(&f.env, "escrow"),
                 &2u32,
                 &dummy_hash(&f.env),
@@ -106,7 +122,7 @@ pub fn run() -> Vec<BenchResult> {
         
         // First schedule an upgrade
         f.client().schedule_upgrade(
-            &dummy_hash(&f.env),
+            &f.wasm_hash,
             &Symbol::new(&f.env, "escrow"),
             &2u32,
             &dummy_hash(&f.env),
@@ -136,10 +152,13 @@ pub fn run() -> Vec<BenchResult> {
         let mut approvers = SorobanVec::new(&f.env);
         approvers.push_back(f.signer1.clone());
         approvers.push_back(f.signer2.clone());
+
+        // Satisfy upgrade_delay (86_400s) before the direct upgrade path.
+        f.env.ledger().with_mut(|li| li.timestamp = 86_401);
         
         let snap = measure(&f.env, || {
             f.client().upgrade_contract(
-                &dummy_hash(&f.env),
+                &f.wasm_hash,
                 &Symbol::new(&f.env, "governance"),
                 &3u32,
                 &dummy_hash(&f.env),

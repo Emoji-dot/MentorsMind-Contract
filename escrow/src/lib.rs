@@ -1,6 +1,6 @@
 #![no_std]
 #![allow(deprecated)]
-#![allow(dead_code)]
+#![allow(dead_code, unused_assignments)]
 use shared::events::{
     emit_escrow_event, evt_escrow_created, evt_escrow_disputed, evt_escrow_emergency_release,
     evt_escrow_refunded, evt_escrow_released, evt_escrow_resolved, evt_escrow_stuck_reported,

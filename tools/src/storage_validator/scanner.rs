@@ -7,8 +7,8 @@
 use std::path::{Path, PathBuf};
 use std::{env, fs};
 
-use crate::storage_validator::parser::parse_file;
-use crate::storage_validator::types::{ContractSchema, SchemaSnapshot};
+use crate::parser::parse_file;
+use crate::types::{ContractSchema, SchemaSnapshot};
 
 /// Directories to skip during workspace scanning.
 const SKIP_DIRS: &[&str] = &[

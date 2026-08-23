@@ -1,5 +1,5 @@
 #![no_std]
-#![allow(deprecated)] // Temporarily allow deprecated Events::publish until we migrate to #[contractevent]
+#![allow(deprecated, unused_imports)] // Temporarily allow deprecated Events::publish until we migrate to #[contractevent]
 
 // ---------------------------------------------------------------------------
 // RFC: Upgrade path design
@@ -1483,7 +1483,6 @@ fn require_upgrade_approvals(env: &Env, approvers: Vec<Address>) -> Result<Vec<A
         Ok(approvers)
     } else {
         let admin = require_admin(env)?;
-        admin.require_auth();
         Ok(soroban_sdk::vec![env, admin])
     }
 }

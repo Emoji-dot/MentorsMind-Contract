@@ -7,7 +7,6 @@ on:
       - '.github/workflows/wasm-size.yml'
 
 env:
-  RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
   CARGO_TERM_COLOR: always
 
 jobs:

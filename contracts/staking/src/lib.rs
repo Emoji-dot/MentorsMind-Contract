@@ -1,18 +1,16 @@
 #![no_std]
+#![allow(deprecated)] // Temporarily allow deprecated Events::publish until we migrate to #[contractevent]
 
 use shared::events::{emit_staking_event, evt_staking_staked, evt_staking_unstaked};
 use shared::{
-    compute_checksum, push_snapshot_index, require_not_paused, AtomicBatch, BatchOp,
-    ReentrancyGuard, RollbackProposal, SnapshotMeta, StateSnapshot, StakeRecord, StakedEventData,
-    StateVerificationReport, EMERGENCY_THRESHOLD, MAX_SNAPSHOTS, Validator,
-    validate_amount_limits, validate_caller_is_authorized,
-    StakingSnapshot, RewardLockup, PenaltyCalculation, SuspiciousPatternFlag, StakingActionRecord,
+    compute_checksum, push_snapshot_index, require_not_paused, ReentrancyGuard, RollbackProposal,
+    SafeMath, SnapshotMeta, StateSnapshot, StakeRecord, StakedEventData, StateVerificationReport,
+    EMERGENCY_THRESHOLD, MAX_SNAPSHOTS, Validator, validate_amount_limits,
+    RewardLockup, PenaltyCalculation, SuspiciousPatternFlag, StakingActionRecord,
     compute_reward_multiplier_bps, compute_early_unstake_penalty, detect_suspicious_pattern,
     apply_bps_multiplier, action_stake, action_unstake, action_claim,
-    MIN_STAKING_DURATION_SECS, REWARD_LOCKUP_SECS, MAX_SCALING_DURATION_SECS,
-    REWARD_MULTIPLIER_MIN_BPS, REWARD_MULTIPLIER_MAX_BPS,
-    EARLY_UNSTAKE_PENALTY_MIN_BPS, EARLY_UNSTAKE_PENALTY_MAX_BPS,
-    BASIS_POINTS, PATTERN_DETECTION_WINDOW, SUSPICIOUS_CYCLE_THRESHOLD_SECS,
+    MIN_STAKING_DURATION_SECS, REWARD_LOCKUP_SECS,
+    REWARD_MULTIPLIER_MIN_BPS, PATTERN_DETECTION_WINDOW,
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
@@ -741,7 +739,7 @@ impl StakingContract {
     /// Admin setter for the next scheduled distribution timestamp. Feeds
     /// the pattern detector so it can flag large stakes placed immediately
     /// before a known distribution window.
-    pub fn set_next_scheduled_distribution_at(
+    pub fn set_next_distribution_at(
         env: Env,
         admin: Address,
         timestamp: u64,
@@ -753,7 +751,7 @@ impl StakingContract {
         Ok(())
     }
 
-    pub fn get_next_scheduled_distribution_at(env: Env) -> Option<u64> {
+    pub fn get_next_distribution_at(env: Env) -> Option<u64> {
         env.storage()
             .instance()
             .get(&DataKey::NextScheduledDistributionAt)
@@ -1325,7 +1323,7 @@ impl StakingContract {
         Self::internal_distribute_revenue(&env, token, amount);
     }
 
-    pub fn get_treasury_distribution_receipt(
+    pub fn get_treasury_dist_receipt(
         env: Env,
         distribution_id: u64,
     ) -> Option<TreasuryDistributionReceipt> {
@@ -1752,7 +1750,7 @@ impl StakingContract {
             .expect("Not initialized");
         let token_client = token::Client::new(&env, &mnt_token);
         let contract_addr = env.current_contract_address();
-        let balance_before = token_client.balance(&contract_addr);
+        let _balance_before = token_client.balance(&contract_addr);
 
         let invoker_addr = env.current_contract_address();
         let _ = invoker_addr;
@@ -1969,7 +1967,7 @@ impl StakingContract {
             .persistent()
             .get(&DataKey::StakerEpochEntry(staker.clone()))
             .unwrap_or(current_epoch);
-        let mut next_claim: u64 = env
+        let next_claim: u64 = env
             .storage()
             .persistent()
             .get(&DataKey::StakerNextClaimEpoch(staker.clone()))
@@ -1981,7 +1979,7 @@ impl StakingContract {
         // `StakerNextClaimEpoch` (which tracks CLAIM epochs) because a user
         // may have settled (lockups created) but not yet claimed them.
         let settled_until_key = DataKey::StakerLockupSettledUntil(staker.clone());
-        let mut settled_until: u64 = env
+        let settled_until: u64 = env
             .storage()
             .persistent()
             .get(&settled_until_key)
@@ -2133,7 +2131,7 @@ impl StakingContract {
 
     /// Duration-based multiplier the staker would earn for a reward
     /// materialised *right now*, given their current live stake duration.
-    pub fn get_current_reward_multiplier_bps(env: Env, staker: Address) -> u32 {
+    pub fn get_reward_multiplier_bps(env: Env, staker: Address) -> u32 {
         match env
             .storage()
             .persistent()
