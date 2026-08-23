@@ -10,6 +10,8 @@ const FULL_WEIGHT: i128 = 1000; // scaling factor for weight
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     SessionRegistry,
     Endorsement(Address, Address, Symbol),

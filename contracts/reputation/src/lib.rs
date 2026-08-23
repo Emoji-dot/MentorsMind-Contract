@@ -40,6 +40,8 @@ pub struct LearnerReviewRecord {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Review(Symbol),
     MentorRatingSum(Address),
     MentorReviewCount(Address),

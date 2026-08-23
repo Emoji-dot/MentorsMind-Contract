@@ -23,6 +23,8 @@ pub struct AllowanceRecord {
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Allowance(Address, Address, Address), // (owner, spender, token)
 }
 

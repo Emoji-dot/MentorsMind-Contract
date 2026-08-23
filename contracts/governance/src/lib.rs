@@ -9,7 +9,7 @@ use shared::events::{
     evt_gov_proposal_passed, evt_gov_proposal_queued, evt_gov_timelock_set,
     evt_gov_vote_cast,
 };
-use shared::{GasEstimate, StateMachine, ROLLBACK_GOVERNANCE_QUORUM_BPS};
+use shared::{GasEstimate, StateMachine, ROLLBACK_GOVERNANCE_QUORUM_BPS, SecureStorageAccess};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, vec, Address, Bytes,
     BytesN, Env, IntoVal, Symbol, Vec,
@@ -25,6 +25,7 @@ const QUORUM_BPS: Symbol = symbol_short!("QRM_BPS");
 const CURRENT_FEE_BPS: Symbol = symbol_short!("FEE_BPS");
 const CURRENT_AUTO_RELEASE_SECS: Symbol = symbol_short!("AUTO_REL");
 const TEMPLATES: Symbol = symbol_short!("TMPLATES");
+const GOV_STORAGE_SCOPE: Symbol = symbol_short!("mm_gov");
 
 const DEFAULT_VOTING_PERIOD_SECS: u64 = 7 * 24 * 60 * 60;
 const DEFAULT_QUORUM_BPS: u32 = 1_000; // 10%
@@ -182,6 +183,8 @@ pub struct Proposal {
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Proposal(u32),
     Vote(u32, Address),
     VoteWeight(u32, Address),
@@ -268,6 +271,8 @@ impl GovernanceContract {
         voting_period_secs: Option<u64>,
         quorum_bps: Option<u32>,
     ) {
+        SecureStorageAccess::install_namespace(&env, &DataKey::NamespaceRoot, GOV_STORAGE_SCOPE);
+
         if env.storage().instance().has(&ADMIN) {
             panic!("already initialized");
         }

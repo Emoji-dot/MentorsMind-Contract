@@ -32,6 +32,8 @@ pub struct KycBatchEntry {
 
 #[contracttype]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     Rbac,
     Kyc(Address),

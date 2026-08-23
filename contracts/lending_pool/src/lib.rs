@@ -30,6 +30,8 @@ use shared::{
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     UsdcToken,
     CreditScoreContract,

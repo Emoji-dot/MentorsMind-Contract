@@ -186,6 +186,8 @@ pub struct GuardianRotationRecord {
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     OpCount,
     Op(BytesN<32>),

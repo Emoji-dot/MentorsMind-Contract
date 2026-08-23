@@ -31,6 +31,8 @@ pub struct TxRecord {
 
 #[contracttype]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     EscrowContract,
     /// All records for a user (sender or receiver): Vec<TxRecord>

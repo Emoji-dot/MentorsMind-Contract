@@ -62,6 +62,8 @@ pub enum IsaStatus {
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     NextIsaId,
     Isa(u32),
     IncomeOracle,

@@ -68,6 +68,8 @@ pub struct TransferEventData {
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     Allowance(Address, Address), // (owner, spender)
     Balance(Address),

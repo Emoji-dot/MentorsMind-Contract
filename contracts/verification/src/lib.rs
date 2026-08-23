@@ -7,6 +7,8 @@ const DEFAULT_GRACE_PERIOD_SECS: u64 = 7 * 24 * 60 * 60;
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     Verification(Address),
     Tier(Address),

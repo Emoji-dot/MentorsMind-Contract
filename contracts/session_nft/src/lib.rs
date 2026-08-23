@@ -47,6 +47,8 @@ pub struct NftMetadata {
 
 #[contracttype]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     TokenIdCounter,
     Bundle(u64),           // token_id -> BundleNFT
     OwnerBundles(Address), // owner -> Vec<u64>

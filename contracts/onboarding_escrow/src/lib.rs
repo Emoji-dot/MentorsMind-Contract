@@ -42,6 +42,8 @@ pub struct OnboardingInfo {
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     /// OnboardingStatus per mentor.
     MentorOnboardingStatus(Address),
     /// Whether a mentor's first escrow uses extended delay.
