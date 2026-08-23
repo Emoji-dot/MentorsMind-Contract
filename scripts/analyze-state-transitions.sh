@@ -16,7 +16,7 @@ mkdir -p "$OUTPUT_DIR"
 
 # Build and run the analyzer
 cd "$PROJECT_ROOT"
-cargo run --bin analyze-transitions --release 2>&1
+cargo run -p state-transition-analyzer --bin analyze-transitions --release 2>&1
 
 # Check exit status
 if [ $? -ne 0 ]; then

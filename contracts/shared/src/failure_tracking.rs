@@ -1,6 +1,4 @@
-#![no_std]
-
-use soroban_sdk::{contracttype, Address, BytesN, Env};
+use soroban_sdk::{contracttype, BytesN, Env};
 
 /// Classification of auto-release failure reasons
 #[contracttype]

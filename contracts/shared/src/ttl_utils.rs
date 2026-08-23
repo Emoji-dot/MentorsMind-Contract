@@ -5,7 +5,7 @@
 //! persistent, temporary) to prevent unexpected data expiration during active operations.
 
 use soroban_sdk::{
-    contracttype, symbol_short, xdr::ToXdr, Bytes, BytesN, Env, IntoVal, Symbol, Val, Vec,
+    contracttype, symbol_short, xdr::ToXdr, Bytes, BytesN, Env, IntoVal, Symbol, Val,
 };
 
 // ---------------------------------------------------------------------------

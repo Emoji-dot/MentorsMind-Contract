@@ -7,10 +7,10 @@ use shared::events::{
 };
 use shared::{
     compute_checksum, push_snapshot_index, CrossContractAuth, EscrowRecord,
-    RollbackProposal, SnapshotMeta, StateVerificationReport, EMERGENCY_SIGNERS,
+    RollbackProposal, SnapshotMeta, StateVerificationReport,
     EMERGENCY_THRESHOLD, MAX_SNAPSHOTS, StateMachine, EscrowTransitionLog, GasEstimate, Validator,
-    ReleaseFailure, FailureClassification, RecoveryState, calculate_backoff_delay,
-    classify_failure, calculate_next_retry, compute_failure_hash, MAX_AUTO_RELEASE_ATTEMPTS,
+    ReleaseFailure, FailureClassification, RecoveryState, calculate_next_retry,
+    MAX_AUTO_RELEASE_ATTEMPTS,
     MANUAL_RECOVERY_THRESHOLD, EmergencyAction, EmergencyAdminRole, EmergencyAuditRecord,
     EmergencyCircuitBreaker, EmergencyMultisig, MultisigValidation, SafeMath,
     EMERGENCY_ADMIN_TTL_SECS, EMERGENCY_MSIG_THRESHOLD,
@@ -21,7 +21,7 @@ use soroban_sdk::{
     IntoVal, BytesN,
 };
 use shared::{
-    AdminTransfer, AdminChangeProposal, MIN_ADMIN_TIMELOCK_SECS, ADMIN_COOLING_OFF_SECS, SharedError
+    AdminTransfer, AdminChangeProposal, MIN_ADMIN_TIMELOCK_SECS, ADMIN_COOLING_OFF_SECS,
 };
 
 #[contracttype]
@@ -1423,7 +1423,7 @@ impl EscrowContract {
     // -----------------------------------------------------------------------
 
     /// Get or initialize a failure record for an escrow
-    fn _get_or_init_failure_record(env: &Env, escrow_id: u64, now: u64) -> ReleaseFailure {
+    fn _get_or_init_failure_record(env: &Env, escrow_id: u64, _now: u64) -> ReleaseFailure {
         match env.storage().persistent().get::<_, ReleaseFailure>(&DataKey::FailureRecord(escrow_id)) {
             Some(record) => record,
             None => ReleaseFailure {

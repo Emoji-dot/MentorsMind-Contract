@@ -62,6 +62,7 @@ members = [
     "contracts/verification",
     "contracts/vesting",
     "tests",
+    "tools",
 ]
 
 [workspace.package]
