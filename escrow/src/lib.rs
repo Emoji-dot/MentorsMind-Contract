@@ -8,12 +8,14 @@ use shared::events::{
 use shared::{
     compute_checksum, push_snapshot_index, CrossContractAuth, EscrowRecord,
     RollbackProposal, SnapshotMeta, StateVerificationReport,
-    EMERGENCY_THRESHOLD, MAX_SNAPSHOTS, StateMachine, EscrowTransitionLog, GasEstimate, Validator,
+    MAX_SNAPSHOTS, EscrowTransitionLog, GasEstimate, Validator, StateMachine,
     ReleaseFailure, FailureClassification, RecoveryState, calculate_next_retry,
     MAX_AUTO_RELEASE_ATTEMPTS,
     MANUAL_RECOVERY_THRESHOLD, EmergencyAction, EmergencyAdminRole, EmergencyAuditRecord,
     EmergencyCircuitBreaker, EmergencyMultisig, MultisigValidation, SafeMath,
     EMERGENCY_ADMIN_TTL_SECS, EMERGENCY_MSIG_THRESHOLD,
+    EmergencyRollback, ImmutableRollbackAuditRecord, RollbackAuthorization, RollbackJustification,
+    RollbackScope,
 };
 pub use shared::EscrowStatus;
 use soroban_sdk::{
@@ -346,6 +348,18 @@ pub enum DataKey {
     RollbackApproval(u32, Address),
     /// Auto-incremented rollback proposal counter.
     RollbackProposalCount,
+    /// Hardened emergency rollback proposal `n` (issue #825).
+    EmergencyRollback(u32),
+    /// Auto-incremented emergency rollback counter.
+    EmergencyRollbackCount,
+    /// Immutable rollback audit archive for proposal `n`.
+    ImmutableRollbackAudit(u32),
+    /// Preserved emergency audit `n` (survives rollback).
+    PreservedEmergencyAudit(u32),
+    /// Preserved transition log for escrow `id` (survives rollback).
+    PreservedTransitionLog(u64),
+    /// Registered governance contract for rollback review callbacks.
+    GovernanceContract,
     /// Store a vector of escrow transition logs.
     TransitionLog(u64),
     /// Pending admin change tracking.
@@ -1868,6 +1882,27 @@ impl EscrowContract {
             .set(&DataKey::MultisigAdmin, &multisig_admin);
         env.storage().persistent().extend_ttl(
             &DataKey::MultisigAdmin,
+            ESCROW_TTL_THRESHOLD,
+            ESCROW_TTL_BUMP,
+        );
+    }
+
+    /// Register the governance contract authorised to approve emergency rollbacks.
+    pub fn set_governance_contract(env: Env, admin: Address, governance: Address) {
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("Caller not authorized");
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovernanceContract, &governance);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovernanceContract,
             ESCROW_TTL_THRESHOLD,
             ESCROW_TTL_BUMP,
         );
@@ -3920,6 +3955,75 @@ impl EscrowContract {
         }
     }
 
+    /// Open a hardened emergency rollback proposal (issue #825).
+    pub fn propose_emergency_rollback(
+        env: Env,
+        proposer: Address,
+        snapshot_id: u32,
+        old_wasm_hash: BytesN<32>,
+        scope: RollbackScope,
+        justification: RollbackJustification,
+    ) -> u32 {
+        proposer.require_auth();
+        Self::validate_rollback_request_internal(
+            &env,
+            proposer.clone(),
+            snapshot_id,
+            &scope,
+            &justification,
+        );
+
+        let now = env.ledger().timestamp();
+        let review_ends_at = RollbackAuthorization::compute_review_ends_at(now)
+            .expect("review period overflow");
+
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmergencyRollbackCount)
+            .unwrap_or(0);
+        let new_id = count.safe_add(&env, 1);
+        env.storage()
+            .persistent()
+            .set(&DataKey::EmergencyRollbackCount, &new_id);
+
+        let mut technical_signers = Vec::new(&env);
+        let technical_approval_count = RollbackAuthorization::aggregate_technical_approval(
+            &mut technical_signers,
+            proposer.clone(),
+        );
+
+        let rollback = EmergencyRollback {
+            id: new_id,
+            snapshot_id,
+            old_wasm_hash: old_wasm_hash.clone(),
+            scope,
+            justification,
+            proposer: proposer.clone(),
+            proposed_at: now,
+            review_ends_at,
+            technical_approval_count,
+            technical_signers,
+            governance_proposal_id: None,
+            governance_approved: false,
+            executed: false,
+            rejected: false,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::EmergencyRollback(new_id), &rollback);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "DR"),
+                Symbol::new(&env, "erb_proposed"),
+                new_id,
+            ),
+            (snapshot_id, proposer, old_wasm_hash),
+        );
+        new_id
+    }
+
     /// Open a rollback proposal targeting a specific snapshot.
     ///
     /// The `proposer` must be one of the registered emergency signers.
@@ -3938,17 +4042,159 @@ impl EscrowContract {
         snapshot_id: u32,
         old_wasm_hash: BytesN<32>,
     ) -> u32 {
-        // Validate proposer is an emergency signer
+        let justification = RollbackJustification {
+            evidence_hash: old_wasm_hash.clone(),
+            incident_hash: old_wasm_hash.clone(),
+            description_hash: RollbackAuthorization::zero_hash(&env),
+        };
+        Self::propose_emergency_rollback(
+            env,
+            proposer,
+            snapshot_id,
+            old_wasm_hash,
+            RollbackScope::Escrow,
+            justification,
+        )
+    }
+
+    /// Technical multisig approval for an emergency rollback (4-of-7 required).
+    pub fn approve_technical_rollback(env: Env, signer: Address, proposal_id: u32) {
+        signer.require_auth();
         let signers: Vec<Address> = env
             .storage()
             .persistent()
             .get(&DataKey::EmergencySigners)
             .expect("Emergency signers not configured");
-        let is_signer = signers.iter().any(|s| s == proposer);
-        if !is_signer {
+        if !RollbackAuthorization::is_registered_signer(&signers, &signer) {
+            panic!("Signer is not an emergency signer");
+        }
+
+        let mut rollback: EmergencyRollback = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmergencyRollback(proposal_id))
+            .expect("Emergency rollback proposal not found");
+        if rollback.executed || rollback.rejected {
+            panic!("Rollback already finalized");
+        }
+
+        rollback.technical_approval_count = RollbackAuthorization::aggregate_technical_approval(
+            &mut rollback.technical_signers,
+            signer.clone(),
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::EmergencyRollback(proposal_id), &rollback);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "DR"),
+                Symbol::new(&env, "erb_tech_aprv"),
+                proposal_id,
+            ),
+            (signer, rollback.technical_approval_count),
+        );
+    }
+
+    pub fn approve_rollback(env: Env, signer: Address, proposal_id: u32) {
+        Self::approve_technical_rollback(env, signer, proposal_id);
+    }
+
+    pub fn link_governance_rollback_review(
+        env: Env,
+        governance: Address,
+        rollback_id: u32,
+        governance_proposal_id: u32,
+    ) {
+        governance.require_auth();
+        let stored: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovernanceContract)
+            .expect("Governance contract not configured");
+        if governance != stored {
+            panic!("Unauthorized governance contract");
+        }
+
+        let mut rollback: EmergencyRollback = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmergencyRollback(rollback_id))
+            .expect("Emergency rollback proposal not found");
+        rollback.governance_proposal_id = Some(governance_proposal_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::EmergencyRollback(rollback_id), &rollback);
+    }
+
+    pub fn mark_gov_rollback_approved(
+        env: Env,
+        governance: Address,
+        rollback_id: u32,
+        governance_proposal_id: u32,
+    ) {
+        governance.require_auth();
+        let stored: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovernanceContract)
+            .expect("Governance contract not configured");
+        if governance != stored {
+            panic!("Unauthorized governance contract");
+        }
+
+        let mut rollback: EmergencyRollback = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmergencyRollback(rollback_id))
+            .expect("Emergency rollback proposal not found");
+        if rollback.governance_proposal_id != Some(governance_proposal_id) {
+            panic!("Governance proposal mismatch");
+        }
+        rollback.governance_approved = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::EmergencyRollback(rollback_id), &rollback);
+    }
+
+    pub fn validate_rollback_request(env: Env, proposal_id: u32) -> bool {
+        let rollback: EmergencyRollback = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmergencyRollback(proposal_id))
+        {
+            Some(r) => r,
+            None => return false,
+        };
+        let meta: SnapshotMeta = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::SnapshotMetadata(rollback.snapshot_id))
+        {
+            Some(m) => m,
+            None => return false,
+        };
+        if !RollbackAuthorization::validate_justification(&env, &rollback.justification) {
+            return false;
+        }
+        RollbackAuthorization::validate_scope_window(rollback.proposed_at, meta.created_at)
+    }
+
+    fn validate_rollback_request_internal(
+        env: &Env,
+        proposer: Address,
+        snapshot_id: u32,
+        scope: &RollbackScope,
+        justification: &RollbackJustification,
+    ) {
+        let signers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmergencySigners)
+            .expect("Emergency signers not configured");
+        if !RollbackAuthorization::is_registered_signer(&signers, &proposer) {
             panic!("Proposer is not an emergency signer");
         }
-        // Verify snapshot exists
         if !env
             .storage()
             .persistent()
@@ -3956,149 +4202,122 @@ impl EscrowContract {
         {
             panic!("Snapshot not found");
         }
-        proposer.require_auth();
-
-        let proposal_count: u32 = env
+        let meta: SnapshotMeta = env
             .storage()
             .persistent()
-            .get(&DataKey::RollbackProposalCount)
-            .unwrap_or(0);
-        let new_id = proposal_count
-            .safe_add(&env, 1);
-        env.storage()
-            .persistent()
-            .set(&DataKey::RollbackProposalCount, &new_id);
-
-        let proposal = RollbackProposal {
-            id: new_id,
-            snapshot_id,
-            old_wasm_hash: old_wasm_hash.clone(),
-            approval_count: 1,
-            executed: false,
-            created_at: env.ledger().timestamp(),
-            proposer: proposer.clone(),
-        };
-        env.storage()
-            .persistent()
-            .set(&DataKey::RollbackProposal(new_id), &proposal);
-        env.storage().persistent().extend_ttl(
-            &DataKey::RollbackProposal(new_id),
-            ESCROW_TTL_THRESHOLD,
-            ESCROW_TTL_BUMP,
-        );
-        // Record proposer's implicit approval
-        env.storage().persistent().set(
-            &DataKey::RollbackApproval(new_id, proposer.clone()),
-            &true,
-        );
-
-        env.events().publish(
-            (
-                Symbol::new(&env, "DR"),
-                Symbol::new(&env, "rb_proposed"),
-                new_id,
-            ),
-            (snapshot_id, proposer, old_wasm_hash),
-        );
-        new_id
+            .get(&DataKey::SnapshotMetadata(snapshot_id))
+            .expect("Snapshot metadata not found");
+        if !RollbackAuthorization::validate_justification(env, justification) {
+            panic!("Invalid rollback justification");
+        }
+        if !RollbackAuthorization::validate_scope_window(env.ledger().timestamp(), meta.created_at)
+        {
+            panic!("Snapshot outside 24h rollback window");
+        }
+        match scope {
+            RollbackScope::Escrow => {}
+            RollbackScope::Contract(addr) => {
+                if *addr != env.current_contract_address() {
+                    panic!("Contract scope mismatch");
+                }
+            }
+            RollbackScope::Governance => panic!("Governance scope not valid on escrow"),
+        }
     }
 
-    /// Cast an approval vote on an open rollback proposal.
-    ///
-    /// * `signer` must be one of the registered emergency signers.
-    /// * Double-voting panics.
-    /// * Voting on an already-executed proposal panics.
-    pub fn approve_rollback(env: Env, signer: Address, proposal_id: u32) {
-        // Validate signer is an emergency signer
-        let signers: Vec<Address> = env
+    pub fn preserve_audit_data(env: Env, proposal_id: u32) -> (u32, u32) {
+        let rollback: EmergencyRollback = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmergencyRollback(proposal_id))
+            .expect("Emergency rollback proposal not found");
+
+        let action_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmergencyProposalCount)
+            .unwrap_or(0);
+        let mut preserved_audits = 0u32;
+        for id in 1..=action_count {
+            if let Some(audit) = env
+                .storage()
+                .persistent()
+                .get::<_, EmergencyAuditRecord>(&DataKey::EmergencyAudit(id))
+            {
+                env.storage().persistent().set(
+                    &DataKey::PreservedEmergencyAudit(id),
+                    &audit,
+                );
+                preserved_audits = preserved_audits.safe_add(&env, 1);
+            }
+        }
+
+        let records: Vec<EscrowRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Snapshot(rollback.snapshot_id))
+            .expect("Snapshot data not found");
+        let mut preserved_logs = 0u32;
+        for record in records.iter() {
+            if let Some(logs) = env
+                .storage()
+                .persistent()
+                .get::<_, Vec<EscrowTransitionLog>>(&DataKey::TransitionLog(record.id))
+            {
+                env.storage().persistent().set(
+                    &DataKey::PreservedTransitionLog(record.id),
+                    &logs,
+                );
+                preserved_logs = preserved_logs.safe_add(&env, 1);
+            }
+        }
+        (preserved_audits, preserved_logs)
+    }
+
+    pub fn emergency_rollback(env: Env, proposal_id: u32, executor: Address) -> bool {
+        executor.require_auth();
+        let now = env.ledger().timestamp();
+        let mut rollback: EmergencyRollback = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmergencyRollback(proposal_id))
+            .expect("Emergency rollback proposal not found");
+
+        if !RollbackAuthorization::ready_to_execute(&rollback, now) {
+            return false;
+        }
+        let registered: Vec<Address> = env
             .storage()
             .persistent()
             .get(&DataKey::EmergencySigners)
             .expect("Emergency signers not configured");
-        let is_signer = signers.iter().any(|s| s == signer);
-        if !is_signer {
-            panic!("Signer is not an emergency signer");
+        if !RollbackAuthorization::validate_technical_signatures(
+            &registered,
+            &rollback.technical_signers,
+        ) {
+            return false;
         }
 
-        let mut proposal: RollbackProposal = env
+        let meta: SnapshotMeta = match env
             .storage()
             .persistent()
-            .get(&DataKey::RollbackProposal(proposal_id))
-            .expect("Rollback proposal not found");
-        if proposal.executed {
-            panic!("Rollback already executed");
-        }
-        if env
-            .storage()
-            .persistent()
-            .get::<_, bool>(&DataKey::RollbackApproval(proposal_id, signer.clone()))
-            .unwrap_or(false)
+            .get(&DataKey::SnapshotMetadata(rollback.snapshot_id))
         {
-            panic!("Already approved");
-        }
-        signer.require_auth();
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::RollbackApproval(proposal_id, signer.clone()), &true);
-        proposal.approval_count = proposal
-            .approval_count
-            .safe_add(&env, 1);
-        env.storage()
-            .persistent()
-            .set(&DataKey::RollbackProposal(proposal_id), &proposal);
-
-        env.events().publish(
-            (
-                Symbol::new(&env, "DR"),
-                Symbol::new(&env, "rb_approved"),
-                proposal_id,
-            ),
-            (signer, proposal.approval_count),
-        );
-    }
-
-    /// Execute a rollback after accumulating 4-of-7 emergency signer approvals.
-    ///
-    /// Steps:
-    /// 1. Validate `EMERGENCY_THRESHOLD` approvals are present.
-    /// 2. Load the snapshot payload.
-    /// 3. Restore every `EscrowRecord` from the snapshot back to persistent storage.
-    /// 4. Re-apply the old WASM binary via `env.deployer().update_current_contract_wasm`.
-    /// 5. Mark the proposal as executed and emit a `RollbackExecuted` event.
-    ///
-    /// # Pre-conditions
-    /// * The old WASM binary **must** already be uploaded to the network
-    ///   (`soroban contract install`) before calling this.
-    /// * Exactly `EMERGENCY_THRESHOLD` (4) approvals must have been registered.
-    ///
-    /// # Panics
-    /// * Proposal not found / already executed.
-    /// * Approval count below threshold.
-    /// * Snapshot no longer exists (e.g. was evicted by newer snapshots).
-    pub fn rollback_to_snapshot(env: Env, proposal_id: u32) {
-        let mut proposal: RollbackProposal = env
-            .storage()
-            .persistent()
-            .get(&DataKey::RollbackProposal(proposal_id))
-            .expect("Rollback proposal not found");
-        if proposal.executed {
-            panic!("Rollback already executed");
-        }
-        if proposal.approval_count < EMERGENCY_THRESHOLD {
-            panic!("Insufficient approvals for rollback (need 4-of-7)");
+            Some(m) => m,
+            None => return false,
+        };
+        if !RollbackAuthorization::validate_scope_window(rollback.proposed_at, meta.created_at) {
+            return false;
         }
 
-        let snapshot_id = proposal.snapshot_id;
+        let (preserved_audits, preserved_logs) = Self::preserve_audit_data(env.clone(), proposal_id);
+        let snapshot_id = rollback.snapshot_id;
         let records: Vec<EscrowRecord> = env
             .storage()
             .persistent()
             .get(&DataKey::Snapshot(snapshot_id))
             .expect("Snapshot data not found");
 
-        // ----------------------------------------------------------------
-        // Restore all escrow records from snapshot
-        // ----------------------------------------------------------------
         for record in records.iter() {
             let key = (symbol_short!("ESCROW"), record.id);
             env.storage().persistent().set(&key, &record);
@@ -4109,32 +4328,36 @@ impl EscrowContract {
             );
         }
 
-        // ----------------------------------------------------------------
-        // Re-apply the pre-upgrade WASM
-        // ----------------------------------------------------------------
         env.deployer()
-            .update_current_contract_wasm(proposal.old_wasm_hash.clone());
+            .update_current_contract_wasm(rollback.old_wasm_hash.clone());
 
-        // ----------------------------------------------------------------
-        // Mark executed and emit event
-        // ----------------------------------------------------------------
-        proposal.executed = true;
+        rollback.executed = true;
         env.storage()
             .persistent()
-            .set(&DataKey::RollbackProposal(proposal_id), &proposal);
+            .set(&DataKey::EmergencyRollback(proposal_id), &rollback);
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "DR"),
-                Symbol::new(&env, "rb_executed"),
-                proposal_id,
-            ),
-            (
-                snapshot_id,
-                proposal.old_wasm_hash,
-                records.len() as u32,
-            ),
-        );
+        let audit = ImmutableRollbackAuditRecord {
+            rollback_id: proposal_id,
+            snapshot_id,
+            evidence_hash: rollback.justification.evidence_hash.clone(),
+            preserved_emergency_audits: preserved_audits,
+            preserved_transition_logs: preserved_logs,
+            timestamp: now,
+            executor: executor.clone(),
+            success: true,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::ImmutableRollbackAudit(proposal_id), &audit);
+        true
+    }
+
+    /// Execute a rollback after multi-layer authorization is satisfied.
+    pub fn rollback_to_snapshot(env: Env, proposal_id: u32) {
+        let executor = env.current_contract_address();
+        if !Self::emergency_rollback(env, proposal_id, executor) {
+            panic!("Emergency rollback requirements not satisfied");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -4161,6 +4384,21 @@ impl EscrowContract {
         env.storage()
             .persistent()
             .get(&DataKey::RollbackProposal(proposal_id))
+    }
+
+    pub fn get_emergency_rollback(env: Env, proposal_id: u32) -> Option<EmergencyRollback> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EmergencyRollback(proposal_id))
+    }
+
+    pub fn get_immutable_rollback_audit(
+        env: Env,
+        proposal_id: u32,
+    ) -> Option<ImmutableRollbackAuditRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ImmutableRollbackAudit(proposal_id))
     }
 
     /// View function to retrieve the transition log for a given escrow.

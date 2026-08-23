@@ -2,9 +2,9 @@
 #![allow(deprecated)] // Temporarily allow deprecated Events::publish until we migrate to #[contractevent]
 
 use shared::{
-    compute_checksum, push_snapshot_index, MultisigValidation, RollbackProposal, SnapshotMeta,
-    StateVerificationReport, EMERGENCY_MSIG_SIGNERS, EMERGENCY_MSIG_THRESHOLD, EMERGENCY_THRESHOLD,
-    MAX_SNAPSHOTS,
+    compute_checksum, push_snapshot_index, MultisigValidation, RollbackAuthorization,
+    RollbackJustification, RollbackProposal, SnapshotMeta, StateVerificationReport,
+    EMERGENCY_MSIG_SIGNERS, EMERGENCY_MSIG_THRESHOLD, EMERGENCY_THRESHOLD, MAX_SNAPSHOTS,
 };
 use soroban_sdk::{
     contract, contractimpl, contracterror, contracttype, symbol_short, Address, Bytes, BytesN,
@@ -877,6 +877,34 @@ impl MultisigAdminContract {
         env.storage()
             .persistent()
             .get(&DataKey::GovRollbackProposal(proposal_id))
+    }
+
+    /// Validate cryptographic rollback evidence digests (non-zero required).
+    pub fn validate_rollback_evidence(
+        env: Env,
+        evidence_hash: BytesN<32>,
+        incident_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        let justification = RollbackJustification {
+            evidence_hash,
+            incident_hash,
+            description_hash: RollbackAuthorization::zero_hash(&env),
+        };
+        if RollbackAuthorization::validate_justification(&env, &justification) {
+            Ok(())
+        } else {
+            Err(Error::InvalidEmergencySignatures)
+        }
+    }
+
+    /// Validate that a snapshot timestamp is within the 24-hour rollback window.
+    pub fn validate_rollback_scope(env: Env, snapshot_created_at: u64) -> Result<(), Error> {
+        if RollbackAuthorization::validate_scope_window(env.ledger().timestamp(), snapshot_created_at)
+        {
+            Ok(())
+        } else {
+            Err(Error::InvalidEmergencySignatures)
+        }
     }
 }
 

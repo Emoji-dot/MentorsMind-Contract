@@ -1,11 +1,15 @@
 #![cfg(test)]
 
 use mentorminds_escrow::{EscrowContract, EscrowContractClient, EscrowStatus};
+use shared::{
+    RollbackJustification, RollbackScope, ROLLBACK_COMMUNITY_REVIEW_SECS,
+    ROLLBACK_MAX_WINDOW_SECS,
+};
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Env, Symbol, Vec,
+    Address, BytesN, Env, Symbol, Vec,
 };
 
 // -----------------------------------------------------------------------
@@ -535,7 +539,7 @@ fn test_estimate_release_escrow_cost_within_tolerance_of_actual() {
 
 extern crate alloc;
 
-use soroban_sdk::{contract, contractimpl, BytesN};
+use soroban_sdk::{contract, contractimpl};
 
 // -----------------------------------------------------------------------
 // Escrow Auto-Release Failure Recovery Tests
@@ -856,6 +860,142 @@ fn test_emergency_admin_expires_after_72h() {
         .client()
         .execute_emergency_action(&emergency_admin, &action_id);
     assert!(!ok, "expired emergency admin must not execute");
+}
+
+// ----- Emergency rollback (issue #825) -----
+
+fn rollback_justification(env: &Env) -> RollbackJustification {
+    RollbackJustification {
+        evidence_hash: BytesN::from_array(env, &[0x01u8; 32]),
+        incident_hash: BytesN::from_array(env, &[0x02u8; 32]),
+        description_hash: BytesN::from_array(env, &[0u8; 32]),
+    }
+}
+
+fn setup_rollback_proposal(f: &TestFixture) -> (Vec<Address>, u32) {
+    setup_rollback_proposal_with_hash(
+        f,
+        &BytesN::from_array(&f.env, &[0xBBu8; 32]),
+    )
+}
+
+fn setup_rollback_proposal_with_hash(
+    f: &TestFixture,
+    wasm_hash: &BytesN<32>,
+) -> (Vec<Address>, u32) {
+    let signers = setup_emergency_signers(f);
+    let snapshot_id = 1u32;
+    f.create_escrow_at(1_000, f.env.ledger().timestamp(), "RBK1");
+    f.client().snapshot_state(&f.admin, &snapshot_id);
+    let proposal_id = f.client().propose_emergency_rollback(
+        &signers.get(0).unwrap(),
+        &snapshot_id,
+        wasm_hash,
+        &RollbackScope::Escrow,
+        &rollback_justification(&f.env),
+    );
+    (signers, proposal_id)
+}
+
+fn approve_technical_rollback_quorum(f: &TestFixture, signers: &Vec<Address>, proposal_id: u32) {
+    for i in 1..4 {
+        f.client()
+            .approve_technical_rollback(&signers.get(i).unwrap(), &proposal_id);
+    }
+    let rollback = f.client().get_emergency_rollback(&proposal_id).unwrap();
+    assert_eq!(rollback.technical_approval_count, 4);
+}
+
+#[test]
+fn test_emergency_rollback_rejected_without_governance() {
+    let f = TestFixture::setup_with_fee(0);
+    let (signers, proposal_id) = setup_rollback_proposal(&f);
+    approve_technical_rollback_quorum(&f, &signers, proposal_id);
+    advance_time(&f.env, ROLLBACK_COMMUNITY_REVIEW_SECS);
+
+    let executor = Address::generate(&f.env);
+    let ok = f.client().emergency_rollback(&proposal_id, &executor);
+    assert!(!ok, "rollback must fail without governance approval");
+}
+
+#[test]
+fn test_emergency_rollback_rejected_before_48h_review() {
+    let f = TestFixture::setup_with_fee(0);
+    let (signers, proposal_id) = setup_rollback_proposal(&f);
+    approve_technical_rollback_quorum(&f, &signers, proposal_id);
+
+    let governance = Address::generate(&f.env);
+    f.client()
+        .set_governance_contract(&f.admin, &governance);
+    let gov_proposal_id = 1u32;
+    f.client().link_governance_rollback_review(
+        &governance,
+        &proposal_id,
+        &gov_proposal_id,
+    );
+    f.client().mark_gov_rollback_approved(
+        &governance,
+        &proposal_id,
+        &gov_proposal_id,
+    );
+
+    advance_time(&f.env, ROLLBACK_COMMUNITY_REVIEW_SECS - 1);
+    let executor = Address::generate(&f.env);
+    let ok = f.client().emergency_rollback(&proposal_id, &executor);
+    assert!(!ok, "rollback must fail before 48h community review elapses");
+}
+
+#[test]
+#[should_panic(expected = "Snapshot outside 24h rollback window")]
+fn test_rollback_rejects_snapshot_outside_24h_window() {
+    let f = TestFixture::setup_with_fee(0);
+    let signers = setup_emergency_signers(&f);
+    let snapshot_id = 1u32;
+    f.create_escrow_at(1_000, f.env.ledger().timestamp(), "RBK2");
+    f.client().snapshot_state(&f.admin, &snapshot_id);
+    advance_time(&f.env, ROLLBACK_MAX_WINDOW_SECS + 1);
+
+    let wasm_hash = BytesN::from_array(&f.env, &[0xCCu8; 32]);
+    f.client().propose_emergency_rollback(
+        &signers.get(0).unwrap(),
+        &snapshot_id,
+        &wasm_hash,
+        &RollbackScope::Escrow,
+        &rollback_justification(&f.env),
+    );
+}
+
+#[test]
+fn test_emergency_rollback_ready_after_full_authorization() {
+    let f = TestFixture::setup_with_fee(0);
+    let (signers, proposal_id) = setup_rollback_proposal(&f);
+    approve_technical_rollback_quorum(&f, &signers, proposal_id);
+
+    let governance = Address::generate(&f.env);
+    f.client()
+        .set_governance_contract(&f.admin, &governance);
+    let gov_proposal_id = 7u32;
+    f.client().link_governance_rollback_review(
+        &governance,
+        &proposal_id,
+        &gov_proposal_id,
+    );
+    f.client().mark_gov_rollback_approved(
+        &governance,
+        &proposal_id,
+        &gov_proposal_id,
+    );
+    advance_time(&f.env, ROLLBACK_COMMUNITY_REVIEW_SECS);
+
+    let rollback = f.client().get_emergency_rollback(&proposal_id).unwrap();
+    assert!(rollback.governance_approved);
+    assert_eq!(rollback.technical_approval_count, 4);
+    assert!(f.env.ledger().timestamp() >= rollback.review_ends_at);
+    assert!(f.client().validate_rollback_request(&proposal_id));
+
+    let (preserved_audits, preserved_logs) = f.client().preserve_audit_data(&proposal_id);
+    assert!(preserved_logs >= 1);
+    assert_eq!(preserved_audits, 0);
 }
 
 // =======================================================================
