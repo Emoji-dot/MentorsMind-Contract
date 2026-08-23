@@ -1,4 +1,6 @@
 #![no_std]
+#![allow(deprecated)] // Temporarily allow deprecated Events::publish until we migrate to #[contractevent]
+#![allow(unexpected_cfgs)] // kani proofs use #[cfg(kani)] injected by the cargo-kani driver
 use multisig_admin::MultisigAdminContractClient;
 use shared::events::{
     emit_timelock_event, evt_timelock_adm_xfr, evt_timelock_cancel, evt_timelock_emerg_cancel,
@@ -405,7 +407,7 @@ impl TimelockController {
         self::validate_guardian_override_limit(&env, &guardian_multisig, now)?;
 
         // Record guardian action in audit trail
-        let action_id = self::record_guardian_action(
+        let _action_id = self::record_guardian_action(
             &env,
             &guardian_multisig,
             &operation_id,
@@ -616,7 +618,7 @@ fn validate_guardian_override_limit(env: &Env, guardian: &Address, now: u64) -> 
     // Count overrides within the current 30-day period
     let mut count = 0u32;
     for timestamp in stored_timestamps.iter() {
-        if *timestamp >= period_start {
+        if timestamp >= period_start {
             count += 1;
         }
     }
@@ -629,8 +631,8 @@ fn validate_guardian_override_limit(env: &Env, guardian: &Address, now: u64) -> 
     // Record this timestamp
     let mut new_timestamps = Vec::new(env);
     for timestamp in stored_timestamps.iter() {
-        if *timestamp >= period_start {
-            new_timestamps.push_back(*timestamp);
+        if timestamp >= period_start {
+            new_timestamps.push_back(timestamp);
         }
     }
     new_timestamps.push_back(now);

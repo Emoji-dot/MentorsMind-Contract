@@ -128,12 +128,12 @@ jobs:
             --workspace .
           echo "Baseline snapshot updated."
 
-      # Commit new/updated snapshots back to the repo (main branch and manual trigger).
+      # Commit snapshots only on main pushes or explicit baseline updates.
+      # PRs (especially from forks) cannot push back to the head branch.
       - name: Commit snapshots
         if: >
           (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-          (github.event_name == 'workflow_dispatch' && github.event.inputs.update_baseline == 'true') ||
-          env.INITIAL_BASELINE == 'true'
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.update_baseline == 'true')
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: 'chore(storage): update schema snapshots [${{ github.sha }}]'
@@ -174,28 +174,33 @@ jobs:
                 : '## ❌ Storage Migration Validation\n\nValidation failed — check the workflow logs.';
             }
 
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-            });
-
-            const existing = comments.find(c =>
-              c.user.type === 'Bot' && c.body.includes('Storage Migration Validation')
-            );
-
-            if (existing) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: existing.id,
-                body,
-              });
-            } else {
-              await github.rest.issues.createComment({
+            try {
+              const { data: comments } = await github.rest.issues.listComments({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: context.issue.number,
-                body,
               });
+
+              const existing = comments.find(c =>
+                c.user.type === 'Bot' && c.body.includes('Storage Migration Validation')
+              );
+
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: existing.id,
+                  body,
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body,
+                });
+              }
+            } catch (error) {
+              // Fork PRs often lack issues:write — don't fail the job on comment ACL errors.
+              console.error('Failed to post storage migration PR comment:', error.message);
             }

@@ -145,6 +145,8 @@ pub enum DataKey {
     AppealArbitrator(u64),
     /// Optional hash explaining why the appellant requested an appeal.
     AppealReasonHash(u64),
+    /// Optional health dashboard notified of dispute lifecycle events.
+    HealthDashboard,
 }
 
 #[contractclient(name = "EscrowContractClient")]
@@ -187,6 +189,8 @@ pub enum Error {
     AppealAlreadySubmitted   = 13,
     /// A governance contract has not been configured for appeal arbitration.
     GovernanceContractNotConfigured = 14,
+    /// No alternative arbitrator is available for an appeal.
+    NoAlternativeArbitrator = 15,
 }
 
 #[contract]
@@ -588,8 +592,6 @@ impl DisputeEvidenceContract {
     /// Compute a sequential Merkle root over the evidence set:
     /// `sha256(sha256(item_1) || sha256(item_2) || ... || sha256(item_n))`
     fn compute_evidence_root(env: &Env, evidence: &Vec<EvidenceItem>) -> BytesN<32> {
-        use soroban_sdk::crypto::sha256;
-
         // Hash each evidence item individually, then concatenate and hash the
         // result to produce a single root commitment.
         let mut combined = soroban_sdk::Bytes::new(env);
@@ -597,11 +599,11 @@ impl DisputeEvidenceContract {
             let mut item_bytes = soroban_sdk::Bytes::new(env);
             // Include content_hash + evidence_uri_hash + submitted_at in the
             // item leaf so any field modification invalidates the root.
-            item_bytes.extend_from_slice(&item.content_hash.to_bytes());
-            item_bytes.extend_from_slice(&item.evidence_uri_hash.to_bytes());
+            item_bytes.append(&item.content_hash.clone().into());
+            item_bytes.append(&item.evidence_uri_hash.clone().into());
             item_bytes.extend_from_array(&item.submitted_at.to_be_bytes());
-            let leaf = sha256(&item_bytes);
-            combined.extend_from_slice(&leaf.to_bytes());
+            let leaf = env.crypto().sha256(&item_bytes);
+            combined.append(&leaf.clone().into());
         }
 
         if combined.len() == 0 {
@@ -609,7 +611,7 @@ impl DisputeEvidenceContract {
             return BytesN::from_array(env, &[0u8; 32]);
         }
 
-        sha256(&combined)
+        env.crypto().sha256(&combined).into()
     }
 
     /// Return the stored Merkle root for `escrow_id`, or zero if no evidence
@@ -727,7 +729,7 @@ impl DisputeEvidenceContract {
         dispute_id: u64,
         original_arbitrator: &Address,
     ) -> Result<Address, Error> {
-        let mut candidate: Address = GovernanceContractClient::new(env, governance)
+        let candidate: Address = GovernanceContractClient::new(env, governance)
             .select_arbitrator(&dispute_id);
         if &candidate != original_arbitrator {
             return Ok(candidate);

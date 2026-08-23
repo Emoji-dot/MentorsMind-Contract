@@ -1,6 +1,6 @@
 /// Report renderer — produces both JSON and a Markdown migration report.
 
-use crate::storage_validator::types::{MigrationReport, SchemaSnapshot, Severity};
+use crate::types::{MigrationReport, SchemaSnapshot, Severity};
 use std::fs;
 
 const REPORTS_DIR: &str = "storage-snapshots";
