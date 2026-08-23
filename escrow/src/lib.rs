@@ -11,7 +11,9 @@ use shared::{
     EMERGENCY_THRESHOLD, MAX_SNAPSHOTS, StateMachine, EscrowTransitionLog, GasEstimate, Validator,
     ReleaseFailure, FailureClassification, RecoveryState, calculate_backoff_delay,
     classify_failure, calculate_next_retry, compute_failure_hash, MAX_AUTO_RELEASE_ATTEMPTS,
-    MANUAL_RECOVERY_THRESHOLD,
+    MANUAL_RECOVERY_THRESHOLD, StateTransitionContext, PreConditionCheck, PostConditionCheck,
+    CrossContractStateCheck, StateTransitionProof, InvalidStateRecord, compute_transition_proof_hash,
+    all_checkpoints_passed, is_transition_expired, STATE_TRANSITION_TIMEOUT_SECS,
 };
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, Bytes, Env, Symbol, Vec,
@@ -292,6 +294,14 @@ pub enum DataKey {
     FailureRecord(u64),
     /// Watchlist of escrow IDs reported as stuck (after grace period elapsed).
     StuckEscrows,
+    /// ATOMIC STATE TRANSITIONS: Lock for concurrent modification prevention
+    StateTransitionLock(u64),
+    /// ATOMIC STATE TRANSITIONS: Context for active transition
+    StateTransitionContext(u64),
+    /// ATOMIC STATE TRANSITIONS: Invalid state recovery records
+    InvalidStateRecord(u64),
+    /// ATOMIC STATE TRANSITIONS: Cross-contract state verification
+    CrossContractStateCheck(u64),
     // -----------------------------------------------------------------------
     // Disaster-recovery keys
     // -----------------------------------------------------------------------
@@ -2204,6 +2214,30 @@ impl EscrowContract {
         Self::_get_failure_record(&env, escrow_id).map(|f| f.next_retry_time)
     }
 
+    // -----------------------------------------------------------------------
+    // Atomic State Transition View Functions
+    // -----------------------------------------------------------------------
+
+    /// Get the current state transition context for an escrow
+    pub fn get_state_transition_context(env: Env, escrow_id: u64) -> Option<StateTransitionContext> {
+        env.storage().persistent().get(&DataKey::StateTransitionContext(escrow_id))
+    }
+
+    /// Check if an escrow is currently locked for state transition
+    pub fn is_state_transition_locked(env: Env, escrow_id: u64) -> bool {
+        env.storage().persistent().get::<_, bool>(&DataKey::StateTransitionLock(escrow_id)).unwrap_or(false)
+    }
+
+    /// Get invalid state recovery record for an escrow (if any)
+    pub fn get_invalid_state_record(env: Env, escrow_id: u64) -> Option<InvalidStateRecord> {
+        env.storage().persistent().get(&DataKey::InvalidStateRecord(escrow_id))
+    }
+
+    /// Check if an escrow has an invalid state requiring recovery
+    pub fn has_invalid_state(env: Env, escrow_id: u64) -> bool {
+        env.storage().persistent().get::<_, InvalidStateRecord>(&DataKey::InvalidStateRecord(escrow_id)).is_some()
+    }
+
     /// Return the current stuck-escrows watchlist as a `Vec<u64>` of
     /// escrow IDs.
     pub fn get_stuck_escrows(env: Env) -> Vec<u64> {
@@ -3763,6 +3797,208 @@ fn transition_status(
     final_status
 }
 
+
+// ---------------------------------------------------------------------------
+// Atomic State Transition Validation and Recovery
+// ---------------------------------------------------------------------------
+
+impl EscrowContract {
+    /// Acquire a state transition lock for an escrow to prevent concurrent modifications
+    fn acquire_state_lock(env: &Env, escrow_id: u64, caller: &Address) -> Result<StateTransitionContext, &'static str> {
+        let now = env.ledger().timestamp();
+        let timeout_at = now.saturating_add(STATE_TRANSITION_TIMEOUT_SECS);
+        
+        // Check if lock already exists
+        if env.storage().persistent().has(&DataKey::StateTransitionLock(escrow_id)) {
+            return Err("State transition lock already held for this escrow");
+        }
+        
+        // Generate unique transition ID
+        let mut payload = Bytes::new(env);
+        payload.append(&caller.clone().to_xdr(env));
+        payload.append(&escrow_id.to_xdr(env));
+        payload.append(&now.to_xdr(env));
+        let transition_id: BytesN<32> = env.crypto().sha256(&payload).into();
+        
+        // Create transition context
+        let context = StateTransitionContext {
+            transition_id: transition_id.clone(),
+            entity_id: escrow_id,
+            pre_state: Symbol::new(env, "pending"),
+            post_state: Symbol::new(env, "pending"),
+            started_at: now,
+            timeout_at,
+            checkpoints_passed: 0,
+            total_checkpoints: 3, // Default: precondition, execution, postcondition
+            lock_holder: caller.clone(),
+            rollback_initiated: false,
+        };
+        
+        // Store lock and context
+        env.storage().persistent().set(&DataKey::StateTransitionLock(escrow_id), &true);
+        env.storage().persistent().set(&DataKey::StateTransitionContext(escrow_id), &context.clone());
+        env.storage().persistent().extend_ttl(&DataKey::StateTransitionLock(escrow_id), ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        env.storage().persistent().extend_ttl(&DataKey::StateTransitionContext(escrow_id), ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        
+        Ok(context)
+    }
+    
+    /// Release a state transition lock after successful completion
+    fn release_state_lock(env: &Env, escrow_id: u64) -> Result<(), &'static str> {
+        env.storage().persistent().remove(&DataKey::StateTransitionLock(escrow_id));
+        env.storage().persistent().remove(&DataKey::StateTransitionContext(escrow_id));
+        Ok(())
+    }
+    
+    /// Mark a checkpoint as passed during transition
+    fn mark_transition_checkpoint(env: &Env, escrow_id: u64, checkpoint: u32) -> Result<(), &'static str> {
+        let mut context: StateTransitionContext = env.storage().persistent()
+            .get(&DataKey::StateTransitionContext(escrow_id))
+            .ok_or("No active state transition")?;
+        
+        if is_transition_expired(&context, env.ledger().timestamp()) {
+            return Err("State transition has timed out");
+        }
+        
+        context.checkpoints_passed = checkpoint;
+        env.storage().persistent().set(&DataKey::StateTransitionContext(escrow_id), &context);
+        env.storage().persistent().extend_ttl(&DataKey::StateTransitionContext(escrow_id), ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        
+        Ok(())
+    }
+    
+    /// Validate preconditions for a state transition
+    fn validate_preconditions(env: &Env, escrow_id: u64, current_status: &EscrowStatus, target_status: &EscrowStatus) -> Result<bool, &'static str> {
+        // Check that transition is valid per state machine
+        if !EscrowStatus::is_valid_transition(env, current_status, target_status) {
+            return Ok(false);
+        }
+        
+        // Check escrow exists and is in expected state
+        let key = (symbol_short!("ESCROW"), escrow_id);
+        let escrow: Escrow = env.storage().persistent()
+            .get(&key)
+            .ok_or("Escrow not found")?;
+        
+        if escrow.status != *current_status {
+            return Ok(false);
+        }
+        
+        // Validate amount constraints
+        if escrow.amount <= 0 || escrow.amount > 1_000_000_000_000_000 {
+            return Ok(false);
+        }
+        
+        Ok(true)
+    }
+    
+    /// Validate postconditions for a state transition
+    fn validate_postconditions(env: &Env, escrow_id: u64, new_status: &EscrowStatus) -> Result<bool, &'static str> {
+        let key = (symbol_short!("ESCROW"), escrow_id);
+        let escrow: Escrow = env.storage().persistent()
+            .get(&key)
+            .ok_or("Escrow not found")?;
+        
+        // Verify state changed to expected value
+        if escrow.status != *new_status {
+            return Ok(false);
+        }
+        
+        // Verify amounts are consistent
+        if escrow.status == EscrowStatus::Released {
+            if escrow.net_amount <= 0 || escrow.platform_fee < 0 {
+                return Ok(false);
+            }
+            if escrow.net_amount + escrow.platform_fee != escrow.amount {
+                return Ok(false);
+            }
+        }
+        
+        Ok(true)
+    }
+    
+    /// Verify cross-contract state consistency
+    fn verify_cross_contract_consistency(env: &Env, escrow_id: u64) -> Result<bool, &'static str> {
+        let key = (symbol_short!("ESCROW"), escrow_id);
+        let escrow: Escrow = env.storage().persistent()
+            .get(&key)
+            .ok_or("Escrow not found")?;
+        
+        // Check reputation contract state if configured
+        if let Some(reputation) = env.storage().persistent().get::<_, Address>(&DataKey::ReputationContract) {
+            let result = env.try_invoke_contract::<bool, soroban_sdk::Error>(
+                &reputation,
+                &Symbol::new(env, "is_session_consistent"),
+                (escrow.id, escrow.mentor.clone(), escrow.learner.clone()).into_val(env),
+            );
+            
+            match result {
+                Ok(Ok(consistent)) => {
+                    if !consistent {
+                        return Ok(false);
+                    }
+                }
+                _ => return Ok(false),
+            }
+        }
+        
+        Ok(true)
+    }
+    
+    /// Detect invalid states and create recovery records
+    fn detect_and_record_invalid_state(env: &Env, escrow_id: u64) -> Result<Option<InvalidStateRecord>, &'static str> {
+        let key = (symbol_short!("ESCROW"), escrow_id);
+        let escrow: Escrow = env.storage().persistent()
+            .get(&key)
+            .ok_or("Escrow not found")?;
+        
+        // Check if current state is reachable from valid transitions
+        let valid_states = [EscrowStatus::Pending, EscrowStatus::Active, EscrowStatus::Released, 
+                           EscrowStatus::Disputed, EscrowStatus::Resolved, EscrowStatus::Refunded];
+        
+        let is_valid = valid_states.iter().any(|state| state == &escrow.status);
+        
+        if !is_valid {
+            let record = InvalidStateRecord {
+                entity_id: escrow_id,
+                invalid_state: Symbol::new(env, "unknown"),
+                expected_valid_states: valid_states.len() as u32,
+                detected_at: env.ledger().timestamp(),
+                recovery_attempted: false,
+                recovery_successful: false,
+                invalidity_reason: Symbol::new(env, "unknown_state"),
+            };
+            
+            env.storage().persistent().set(&DataKey::InvalidStateRecord(escrow_id), &record.clone());
+            env.storage().persistent().extend_ttl(&DataKey::InvalidStateRecord(escrow_id), ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+            
+            return Ok(Some(record));
+        }
+        
+        Ok(None)
+    }
+    
+    /// Attempt automatic recovery for invalid states
+    fn attempt_invalid_state_recovery(env: &Env, escrow_id: u64) -> Result<bool, &'static str> {
+        let key = (symbol_short!("ESCROW"), escrow_id);
+        let mut escrow: Escrow = env.storage().persistent()
+            .get(&key)
+            .ok_or("Escrow not found")?;
+        
+        // Attempt to recover by resetting to a known valid state
+        // For now, if escrow is in Released or Resolved, consider it recovered
+        if escrow.status == EscrowStatus::Released || escrow.status == EscrowStatus::Resolved {
+            if let Some(mut record) = env.storage().persistent().get::<_, InvalidStateRecord>(&DataKey::InvalidStateRecord(escrow_id)) {
+                record.recovery_attempted = true;
+                record.recovery_successful = true;
+                env.storage().persistent().set(&DataKey::InvalidStateRecord(escrow_id), &record);
+            }
+            return Ok(true);
+        }
+        
+        Ok(false)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Tests
