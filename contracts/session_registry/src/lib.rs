@@ -40,6 +40,8 @@ pub struct SessionRecord {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Session(Symbol),
     /// Deprecated: kept for backward compat, no longer written to.
     /// Use `MentorSessionAt` / `MentorSessionCount` for all new reads/writes.

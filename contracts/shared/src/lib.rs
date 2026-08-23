@@ -80,6 +80,11 @@ pub use staking::{
     BASIS_POINTS, PATTERN_DETECTION_WINDOW, SUSPICIOUS_CYCLE_THRESHOLD_SECS,
 };
 pub use storage::{EternalStorage, StorageType, InstanceKey, PersistentKey, TempKey};
+pub use storage::{
+    CollisionDetector, CollisionDetector as CollisionDetection, SecureStorageAccess,
+    StorageAccessControl, StorageIntegrity, StorageKeyDerivation, StorageKeyFingerprint,
+    StorageIntegrityRecord, StorageNamespace, StorageSecurityError, STORAGE_DERIVE_CTX,
+};
 pub use storage_compatibility::{
     CompatibilityError, CompatibilityReport, CompatibilityValidator, GradualMigrationStatus,
     MigrationScript, StorageField, StorageFieldType, StorageLayoutSchema, StorageVersion,

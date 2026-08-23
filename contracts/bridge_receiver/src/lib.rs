@@ -15,6 +15,8 @@ pub struct BridgeConfig {
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Config,
     ProcessedVAA(BytesN<32>),
     WrappedToken,

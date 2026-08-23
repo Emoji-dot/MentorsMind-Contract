@@ -148,6 +148,8 @@ pub struct PendingUpgrade {
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     UpgradeHistory(Symbol),
     LatestVersion(Symbol),

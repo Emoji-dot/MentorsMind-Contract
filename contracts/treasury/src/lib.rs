@@ -239,6 +239,8 @@ pub const DISTRIBUTION_BUFFER_SECS: u64 = 4 * 60 * 60; // 4 hours
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     Timelock,
     StakingContract,

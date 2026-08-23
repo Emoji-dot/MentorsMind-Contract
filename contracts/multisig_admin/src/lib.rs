@@ -5,6 +5,7 @@ use shared::{
     compute_checksum, push_snapshot_index, MultisigValidation, RollbackAuthorization,
     RollbackJustification, RollbackProposal, SnapshotMeta, StateVerificationReport,
     EMERGENCY_MSIG_SIGNERS, EMERGENCY_MSIG_THRESHOLD, EMERGENCY_THRESHOLD, MAX_SNAPSHOTS,
+    SecureStorageAccess,
 };
 use soroban_sdk::{
     contract, contractimpl, contracterror, contracttype, symbol_short, Address, Bytes, BytesN,
@@ -69,6 +70,8 @@ const EXPIRY_SECONDS: u64 = 7 * 24 * 60 * 60; // 7 days
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Threshold,
     SignerCount,
     ProposalCount,
@@ -128,6 +131,8 @@ impl MultisigAdminContract {
         signers: Vec<Address>,
         threshold: u32,
     ) -> Result<(), Error> {
+        SecureStorageAccess::install_namespace(&env, &DataKey::NamespaceRoot, symbol_short!("mm_msig"));
+
         if env.storage().instance().has(&DataKey::Threshold) {
             return Err(Error::AlreadyInitialized);
         }

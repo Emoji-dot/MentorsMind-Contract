@@ -18,6 +18,7 @@ use shared::{
     EmergencyAuditRecord, EmergencyCircuitBreaker, EmergencyMultisig, MultisigValidation, SafeMath,
     EMERGENCY_ADMIN_TTL_SECS, EMERGENCY_MSIG_THRESHOLD, EmergencyRollback,
     ImmutableRollbackAuditRecord, RollbackAuthorization, RollbackJustification, RollbackScope,
+    SecureStorageAccess, STORAGE_DERIVE_CTX,
 };
 pub use shared::EscrowStatus;
 use soroban_sdk::{
@@ -291,6 +292,8 @@ pub struct ProposalRecordMirror {
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     Treasury,
     FeeBps,
@@ -413,6 +416,40 @@ const DEFAULT_AUTO_RELEASE_DELAY: u64 = 72 * 60 * 60;
 ///
 /// Default: 7 days (7 * 24 * 60 * 60).
 const GRACE_PERIOD_SECS: u64 = 7 * 24 * 60 * 60;
+/// Contract-specific storage namespace scope (#826).
+const ESCROW_STORAGE_SCOPE: Symbol = symbol_short!("mm_escrw");
+
+fn escrow_secure_set<V, K>(env: &Env, key: &K, value: &V)
+where
+    K: IntoVal<Env, soroban_sdk::Val>,
+    V: IntoVal<Env, soroban_sdk::Val>,
+{
+    SecureStorageAccess::set_persistent_checked(
+        env,
+        &DataKey::NamespaceRoot,
+        STORAGE_DERIVE_CTX,
+        key,
+        value,
+    )
+    .unwrap_or_else(|_| panic!("secure storage write failed"));
+}
+
+fn escrow_secure_get<V, K>(env: &Env, key: &K) -> Option<V>
+where
+    K: IntoVal<Env, soroban_sdk::Val>,
+    V: soroban_sdk::TryFromVal<Env, soroban_sdk::Val> + IntoVal<Env, soroban_sdk::Val>,
+{
+    SecureStorageAccess::get_persistent_checked(env, &DataKey::NamespaceRoot, key)
+        .unwrap_or_else(|_| panic!("secure storage read failed"))
+}
+
+fn escrow_secure_has<K>(env: &Env, key: &K) -> bool
+where
+    K: IntoVal<Env, soroban_sdk::Val>,
+{
+    SecureStorageAccess::has_persistent_checked(env, &DataKey::NamespaceRoot, key)
+        .unwrap_or(false)
+}
 
 // Approved token registry key prefix: ("APRV_TOK", address → bool
 const APPROVED_TOKEN_KEY: Symbol = symbol_short!("APRV_TOK");
@@ -486,6 +523,8 @@ impl EscrowContract {
         approved_tokens: soroban_sdk::Vec<Address>,
         auto_release_delay_secs: u64,
     ) {
+        SecureStorageAccess::install_namespace(&env, &DataKey::NamespaceRoot, ESCROW_STORAGE_SCOPE);
+
         if env.storage().persistent().has(&DataKey::Admin) {
             panic!("Already initialized");
         }

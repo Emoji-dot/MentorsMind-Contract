@@ -19,6 +19,8 @@ pub enum BadgeType {
 
 #[contracttype]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     Backend,
     MentorBadge(Address, BadgeType),

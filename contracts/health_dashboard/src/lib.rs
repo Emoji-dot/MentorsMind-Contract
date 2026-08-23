@@ -84,6 +84,8 @@ pub struct InterfaceEntry {
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Config,
     /// `(ledger_sequence, cached stats)` — invalidated when ledger advances.
     Cache,

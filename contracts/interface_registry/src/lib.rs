@@ -5,6 +5,8 @@ use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, Ve
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     Interface(Symbol),
     InterfaceIds,
