@@ -28,6 +28,7 @@ pub mod interface_id;
 pub mod validation;
 pub mod reputation;
 pub mod failure_tracking;
+pub mod atomic_state;
 
 pub use admin::{
     AdminChangeProposal, AdminTransfer, ADMIN_COOLING_OFF_SECS, MIN_ADMIN_TIMELOCK_SECS,
@@ -94,6 +95,12 @@ pub use failure_tracking::{
     ReleaseFailure, FailureClassification, ExponentialBackoff, RecoveryState,
     calculate_backoff_delay, classify_failure, calculate_next_retry, compute_failure_hash,
     MAX_AUTO_RELEASE_ATTEMPTS, MANUAL_RECOVERY_THRESHOLD,
+};
+pub use atomic_state::{
+    StateTransitionContext, PreConditionCheck, PostConditionCheck, CrossContractStateCheck,
+    StateTransitionProof, InvalidStateRecord, AtomicStateValidator, compute_transition_proof_hash,
+    all_checkpoints_passed, is_transition_expired, STATE_TRANSITION_TIMEOUT_SECS,
+    STATE_TRANSITION_LOCK_TTL, MAX_CHECKPOINT_COUNT,
 };
 
 /// Economic sanity ceiling for a single financial amount (token smallest units).
