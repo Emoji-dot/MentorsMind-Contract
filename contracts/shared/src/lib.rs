@@ -11,6 +11,7 @@ pub mod admin;
 pub mod cross_contract_auth;
 pub mod disaster_recovery;
 pub mod emergency;
+pub mod emergency_rollback;
 pub mod escrow;
 pub mod events;
 pub mod gas_estimation;
@@ -42,6 +43,11 @@ pub use emergency::{
     EmergencyMultisig, MultisigValidation, EMERGENCY_ADMIN_TTL_SECS, EMERGENCY_CIRCUIT_WINDOW_SECS,
     EMERGENCY_MSIG_SIGNERS, EMERGENCY_MSIG_THRESHOLD, EMERGENCY_RELEASE_CAP_BPS,
     EMERGENCY_TIMELOCK_SECS,
+};
+pub use emergency_rollback::{
+    EmergencyRollback, ImmutableRollbackAuditRecord, RollbackAuthorization, RollbackJustification,
+    RollbackScope, ROLLBACK_COMMUNITY_REVIEW_SECS, ROLLBACK_GOVERNANCE_QUORUM_BPS,
+    ROLLBACK_MAX_WINDOW_SECS,
 };
 pub use safe_math::SafeMath;
 pub use cross_contract_auth::{ContractRegistry, CrossContractAuth, InterfaceRegistryLookup};

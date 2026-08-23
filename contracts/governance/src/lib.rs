@@ -9,7 +9,7 @@ use shared::events::{
     evt_gov_proposal_passed, evt_gov_proposal_queued, evt_gov_timelock_set,
     evt_gov_vote_cast,
 };
-use shared::{GasEstimate, StateMachine};
+use shared::{GasEstimate, StateMachine, ROLLBACK_GOVERNANCE_QUORUM_BPS};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, vec, Address, Bytes,
     BytesN, Env, IntoVal, Symbol, Vec,
@@ -120,6 +120,8 @@ pub enum ProposalAction {
     AddAsset(Address),
     UpdateAdmin(Address),
     ExecuteCall(Address, Symbol, Vec<u64>),
+    /// Approve an escrow emergency rollback after community review.
+    ApproveEmergencyRollback(Address, u32),
 }
 
 #[contracttype]
@@ -766,7 +768,12 @@ impl GovernanceContract {
             panic!("proposal not executable");
         }
 
-        let quorum_bps: u32 = if env
+        let quorum_bps: u32 = if matches!(
+            proposal.action,
+            ProposalAction::ApproveEmergencyRollback(_, _)
+        ) {
+            ROLLBACK_GOVERNANCE_QUORUM_BPS
+        } else if env
             .storage()
             .persistent()
             .get::<_, bool>(&DataKey::CustomProposal(proposal_id))
@@ -875,7 +882,7 @@ impl GovernanceContract {
 
             emit_governance_event(&env, evt_gov_proposal_queued(&env), op_id);
         } else {
-            Self::apply_action(&env, &proposal.action);
+            Self::apply_action(&env, &proposal.action, proposal_id);
             Self::transition_proposal_status(&env, &mut proposal, ProposalStatus::Executed);
 
             env.storage()
@@ -902,13 +909,42 @@ impl GovernanceContract {
             panic!("proposal not queued");
         }
 
-        Self::apply_action(&env, &proposal.action);
+        Self::apply_action(&env, &proposal.action, proposal_id);
         Self::transition_proposal_status(&env, &mut proposal, ProposalStatus::Executed);
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
 
         emit_governance_event(&env, evt_gov_proposal_executed(&env), true);
+    }
+
+    /// Open a governance review for an escrow emergency rollback request.
+    pub fn propose_rollback_review(
+        env: Env,
+        proposer: Address,
+        title: Bytes,
+        description_hash: BytesN<32>,
+        escrow_contract: Address,
+        escrow_rollback_id: u32,
+    ) -> u32 {
+        proposer.require_auth();
+        let action =
+            ProposalAction::ApproveEmergencyRollback(escrow_contract.clone(), escrow_rollback_id);
+        let proposal_id = Self::create_proposal(env.clone(), proposer, title, description_hash, action);
+        env.storage()
+            .persistent()
+            .set(&DataKey::CustomProposal(proposal_id), &true);
+        env.invoke_contract::<()>(
+            &escrow_contract,
+            &Symbol::new(&env, "link_governance_rollback_review"),
+            (
+                env.current_contract_address(),
+                escrow_rollback_id,
+                proposal_id,
+            )
+                .into_val(&env),
+        );
+        proposal_id
     }
 
     /// Cancel a non-executed proposal.
@@ -1400,7 +1436,7 @@ impl GovernanceContract {
         env.invoke_contract::<i128>(&token, &fn_name, args)
     }
 
-    fn apply_action(env: &Env, action: &ProposalAction) {
+    fn apply_action(env: &Env, action: &ProposalAction, proposal_id: u32) {
         match action {
             ProposalAction::UpdateFee(new_fee_bps) => {
                 env.storage().instance().set(&CURRENT_FEE_BPS, new_fee_bps);
@@ -1420,6 +1456,18 @@ impl GovernanceContract {
             }
             ProposalAction::ExecuteCall(target, function, _) => {
                 env.invoke_contract::<soroban_sdk::Val>(target, function, vec![env]);
+            }
+            ProposalAction::ApproveEmergencyRollback(escrow, rollback_id) => {
+                env.invoke_contract::<()>(
+                    escrow,
+                    &Symbol::new(env, "mark_gov_rollback_approved"),
+                    (
+                        env.current_contract_address(),
+                        *rollback_id,
+                        proposal_id,
+                    )
+                        .into_val(env),
+                );
             }
         }
     }
