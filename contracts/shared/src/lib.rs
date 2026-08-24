@@ -33,6 +33,10 @@ pub mod atomic_state;
 pub mod community_protection;
 pub mod pricing_protection;
 pub mod privacy_protection;
+pub mod network_authenticity;
+pub mod competency_validation;
+pub mod benchmark_integrity;
+pub mod emergency_response_protection;
 
 pub use admin::{
     AdminChangeProposal, AdminTransfer, ADMIN_COOLING_OFF_SECS, MIN_ADMIN_TIMELOCK_SECS,
