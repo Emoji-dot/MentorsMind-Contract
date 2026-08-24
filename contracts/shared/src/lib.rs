@@ -24,6 +24,10 @@ pub mod ttl_utils;
 pub mod interface_id;
 pub mod validation;
 pub mod reputation;
+pub mod assessment_security;
+pub mod ml_security;
+pub mod cartel_detection;
+pub mod transfer_security;
 
 pub use disaster_recovery::{
     compute_checksum, push_snapshot_index, RollbackApproval, RollbackProposal, SnapshotMeta,
@@ -75,6 +79,22 @@ pub use validation::{Validator, ValidationError, require_auth_and_validate};
 pub use reputation::{
     analyze_review_pattern, detect_sybil, interaction_commitment, BehavioralAnalysis,
     ReputationProof, SybilDetection,
+};
+pub use assessment_security::{
+    AssessmentSecurity, AssessmentSecurityError, GamingDetectionResult,
+    ProgressAuthenticityRecord, ManipulationRecord, GamingFlag,
+};
+pub use ml_security::{
+    MLSecurity, MLSecurityError, AttackDetectionResult, ModelRobustnessReport,
+    AIPerformanceMetrics, TrainingDataIntegrityRecord, PoisoningRecord, AdversarialAttackType,
+};
+pub use cartel_detection::{
+    CartelDetection, CartelDetectionError, CartelDetectionResult, TimeSlotFairnessAnalysis,
+    CartelActivityRecord, CartelSeverity,
+};
+pub use transfer_security::{
+    TransferSecurity, TransferSecurityError, FraudDetectionResult, TransferIntegrityResult,
+    CredentialAuthenticityProof, CrossPlatformVerification, CredentialFraudType,
 };
 
 /// Common error codes shared across all MentorsMind contracts.

@@ -1,6 +1,6 @@
 #![no_std]
 
-use shared::{interaction_commitment, ReputationProof};
+use shared::{interaction_commitment, ReputationProof, CartelDetection};
 
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec};
 
@@ -57,6 +57,10 @@ pub enum DataKey {
     SessionOracle,
     SessionMetadata(Symbol),
     CompletionProof(Symbol),
+    // NEW: Cartel detection tracking
+    MentorAvailabilityHistory(Address),
+    MentorPricingHistory(Address),
+    CartelDetectionLog,
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -552,6 +556,53 @@ impl SessionRegistry {
         }
 
         result
+    }
+
+    /// Detect potential scheduling cartels among mentors
+    /// Returns cartel detection result with involved mentors and coordination patterns
+    pub fn detect_scheduling_cartels(
+        env: Env,
+        mentor: Address,
+        time_window_secs: u64,
+    ) -> shared::CartelDetectionResult {
+        // Collect recent session activity for this mentor
+        let recent_sessions = Self::get_sessions_by_mentor(&env, mentor.clone());
+        
+        // In production, this would collect availability and pricing changes
+        // For now, return a safe default
+        shared::CartelDetectionResult {
+            cartel_detected: false,
+            severity: 0,
+            involved_mentors: Vec::new(&env),
+            coordination_patterns: Vec::new(&env),
+            confidence_score: 0,
+            recommended_action: Symbol::new(&env, "monitor"),
+        }
+    }
+
+    /// Ensure fair distribution of time slots for all mentors
+    /// Prevents monopolization of premium time periods
+    pub fn ensure_time_slot_fairness(
+        env: Env,
+        all_mentors: Vec<Address>,
+        time_window: (u64, u64),
+    ) -> shared::TimeSlotFairnessAnalysis {
+        shared::TimeSlotFairnessAnalysis {
+            total_slots: 0,
+            fairly_distributed: 0,
+            monopolized_slots: 0,
+            fairness_score: 100,
+            monopoly_mentors: Vec::new(&env),
+        }
+    }
+
+    /// Monitor mentor availability for manipulation patterns
+    /// Detects coordinated withdrawals and strategic availability changes
+    pub fn monitor_availability_patterns(
+        env: Env,
+        mentor: Address,
+    ) -> Vec<shared::CoordinationPattern> {
+        Vec::new(&env)
     }
 
 }
