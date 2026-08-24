@@ -1,10 +1,15 @@
 #![no_std]
 
 use shared::{
-    detect_coordination, detect_price_coordination, evaluate_fair_access, interaction_commitment,
+    compute_scalability_intervention, detect_coordination,
+    detect_resource_competition as shared_detect_resource_competition, detect_price_coordination,
+    distribute_resources_fairly as shared_distribute_resources_fairly, evaluate_fair_access,
+    interaction_commitment, is_performance_restoration_eligible,
+    validate_load_pattern as shared_validate_load_pattern,
     verify_demand_authenticity as shared_verify_demand_authenticity, CoordinationFlag,
-    DemandAuthenticity, FairAccessDecision, PriceCoordinationFlag, ReputationProof,
-    SocialProofRecord,
+    DemandAuthenticity, FairAccessDecision, FairResourceAllocation, LoadValidationResult,
+    PerformanceInterventionRecord, PriceCoordinationFlag, ReputationProof,
+    ResourceCompetitionFlag, SocialProofRecord, PERFORMANCE_RESTORATION_COOLDOWN_SECS,
 };
 
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec};
@@ -17,6 +22,9 @@ const TTL_BUMP: u32 = 1_000_000;
 const SLOT_SIZE_SECS: u64 = 1_800;
 /// Minimum free time required between consecutive sessions on the same mentor.
 const SCHEDULING_BUFFER_SECS: u64 = 900;
+/// Rolling window used to compute a mentor's booking-request rate for
+/// load-attack validation (#scalability-protection).
+const LOAD_MONITORING_WINDOW_SECS: u64 = 300;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 #[contracttype]
@@ -78,6 +86,15 @@ pub enum DataKey {
     /// mentors, used for pricing-coordination detection.
     RecentSessionPrices,
     RecentSessionPriceTimestamps,
+    /// Cached resource-competition assessment for a mentor's booking load
+    /// (#scalability-protection).
+    SystemLoadRecord(Address),
+    /// Rolling total requested booking-capacity units (duration-minutes) for
+    /// a mentor, used for fair-resource-distribution scoring.
+    MentorTotalRequestedUnits(Address),
+    /// Cached combined performance-protection intervention record for a
+    /// mentor.
+    PerformanceIntervention(Address),
 }
 
 /// Maximum length of the rolling price/pair/request logs kept for scoring.
@@ -141,6 +158,16 @@ impl SessionRegistry {
         if !access.access_granted {
             panic!("CommunityAccessRestricted");
         }
+
+        // Scalability protection: track requested booking-capacity units and
+        // re-score this mentor's resource-competition/load risk before
+        // committing state (#scalability-protection).
+        let total_units_key = DataKey::MentorTotalRequestedUnits(mentor.clone());
+        let total_units: u32 = env.storage().persistent().get(&total_units_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&total_units_key, &total_units.saturating_add(duration_mins));
+        Self::manage_system_load(env.clone(), mentor.clone());
 
         let record = SessionRecord {
             session_id: session_id.clone(),
@@ -607,6 +634,132 @@ impl SessionRegistry {
             .get(&DataKey::RecentSessionPriceTimestamps)
             .unwrap_or(Vec::new(&env));
         detect_price_coordination(&prices, &timestamps)
+    }
+
+    // ─── Scalability protection (#scalability-protection) ──────────────────
+
+    /// Detect resource competition/griefing on `mentor`'s booking load from
+    /// request timestamps: a burst of requests from a narrow set of
+    /// learners is treated as unfair competition rather than organic
+    /// demand. Safe to call by anyone as a read-through audit; also invoked
+    /// internally on every `register_session`.
+    pub fn manage_system_load(env: Env, mentor: Address) -> ResourceCompetitionFlag {
+        let log: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MentorRequestLog(mentor.clone()))
+            .unwrap_or(Vec::new(&env));
+        let distinct: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MentorDistinctLearnerCount(mentor.clone()))
+            .unwrap_or(0);
+        let flag = shared_detect_resource_competition(&log, distinct);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SystemLoadRecord(mentor.clone()), &flag);
+        if !flag.fair {
+            env.events().publish(
+                (symbol_short!("load"), Symbol::new(&env, "flagged")),
+                (mentor, flag.risk_score),
+            );
+        }
+        flag
+    }
+
+    /// Compute a fair booking-capacity share for `requested_units` (e.g.
+    /// requested session duration in minutes) against `mentor`'s rolling
+    /// total requested capacity, throttling any single requester attempting
+    /// to claim an unfair share of a mentor's schedule.
+    pub fn distribute_resources_fairly(
+        env: Env,
+        mentor: Address,
+        requested_units: u32,
+    ) -> FairResourceAllocation {
+        let total: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MentorTotalRequestedUnits(mentor))
+            .unwrap_or(0);
+        shared_distribute_resources_fairly(&env, requested_units, total.max(requested_units))
+    }
+
+    /// Validate whether `mentor`'s recent booking-request volume reflects
+    /// legitimate demand or a coordinated load attack on the scheduling
+    /// system.
+    pub fn validate_usage_patterns(env: Env, mentor: Address) -> LoadValidationResult {
+        let log: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MentorRequestLog(mentor))
+            .unwrap_or(Vec::new(&env));
+        let now = env.ledger().timestamp();
+        let window_start = now.saturating_sub(LOAD_MONITORING_WINDOW_SECS);
+        let mut count = 0u32;
+        for i in 0..log.len() {
+            let ts = log.get(i).unwrap_or(0);
+            if ts >= window_start {
+                count = count.saturating_add(1);
+            }
+        }
+        shared_validate_load_pattern(count, LOAD_MONITORING_WINDOW_SECS)
+    }
+
+    /// Combine the cached resource-competition and freshly-computed
+    /// load-validation signals for `mentor` into a single
+    /// performance-protection intervention decision.
+    pub fn get_performance_status(env: Env, mentor: Address) -> PerformanceInterventionRecord {
+        let competition: ResourceCompetitionFlag = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SystemLoadRecord(mentor.clone()))
+            .unwrap_or(ResourceCompetitionFlag {
+                fair: true,
+                risk_score: 0,
+                distinct_requester_bps: 10_000,
+                burst_count: 0,
+            });
+        let load = Self::validate_usage_patterns(env.clone(), mentor.clone());
+        let record = compute_scalability_intervention(
+            &env,
+            competition,
+            load,
+            PERFORMANCE_RESTORATION_COOLDOWN_SECS,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::PerformanceIntervention(mentor.clone()), &record);
+        record
+    }
+
+    /// Restore fair resource allocation for `mentor` once the
+    /// performance-protection intervention cooldown has elapsed. Only
+    /// callable by the platform backend.
+    pub fn restore_fair_performance(env: Env, mentor: Address) {
+        let backend = Self::require_backend(&env);
+        backend.require_auth();
+
+        let record: PerformanceInterventionRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PerformanceIntervention(mentor.clone()))
+            .expect("NoPerformanceInterventionOnRecord");
+
+        if !is_performance_restoration_eligible(&record, env.ledger().timestamp()) {
+            panic!("PerformanceRestorationNotEligible");
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PerformanceIntervention(mentor.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::SystemLoadRecord(mentor.clone()));
+
+        env.events().publish(
+            (symbol_short!("perfrest"), Symbol::new(&env, "restored")),
+            mentor,
+        );
     }
 
     /// Check for scheduling conflicts and buffer enforcement.

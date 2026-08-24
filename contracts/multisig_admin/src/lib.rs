@@ -2,10 +2,12 @@
 #![allow(deprecated)] // Temporarily allow deprecated Events::publish until we migrate to #[contractevent]
 
 use shared::{
-    compute_checksum, push_snapshot_index, MultisigValidation, RollbackAuthorization,
-    RollbackJustification, RollbackProposal, SnapshotMeta, StateVerificationReport,
-    EMERGENCY_MSIG_SIGNERS, EMERGENCY_MSIG_THRESHOLD, EMERGENCY_THRESHOLD, MAX_SNAPSHOTS,
-    SecureStorageAccess,
+    compute_checksum, compute_justice_intervention, protect_arbitration_fairness,
+    push_snapshot_index, ArbitrationBiasFlag, DisputeIndependenceFlag, EvidenceAuthenticity,
+    JusticeInterventionRecord, MultisigValidation, RollbackAuthorization, RollbackJustification,
+    RollbackProposal, SnapshotMeta, StateVerificationReport, EMERGENCY_MSIG_SIGNERS,
+    EMERGENCY_MSIG_THRESHOLD, EMERGENCY_THRESHOLD, JUSTICE_RESTORATION_COOLDOWN_SECS,
+    MAX_SNAPSHOTS, SecureStorageAccess,
 };
 use soroban_sdk::{
     contract, contractimpl, contracterror, contracttype, symbol_short, Address, Bytes, BytesN,
@@ -95,6 +97,23 @@ pub enum DataKey {
     GovRollbackApproval(u32, Address),
     /// Auto-incremented governance rollback proposal counter.
     GovRollbackProposalCount,
+    // -----------------------------------------------------------------------
+    // Justice-monitoring / dispute-oversight keys (#justice-protection)
+    // -----------------------------------------------------------------------
+    /// Latest recorded dispute-oversight audit for a given escrow_id.
+    DisputeAudit(u64),
+    /// Latest recorded arbitration-fairness audit for a given arbitrator.
+    ArbitratorAudit(Address),
+}
+
+/// Record of a multisig-signer-reviewed dispute oversight audit.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeOversightRecord {
+    pub escrow_id: u64,
+    pub reviewer: Address,
+    pub justice_status: JusticeInterventionRecord,
+    pub reviewed_at: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -910,6 +929,102 @@ impl MultisigAdminContract {
         } else {
             Err(Error::InvalidEmergencySignatures)
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Justice monitoring / dispute oversight (#justice-protection)
+    // -----------------------------------------------------------------------
+
+    /// Combine dispute-independence, evidence-authenticity, and
+    /// arbitration-bias signals (as computed by the dispute-evidence
+    /// contract) into a single audited justice-protection decision for
+    /// `escrow_id`, recorded under multisig oversight. Caller must be a
+    /// registered signer.
+    pub fn oversee_dispute_resolution(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        independence: DisputeIndependenceFlag,
+        evidence: EvidenceAuthenticity,
+        bias: ArbitrationBiasFlag,
+    ) -> Result<JusticeInterventionRecord, Error> {
+        if !env.storage().instance().has(&DataKey::Threshold) {
+            return Err(Error::NotInitialized);
+        }
+        if !env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Signer(caller.clone()))
+            .unwrap_or(false)
+        {
+            return Err(Error::NotSigner);
+        }
+        caller.require_auth();
+
+        let record = compute_justice_intervention(
+            &env,
+            independence,
+            evidence,
+            bias,
+            JUSTICE_RESTORATION_COOLDOWN_SECS,
+        );
+        let oversight = DisputeOversightRecord {
+            escrow_id,
+            reviewer: caller.clone(),
+            justice_status: record.clone(),
+            reviewed_at: env.ledger().timestamp(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::DisputeAudit(escrow_id), &oversight);
+        env.events().publish(
+            (symbol_short!("multisig"), symbol_short!("dsp_audit"), escrow_id),
+            (caller, record.intervene, record.combined_risk_score),
+        );
+        Ok(record)
+    }
+
+    /// Audit an arbitrator's recent ruling-favor history for systematic
+    /// bias, recording the result under multisig oversight. Caller must be
+    /// a registered signer.
+    pub fn ensure_arbitration_fairness(
+        env: Env,
+        caller: Address,
+        arbitrator: Address,
+        favor_history: Vec<bool>,
+    ) -> Result<ArbitrationBiasFlag, Error> {
+        if !env.storage().instance().has(&DataKey::Threshold) {
+            return Err(Error::NotInitialized);
+        }
+        if !env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Signer(caller.clone()))
+            .unwrap_or(false)
+        {
+            return Err(Error::NotSigner);
+        }
+        caller.require_auth();
+
+        let flag = protect_arbitration_fairness(&favor_history);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ArbitratorAudit(arbitrator.clone()), &flag);
+        env.events().publish(
+            (symbol_short!("multisig"), symbol_short!("bias_aud")),
+            (arbitrator, flag.fair, flag.bias_risk_score),
+        );
+        Ok(flag)
+    }
+
+    /// Return the last recorded dispute-oversight audit for `escrow_id`.
+    pub fn get_dispute_audit(env: Env, escrow_id: u64) -> Option<DisputeOversightRecord> {
+        env.storage().persistent().get(&DataKey::DisputeAudit(escrow_id))
+    }
+
+    /// Return the last recorded arbitration-fairness audit for `arbitrator`.
+    pub fn get_arbitrator_audit(env: Env, arbitrator: Address) -> Option<ArbitrationBiasFlag> {
+        env.storage().persistent().get(&DataKey::ArbitratorAudit(arbitrator))
     }
 }
 
