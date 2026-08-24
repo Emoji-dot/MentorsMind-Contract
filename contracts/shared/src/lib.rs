@@ -30,6 +30,9 @@ pub mod validation;
 pub mod reputation;
 pub mod failure_tracking;
 pub mod atomic_state;
+pub mod community_protection;
+pub mod pricing_protection;
+pub mod privacy_protection;
 
 pub use admin::{
     AdminChangeProposal, AdminTransfer, ADMIN_COOLING_OFF_SECS, MIN_ADMIN_TIMELOCK_SECS,
@@ -112,6 +115,31 @@ pub use atomic_state::{
     StateTransitionProof, InvalidStateRecord, AtomicStateValidator, compute_transition_proof_hash,
     all_checkpoints_passed, is_transition_expired, STATE_TRANSITION_TIMEOUT_SECS,
     STATE_TRANSITION_LOCK_TTL, MAX_CHECKPOINT_COUNT,
+};
+pub use community_protection::{
+    detect_coordination, detect_coordination_ring, validate_network_authenticity,
+    verify_social_proof, evaluate_fair_access, compute_community_intervention,
+    is_restoration_eligible, CoordinationFlag, NetworkEffectScore, SocialProofRecord,
+    FairAccessDecision, CommunityInterventionRecord, COORDINATION_MIN_INTERACTIONS,
+    COORDINATION_TIGHT_WINDOW_SECS, COORDINATION_RISK_THRESHOLD,
+    NETWORK_DISTINCT_SOURCE_MIN_BPS, NETWORK_SUSPICIOUS_GROWTH_PER_DAY,
+    SOCIAL_PROOF_BURST_WINDOW_SECS, SOCIAL_PROOF_MIN_DISTINCT_BPS,
+    COMMUNITY_INTERVENTION_THRESHOLD,
+};
+pub use pricing_protection::{
+    detect_price_coordination, validate_market_rate, enforce_fair_pricing,
+    verify_demand_authenticity, compute_pricing_intervention, PriceCoordinationFlag,
+    MarketRateValidation, FairPricingResult, DemandAuthenticity, PricingInterventionRecord,
+    PRICE_COORDINATION_WINDOW_SECS, PRICE_MATCH_TOLERANCE_BPS, PRICING_RISK_THRESHOLD,
+    DEFAULT_MAX_MARKET_DEVIATION_BPS, MAX_MARKET_DEVIATION_CEILING_BPS,
+    DEMAND_BURST_WINDOW_SECS, DEMAND_MIN_DISTINCT_BPS,
+};
+pub use privacy_protection::{
+    check_access, minimize_to_need_to_know, detect_exploitation, compute_privacy_intervention,
+    ConsentRecord, AccessDecision, PrivacyMonitoringResult, PrivacyInterventionRecord,
+    FIELD_IDENTITY, FIELD_CONTACT, FIELD_LEARNING_HISTORY, FIELD_CAREER_DATA, FIELD_PAYMENT,
+    MINIMAL_SESSION_FIELDS, ALL_FIELDS, ACCESS_MONITORING_WINDOW_SECS,
+    MAX_ACCESSES_PER_WINDOW, PRIVACY_RISK_THRESHOLD,
 };
 
 /// Economic sanity ceiling for a single financial amount (token smallest units).
