@@ -1,6 +1,11 @@
 #![no_std]
 
-use shared::{interaction_commitment, ReputationProof};
+use shared::{
+    detect_coordination, detect_price_coordination, evaluate_fair_access, interaction_commitment,
+    verify_demand_authenticity as shared_verify_demand_authenticity, CoordinationFlag,
+    DemandAuthenticity, FairAccessDecision, PriceCoordinationFlag, ReputationProof,
+    SocialProofRecord,
+};
 
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec};
 
@@ -59,7 +64,24 @@ pub enum DataKey {
     SessionOracle,
     SessionMetadata(Symbol),
     CompletionProof(Symbol),
+    /// Scheduled-at timestamps for one mentor/learner pair, used for
+    /// coordination-ring detection (#community-protection).
+    MentorLearnerLog(Address, Address),
+    MentorCoordination(Address),
+    MentorFairAccess(Address),
+    /// Whether `learner` has ever booked `mentor` before (distinct-requester tracking).
+    MentorHasBookedBefore(Address, Address),
+    MentorDistinctLearnerCount(Address),
+    /// Booking-request timestamps for a mentor, used for demand-authenticity checks.
+    MentorRequestLog(Address),
+    /// Rolling window of recently-booked session prices/timestamps across all
+    /// mentors, used for pricing-coordination detection.
+    RecentSessionPrices,
+    RecentSessionPriceTimestamps,
 }
+
+/// Maximum length of the rolling price/pair/request logs kept for scoring.
+const MONITORING_LOG_CAP: u32 = 20;
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 // Errors are surfaced via panics to keep compatibility with SDK 21 contractimpl.
@@ -110,6 +132,15 @@ impl SessionRegistry {
 
         // Check for scheduling conflicts and buffer enforcement
         Self::check_scheduling_conflicts(&env, &mentor, scheduled_at, duration_mins);
+
+        // Community-dynamics monitoring: track pair/demand/pricing signals and
+        // gate on automatic fair-access intervention before committing state.
+        // A panic here reverts all storage writes for this invocation.
+        Self::record_monitoring_signals(&env, &mentor, &learner, amount, scheduled_at);
+        let access = Self::ensure_fair_community_access(env.clone(), mentor.clone(), learner.clone());
+        if !access.access_granted {
+            panic!("CommunityAccessRestricted");
+        }
 
         let record = SessionRecord {
             session_id: session_id.clone(),
@@ -445,6 +476,139 @@ impl SessionRegistry {
             .expect("Not initialized")
     }
 
+    /// Update the pair/demand/pricing monitoring logs consumed by
+    /// `detect_mentor_coordination`, `verify_demand_authenticity`, and
+    /// `monitor_pricing_coordination`.
+    fn record_monitoring_signals(
+        env: &Env,
+        mentor: &Address,
+        learner: &Address,
+        amount: i128,
+        scheduled_at: u64,
+    ) {
+        // Pair coordination log, keyed on the scheduler-controlled `scheduled_at`.
+        let pair_key = DataKey::MentorLearnerLog(mentor.clone(), learner.clone());
+        let mut pair_log: Vec<u64> = env.storage().persistent().get(&pair_key).unwrap_or(Vec::new(env));
+        pair_log.push_back(scheduled_at);
+        while pair_log.len() > MONITORING_LOG_CAP {
+            pair_log.remove(0);
+        }
+        env.storage().persistent().set(&pair_key, &pair_log);
+        env.storage().persistent().extend_ttl(&pair_key, TTL_THRESHOLD, TTL_BUMP);
+
+        // Distinct-learner tracking for demand authenticity.
+        let seen_key = DataKey::MentorHasBookedBefore(mentor.clone(), learner.clone());
+        if !env.storage().persistent().get(&seen_key).unwrap_or(false) {
+            env.storage().persistent().set(&seen_key, &true);
+            let cnt_key = DataKey::MentorDistinctLearnerCount(mentor.clone());
+            let cnt: u32 = env.storage().persistent().get(&cnt_key).unwrap_or(0);
+            env.storage().persistent().set(&cnt_key, &(cnt + 1));
+        }
+
+        // Booking-request log, keyed on wall-clock request time.
+        let req_key = DataKey::MentorRequestLog(mentor.clone());
+        let mut req_log: Vec<u64> = env.storage().persistent().get(&req_key).unwrap_or(Vec::new(env));
+        req_log.push_back(env.ledger().timestamp());
+        while req_log.len() > MONITORING_LOG_CAP {
+            req_log.remove(0);
+        }
+        env.storage().persistent().set(&req_key, &req_log);
+        env.storage().persistent().extend_ttl(&req_key, TTL_THRESHOLD, TTL_BUMP);
+
+        // Global rolling price log for cross-mentor pricing-coordination detection.
+        let prices_key = DataKey::RecentSessionPrices;
+        let prices_ts_key = DataKey::RecentSessionPriceTimestamps;
+        let mut prices: Vec<i128> = env.storage().persistent().get(&prices_key).unwrap_or(Vec::new(env));
+        let mut price_ts: Vec<u64> = env.storage().persistent().get(&prices_ts_key).unwrap_or(Vec::new(env));
+        prices.push_back(amount);
+        price_ts.push_back(env.ledger().timestamp());
+        while prices.len() > MONITORING_LOG_CAP {
+            prices.remove(0);
+        }
+        while price_ts.len() > MONITORING_LOG_CAP {
+            price_ts.remove(0);
+        }
+        env.storage().persistent().set(&prices_key, &prices);
+        env.storage().persistent().set(&prices_ts_key, &price_ts);
+        env.storage().persistent().extend_ttl(&prices_key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage().persistent().extend_ttl(&prices_ts_key, TTL_THRESHOLD, TTL_BUMP);
+    }
+
+    /// Score a mentor/learner pair's booking history for coordination
+    /// (repeated, tightly-clustered scheduling characteristic of a
+    /// manipulation ring). Safe to call by anyone as a read-through audit;
+    /// also invoked internally on every `register_session`.
+    pub fn detect_mentor_coordination(env: Env, mentor: Address, learner: Address) -> CoordinationFlag {
+        let log: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MentorLearnerLog(mentor.clone(), learner.clone()))
+            .unwrap_or(Vec::new(&env));
+        let flag = detect_coordination(&log);
+        env.storage()
+            .persistent()
+            .set(&DataKey::MentorCoordination(mentor.clone()), &flag);
+        if flag.suspicious {
+            env.events().publish(
+                (symbol_short!("session"), Symbol::new(&env, "coord_flag")),
+                (mentor, flag.risk_score),
+            );
+        }
+        flag
+    }
+
+    /// Ensure a mentor/learner pair retains fair community access: combines
+    /// the mentor's coordination score with a neutral social-proof
+    /// placeholder (the reputation contract owns real endorsement signals)
+    /// and returns whether scheduling should be blocked.
+    pub fn ensure_fair_community_access(env: Env, mentor: Address, learner: Address) -> FairAccessDecision {
+        let coordination = Self::detect_mentor_coordination(env.clone(), mentor.clone(), learner);
+        let neutral_social_proof = SocialProofRecord {
+            genuine: true,
+            gaming_risk_score: 0,
+            distinct_endorser_bps: 10_000,
+            burst_count: 0,
+        };
+        let decision = evaluate_fair_access(&env, coordination, neutral_social_proof);
+        env.storage()
+            .persistent()
+            .set(&DataKey::MentorFairAccess(mentor), &decision);
+        decision
+    }
+
+    /// Verify whether a mentor's booking-request history reflects genuine,
+    /// distinct-learner demand rather than artificially generated requests.
+    pub fn verify_demand_authenticity(env: Env, mentor: Address) -> DemandAuthenticity {
+        let log: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MentorRequestLog(mentor.clone()))
+            .unwrap_or(Vec::new(&env));
+        let distinct: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MentorDistinctLearnerCount(mentor))
+            .unwrap_or(0);
+        shared_verify_demand_authenticity(&log, distinct)
+    }
+
+    /// Audit the platform-wide rolling price history for cross-mentor
+    /// pricing coordination (near-identical prices set within a tight
+    /// window). Read-only audit signal; does not block registration.
+    pub fn monitor_pricing_coordination(env: Env) -> PriceCoordinationFlag {
+        let prices: Vec<i128> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RecentSessionPrices)
+            .unwrap_or(Vec::new(&env));
+        let timestamps: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RecentSessionPriceTimestamps)
+            .unwrap_or(Vec::new(&env));
+        detect_price_coordination(&prices, &timestamps)
+    }
+
     /// Check for scheduling conflicts and buffer enforcement.
     /// Panics with "SessionConflict" if an overlap (including 15-min buffer) is detected.
     fn check_scheduling_conflicts(env: &Env, mentor: &Address, scheduled_at: u64, duration_mins: u32) {
@@ -561,6 +725,7 @@ impl SessionRegistry {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
@@ -929,5 +1094,86 @@ mod tests {
             &token,
         );
         assert_eq!(returned_id, session3);
+    }
+
+    #[test]
+    fn test_coordination_block_on_clustered_pair_bookings() {
+        let (env, client, _backend) = setup();
+        let mentor = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let token = dummy_token(&env);
+
+        // Short (5-min) sessions spaced 3500s apart: far enough to avoid a
+        // scheduling conflict, but within the 3600s coordination window.
+        let s1 = Symbol::new(&env, "coordA1");
+        let s2 = Symbol::new(&env, "coordA2");
+        let s3 = Symbol::new(&env, "coordA3");
+
+        client.register_session(&s1, &mentor, &learner, &2_000_000u64, &5u32, &100i128, &token);
+        client.register_session(&s2, &mentor, &learner, &2_003_500u64, &5u32, &100i128, &token);
+
+        // Third clustered booking from the same pair crosses the automatic
+        // fair-access intervention threshold and is blocked. The panic
+        // reverts all storage writes made during this call, so the pair
+        // log stays at 2 entries afterward.
+        let result = client.try_register_session(
+            &s3, &mentor, &learner, &2_007_000u64, &5u32, &100i128, &token,
+        );
+        assert!(result.is_err());
+
+        // A booking spaced well outside the clustering window is not
+        // flagged and succeeds, confirming the block was about clustering
+        // rather than the pair's total interaction count.
+        let s4 = Symbol::new(&env, "coordA4");
+        let returned = client.register_session(&s4, &mentor, &learner, &2_020_000u64, &5u32, &100i128, &token);
+        assert_eq!(returned, s4);
+    }
+
+    #[test]
+    fn test_verify_demand_authenticity_flags_concentrated_requests() {
+        let (env, client, _backend) = setup();
+        let mentor = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let token = dummy_token(&env);
+
+        // Same learner booking repeatedly (wide-spaced to avoid a scheduling
+        // or coordination block) at an unchanged wall-clock time is a
+        // concentrated, low-diversity demand signal.
+        for i in 0u32..5 {
+            let sid = match i {
+                0 => Symbol::new(&env, "demA0"),
+                1 => Symbol::new(&env, "demA1"),
+                2 => Symbol::new(&env, "demA2"),
+                3 => Symbol::new(&env, "demA3"),
+                _ => Symbol::new(&env, "demA4"),
+            };
+            let start = 2_000_000u64 + (i as u64) * 20_000;
+            client.register_session(&sid, &mentor, &learner, &start, &5u32, &100i128, &token);
+        }
+
+        let demand = client.verify_demand_authenticity(&mentor);
+        assert!(!demand.genuine);
+        assert!(demand.artificial_risk_score >= shared::PRICING_RISK_THRESHOLD);
+    }
+
+    #[test]
+    fn test_monitor_pricing_coordination_flags_matching_prices() {
+        let (env, client, _backend) = setup();
+        let mentor1 = Address::generate(&env);
+        let mentor2 = Address::generate(&env);
+        let learner1 = Address::generate(&env);
+        let learner2 = Address::generate(&env);
+        let token = dummy_token(&env);
+
+        // Two independent mentors set the same price at the same instant.
+        client.register_session(
+            &Symbol::new(&env, "priceA"), &mentor1, &learner1, &2_000_000u64, &5u32, &250i128, &token,
+        );
+        client.register_session(
+            &Symbol::new(&env, "priceB"), &mentor2, &learner2, &2_100_000u64, &5u32, &250i128, &token,
+        );
+
+        let flag = client.monitor_pricing_coordination();
+        assert!(flag.suspicious);
     }
 }

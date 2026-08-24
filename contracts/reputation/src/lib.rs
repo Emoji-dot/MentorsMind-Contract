@@ -1,6 +1,11 @@
 #![no_std]
 
-use shared::{analyze_review_pattern, interaction_commitment, BehavioralAnalysis, EscrowRecord, ReputationProof};
+use shared::{
+    analyze_review_pattern, compute_community_intervention, detect_coordination,
+    interaction_commitment, is_restoration_eligible, verify_social_proof, BehavioralAnalysis,
+    CommunityInterventionRecord, CoordinationFlag, EscrowRecord, NetworkEffectScore,
+    ReputationProof, SocialProofRecord,
+};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal,
     Symbol, Vec,
@@ -60,7 +65,19 @@ pub enum DataKey {
     ReviewTimestamps(Address),
     ReviewRatings(Address),
     ReviewSignalScore(Address),
+    /// Interaction timestamps between one mentor/learner pair (#coordination).
+    PairInteractionLog(Address, Address),
+    /// Whether `learner` has ever reviewed `mentor` before (distinct-reviewer tracking).
+    HasReviewedBefore(Address, Address),
+    DistinctReviewerCount(Address),
+    CommunityCoordination(Address),
+    SocialProofScore(Address),
+    CommunityIntervention(Address),
 }
+
+/// Cooldown before an intervened mentor's community access is eligible for
+/// automatic restoration.
+pub const COMMUNITY_RESTORATION_COOLDOWN_SECS: u64 = 7 * 24 * 3600;
 
 pub const REVIEW_DISPUTE_WINDOW_SECS: u64 = 14 * 24 * 3600;
 pub const DISPUTE_FILING_FEE: i128 = 10_000_000; // 10 MNT
@@ -181,6 +198,13 @@ impl ReputationContract {
         let stake_amount = Self::collect_review_stake(&env, &learner, rating);
         let analysis = Self::record_behavior(&env, &mentor, rating);
 
+        // Community-dynamics monitoring: track this mentor/learner pair and
+        // distinct-reviewer count, then re-score coordination and social-proof risk.
+        Self::record_pair_interaction(&env, &mentor, &learner);
+        Self::record_distinct_reviewer(&env, &mentor, &learner);
+        let coordination = Self::validate_community_interactions(env.clone(), mentor.clone(), learner.clone());
+        let social_proof = Self::monitor_social_proof_auth(env.clone(), mentor.clone());
+
         // Store review
         let record = ReviewRecord {
             session_id: session_id.clone(),
@@ -191,7 +215,9 @@ impl ReputationContract {
             comment_hash,
             authenticity_proof: proof,
             stake_amount,
-            investigation_required: analysis.risk_score >= 60,
+            investigation_required: analysis.risk_score >= 60
+                || coordination.suspicious
+                || !social_proof.genuine,
         };
         env.storage().persistent().set(&review_key, &record);
         env.storage()
@@ -276,6 +302,148 @@ impl ReputationContract {
 
     pub fn get_review_risk(env: Env, mentor: Address) -> u32 {
         env.storage().persistent().get(&DataKey::ReviewSignalScore(mentor)).unwrap_or(0)
+    }
+
+    fn record_pair_interaction(env: &Env, mentor: &Address, learner: &Address) {
+        let key = DataKey::PairInteractionLog(mentor.clone(), learner.clone());
+        let mut log: Vec<u64> = env.storage().persistent().get(&key).unwrap_or(Vec::new(env));
+        log.push_back(env.ledger().timestamp());
+        while log.len() > 10 {
+            log.remove(0);
+        }
+        env.storage().persistent().set(&key, &log);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
+    }
+
+    fn record_distinct_reviewer(env: &Env, mentor: &Address, learner: &Address) {
+        let seen_key = DataKey::HasReviewedBefore(mentor.clone(), learner.clone());
+        if !env.storage().persistent().get(&seen_key).unwrap_or(false) {
+            env.storage().persistent().set(&seen_key, &true);
+            let cnt_key = DataKey::DistinctReviewerCount(mentor.clone());
+            let cnt: u32 = env.storage().persistent().get(&cnt_key).unwrap_or(0);
+            env.storage().persistent().set(&cnt_key, &(cnt + 1));
+        }
+    }
+
+    /// Score a mentor/learner pair's interaction history for coordination
+    /// (repeated, tightly-clustered reviews characteristic of a manipulation
+    /// ring). Safe to call by anyone as a read-through audit; also invoked
+    /// internally on every `submit_review`.
+    pub fn validate_community_interactions(env: Env, mentor: Address, learner: Address) -> CoordinationFlag {
+        let log: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PairInteractionLog(mentor.clone(), learner.clone()))
+            .unwrap_or(Vec::new(&env));
+        let flag = detect_coordination(&log);
+        env.storage()
+            .persistent()
+            .set(&DataKey::CommunityCoordination(mentor.clone()), &flag);
+        if flag.suspicious {
+            env.events().publish(
+                (symbol_short!("coord"), Symbol::new(&env, "flagged")),
+                (mentor, flag.risk_score),
+            );
+        }
+        flag
+    }
+
+    /// Score a mentor's aggregate review history for social-proof gaming
+    /// (endorsement bursts from a narrow set of reviewers).
+    pub fn monitor_social_proof_auth(env: Env, mentor: Address) -> SocialProofRecord {
+        let timestamps: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReviewTimestamps(mentor.clone()))
+            .unwrap_or(Vec::new(&env));
+        let distinct: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DistinctReviewerCount(mentor.clone()))
+            .unwrap_or(0);
+        let record = verify_social_proof(&timestamps, distinct);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SocialProofScore(mentor.clone()), &record);
+        if !record.genuine {
+            env.events().publish(
+                (symbol_short!("sproof"), Symbol::new(&env, "flagged")),
+                (mentor, record.gaming_risk_score),
+            );
+        }
+        record
+    }
+
+    /// Recompute and persist the mentor's overall community-protection
+    /// intervention status from the latest coordination/social-proof scores.
+    pub fn get_community_status(env: Env, mentor: Address) -> CommunityInterventionRecord {
+        let coordination: CoordinationFlag = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CommunityCoordination(mentor.clone()))
+            .unwrap_or(CoordinationFlag {
+                suspicious: false,
+                risk_score: 0,
+                repeated_pair_count: 0,
+                clustered_timing_count: 0,
+            });
+        let social_proof: SocialProofRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SocialProofScore(mentor.clone()))
+            .unwrap_or(SocialProofRecord {
+                genuine: true,
+                gaming_risk_score: 0,
+                distinct_endorser_bps: 10_000,
+                burst_count: 0,
+            });
+        // Reputation has no direct visibility into referral/network growth;
+        // treat it as neutral/authentic here (session_registry owns that signal).
+        let network = NetworkEffectScore {
+            authentic: true,
+            influence_score: 100,
+            artificial_growth_flag: false,
+            distinct_source_bps: 10_000,
+        };
+        let record = compute_community_intervention(
+            &env,
+            coordination,
+            network,
+            social_proof,
+            COMMUNITY_RESTORATION_COOLDOWN_SECS,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::CommunityIntervention(mentor.clone()), &record);
+        record
+    }
+
+    /// Restore fair community participation for a mentor once the
+    /// intervention cooldown has elapsed. Callable by any arbitrator address
+    /// (mirrors `resolve_review_dispute`'s governance-pool assumption).
+    pub fn restore_fair_participation(env: Env, arbitrator: Address, mentor: Address) {
+        arbitrator.require_auth();
+        let record: CommunityInterventionRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CommunityIntervention(mentor.clone()))
+            .expect("NoInterventionOnRecord");
+
+        if !is_restoration_eligible(&record, env.ledger().timestamp()) {
+            panic!("RestorationNotEligible");
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::CommunityIntervention(mentor.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::CommunityCoordination(mentor.clone()));
+
+        env.events().publish(
+            (symbol_short!("commrest"), Symbol::new(&env, "restored")),
+            mentor,
+        );
     }
 
     /// Returns (avg_rating * 100, review_count) for a mentor, incorporating slash penalties (Issue #751).
@@ -936,5 +1104,86 @@ mod tests {
 
         let learner_review = client.get_learner_review(&session_id);
         assert_eq!(learner_review.participation_rating, 5);
+    }
+
+    #[test]
+    fn test_coordination_detected_on_clustered_reviews() {
+        let (env, client, escrow_id, mentor, learner) = setup();
+        let mock = MockEscrowClient::new(&env, &escrow_id);
+        let comment_hash = BytesN::from_array(&env, &[0u8; 32]);
+
+        // Same mentor/learner pair reviewing repeatedly in a tight window
+        // is the signature of a coordination ring.
+        for i in 1u32..=4 {
+            let sid = match i {
+                1 => Symbol::new(&env, "cs1"),
+                2 => Symbol::new(&env, "cs2"),
+                3 => Symbol::new(&env, "cs3"),
+                _ => Symbol::new(&env, "cs4"),
+            };
+            mock.set_status(&sid, &true);
+            client.submit_review(&sid, &mentor, &learner, &5, &comment_hash);
+            env.ledger().with_mut(|li| li.timestamp += 60);
+        }
+
+        let flag = client.validate_community_interactions(&mentor, &learner);
+        assert!(flag.suspicious);
+        assert!(flag.risk_score >= shared::COORDINATION_RISK_THRESHOLD);
+
+        let review = client.get_review(&Symbol::new(&env, "cs4"));
+        assert!(review.investigation_required);
+    }
+
+    #[test]
+    fn test_social_proof_genuine_with_distinct_reviewers() {
+        let (env, client, escrow_id, mentor, _learner) = setup();
+        let mock = MockEscrowClient::new(&env, &escrow_id);
+        let comment_hash = BytesN::from_array(&env, &[0u8; 32]);
+
+        for i in 1u32..=3 {
+            let sid = match i {
+                1 => Symbol::new(&env, "gp1"),
+                2 => Symbol::new(&env, "gp2"),
+                _ => Symbol::new(&env, "gp3"),
+            };
+            let reviewer = Address::generate(&env);
+            mock.set_status(&sid, &true);
+            client.submit_review(&sid, &mentor, &reviewer, &5, &comment_hash);
+            env.ledger().with_mut(|li| li.timestamp += 7_200);
+        }
+
+        let record = client.monitor_social_proof_auth(&mentor);
+        assert!(record.genuine);
+    }
+
+    #[test]
+    fn test_restore_fair_participation_requires_cooldown() {
+        let (env, client, escrow_id, mentor, learner) = setup();
+        let mock = MockEscrowClient::new(&env, &escrow_id);
+        let comment_hash = BytesN::from_array(&env, &[0u8; 32]);
+
+        for i in 1u32..=4 {
+            let sid = match i {
+                1 => Symbol::new(&env, "rs1"),
+                2 => Symbol::new(&env, "rs2"),
+                3 => Symbol::new(&env, "rs3"),
+                _ => Symbol::new(&env, "rs4"),
+            };
+            mock.set_status(&sid, &true);
+            client.submit_review(&sid, &mentor, &learner, &5, &comment_hash);
+            env.ledger().with_mut(|li| li.timestamp += 60);
+        }
+
+        let status = client.get_community_status(&mentor);
+        assert!(status.intervene);
+
+        let arbitrator = Address::generate(&env);
+        let result = client.try_restore_fair_participation(&arbitrator, &mentor);
+        assert!(result.is_err());
+
+        env.ledger().with_mut(|li| {
+            li.timestamp = status.restoration_eligible_at;
+        });
+        client.restore_fair_participation(&arbitrator, &mentor);
     }
 }
