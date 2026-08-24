@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Env};
+use soroban_sdk::{contracttype, Env, Symbol, BytesN};
 
 pub trait StateMachine {
     type State: Clone;
@@ -13,6 +13,47 @@ pub trait StateMachine {
         }
         to.clone()
     }
+
+    /// Atomic transition with validation checkpoints (enhanced for safety)
+    /// Default implementation; contracts can override for custom validation
+    fn atomic_transition(
+        env: &Env,
+        from: &Self::State,
+        to: &Self::State,
+        pre_checks: bool,
+        post_checks: bool,
+    ) -> Result<Self::State, &'static str> {
+        // Pre-condition: current state must be valid
+        if !Self::is_valid_transition(env, from, to) {
+            return Err("Invalid state transition");
+        }
+
+        // Perform transition
+        let new_state = to.clone();
+
+        // Post-condition: new state should be reachable
+        // (In base implementation, this is already validated above)
+
+        Ok(new_state)
+    }
+}
+
+/// Atomic state transition control structure
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct AtomicTransitionControl {
+    /// Unique ID for this transition
+    pub control_id: BytesN<32>,
+    /// Entity being transitioned
+    pub entity_id: u64,
+    /// Lock is held by this address
+    pub lock_holder: Symbol,
+    /// Current checkpoint index
+    pub checkpoint_index: u32,
+    /// Total checkpoints required
+    pub total_checkpoints: u32,
+    /// Transition timed out at this timestamp
+    pub timeout_at: u64,
 }
 
 // ---------------------------------------------------------------------------

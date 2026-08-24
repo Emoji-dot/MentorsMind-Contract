@@ -203,6 +203,8 @@ pub struct HistoricalTx {
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     EscrowContract,
     TreasuryContract,

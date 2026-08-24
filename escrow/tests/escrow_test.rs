@@ -1,11 +1,15 @@
 #![cfg(test)]
 
 use mentorminds_escrow::{EscrowContract, EscrowContractClient, EscrowStatus};
+use shared::{
+    RollbackJustification, RollbackScope, ROLLBACK_COMMUNITY_REVIEW_SECS,
+    ROLLBACK_MAX_WINDOW_SECS,
+};
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Env, Symbol, Vec,
+    Address, BytesN, Env, Symbol, Vec,
 };
 
 // -----------------------------------------------------------------------
@@ -535,7 +539,7 @@ fn test_estimate_release_escrow_cost_within_tolerance_of_actual() {
 
 extern crate alloc;
 
-use soroban_sdk::{contractimpl, BytesN};
+use soroban_sdk::{contract, contractimpl};
 
 // -----------------------------------------------------------------------
 // Escrow Auto-Release Failure Recovery Tests
@@ -601,43 +605,71 @@ fn test_report_stuck_escrow_succeeds_after_grace_period() {
 // ----- Attempt-count gate -----
 
 #[test]
-#[should_panic(expected = "Emergency release requires 3 failed attempts")]
+#[should_panic(expected = "No failure record found")]
 fn test_emergency_release_rejected_below_max_attempts() {
     let f = TestFixture::setup_with_fee(0);
     let id = f.create_escrow_at(1_000, 0, "EMG1");
     assert_eq!(f.client().get_auto_release_attempts(&id), 0u32);
+
+    let mut signers = Vec::new(&f.env);
+    for _ in 0..7 {
+        signers.push_back(Address::generate(&f.env));
+    }
+    f.client().set_emergency_signers(&f.admin, &signers);
+
     let reason = BytesN::<32>::from_array(&f.env, &[0x42u8; 32]);
     f.client()
-        .emergency_release(&f.admin, &id, &reason, &0u32);
+        .propose_emergency_action(&signers.get(0).unwrap(), &id, &reason);
 }
 
-// ----- 3 failing attempts => attempt counter reaches 3 -----
-
-fn simulate_3_failed_attempts(f: &TestFixture, id: u64) {
+fn simulate_max_failed_attempts(f: &TestFixture, id: u64) {
     let panic_addr = f.env.register_contract(None, PanicMockContract);
     f.client()
         .set_reputation_contract(&f.admin, &panic_addr);
 
-    for i in 0..3u32 {
+    // Ensure auto-release window is open (default delay is 72h when init delay=0).
+    let delay = f.client().get_auto_release_delay();
+    let escrow = f.client().get_escrow(&id);
+    let ready_at = escrow.session_end_time + delay;
+    let now = f.env.ledger().timestamp();
+    if now < ready_at {
+        advance_time(&f.env, ready_at - now + 1);
+    }
+
+    // Advance past backoff windows between attempts so each try_auto_release
+    // is accepted and increments the counter up to MAX_AUTO_RELEASE_ATTEMPTS.
+    for i in 0..10u32 {
         f.client().try_auto_release(&id);
         assert_eq!(f.client().get_auto_release_attempts(&id), i + 1);
+        // Jump past exponential backoff so the next attempt is allowed.
+        advance_time(&f.env, 8 * 60 * 60 + 1);
     }
     assert_eq!(f.client().get_escrow(&id).status, EscrowStatus::Active);
 }
 
+fn setup_emergency_signers(f: &TestFixture) -> Vec<Address> {
+    let mut signers = Vec::new(&f.env);
+    for _ in 0..7 {
+        signers.push_back(Address::generate(&f.env));
+    }
+    f.client().set_emergency_signers(&f.admin, &signers);
+    signers
+}
+
 #[test]
-#[should_panic(expected = "MultisigAdmin not configured")]
-fn test_emergency_release_requires_multisig_configured() {
+#[should_panic(expected = "Emergency signers not configured")]
+fn test_emergency_release_requires_emergency_signers() {
     let f = TestFixture::setup_full(0, 0);
     let now = f.env.ledger().timestamp();
     let id = f.create_escrow_at(1_000, now, "EMG2");
-    simulate_3_failed_attempts(&f, id);
+    simulate_max_failed_attempts(&f, id);
+    let proposer = Address::generate(&f.env);
     let reason = BytesN::<32>::from_array(&f.env, &[0x11u8; 32]);
     f.client()
-        .emergency_release(&f.admin, &id, &reason, &0u32);
+        .propose_emergency_action(&proposer, &id, &reason);
 }
 
-// ----- Full end-to-end recovery: 3 fails + mock multisig => release -----
+// ----- Full end-to-end: max fails + 4-of-7 + 24h timelock => release -----
 
 #[test]
 fn test_three_failures_then_emergency_release_succeeds() {
@@ -652,11 +684,14 @@ fn test_three_failures_then_emergency_release_succeeds() {
     let mentor_before = f.token().balance(&f.mentor);
     let treasury_before = f.token().balance(&f.treasury);
 
-    simulate_3_failed_attempts(&f, id);
+    // Seed additional active liquidity so the 10% circuit breaker permits
+    // releasing the 10_000 stuck escrow (10% of ~110_000 = 11_000).
+    f.sac().mint(&f.learner, &200_000);
+    let _pool_pad = f.create_escrow_at(100_000, now, "POOL");
 
-    // 4th attempt gated
-    f.client().try_auto_release(&id);
-    assert_eq!(f.client().get_auto_release_attempts(&id), 3u32);
+    simulate_max_failed_attempts(&f, id);
+
+    assert_eq!(f.client().get_auto_release_attempts(&id), 10u32);
     assert_eq!(f.client().get_escrow(&id).status, EscrowStatus::Active);
     assert_eq!(f.token().balance(&f.mentor), mentor_before);
 
@@ -671,24 +706,35 @@ fn test_three_failures_then_emergency_release_succeeds() {
         .iter()
         .any(|x| x == id));
 
-    // Configure mock multisig with 2-of-3 threshold + passing approvals
-    let action_id: u32 = 17;
-    let ms = env.register_contract(None, MockMultisigContract);
-    MockMultisigContractClient::new(env, &ms).configure(
-        &2u32,
-        &action_id,
-        &env.current_contract_address(),
-        &Symbol::new(env, "emergency_release"),
-        &id,
-        &2u32,
-        &(env.ledger().timestamp() + 1_000_000u64),
-    );
-    f.client().set_multisig_admin(&f.admin, &ms);
-
-    // EMERGENCY RELEASE
-    let reason = BytesN::<32>::from_array(env, &[0xAAu8; 32]);
+    let signers = setup_emergency_signers(&f);
+    let emergency_admin = Address::generate(env);
     f.client()
-        .emergency_release(&f.admin, &id, &reason, &action_id);
+        .grant_emergency_admin(&f.admin, &emergency_admin);
+
+    let reason = BytesN::<32>::from_array(env, &[0xAAu8; 32]);
+    let action_id = f.client().propose_emergency_action(
+        &signers.get(0).unwrap(),
+        &id,
+        &reason,
+    );
+    // Collect remaining 3 approvals → exact 4-of-7
+    f.client()
+        .approve_emergency_action(&signers.get(1).unwrap(), &action_id);
+    f.client()
+        .approve_emergency_action(&signers.get(2).unwrap(), &action_id);
+    f.client()
+        .approve_emergency_action(&signers.get(3).unwrap(), &action_id);
+
+    let action = f.client().get_emergency_action(&action_id);
+    assert_eq!(action.approval_count, 4);
+
+    // Timelock: wait 24 hours
+    advance_time(env, 24 * 60 * 60);
+
+    let ok = f
+        .client()
+        .emergency_release(&emergency_admin, &id, &reason, &action_id);
+    assert!(ok);
 
     // Verify balances
     assert_eq!(f.token().balance(&f.mentor), mentor_before + expected_net);
@@ -709,57 +755,254 @@ fn test_three_failures_then_emergency_release_succeeds() {
         .iter()
         .any(|x| x == id));
 
-    // Audit events emitted
-    let evts = env.events().all();
-    let emergency_event = evts.iter().find(|e| {
-        let topics = e.topics();
-        topics.len() >= 3
-            && topics.get(1).unwrap() == Symbol::new(env, "Escrow").into_val(env)
-            && topics.get(2).unwrap()
-                == Symbol::new(env, "EmergencyReleased").into_val(env)
-    });
-    assert!(emergency_event.is_some());
-
-    let standard_release_event = evts.iter().find(|e| {
-        let topics = e.topics();
-        topics.len() >= 3
-            && topics.get(1).unwrap() == Symbol::new(env, "Escrow").into_val(env)
-            && topics.get(2).unwrap() == Symbol::new(env, "Released").into_val(env)
-    });
-    assert!(standard_release_event.is_some());
+    // Immutable audit with participant signatures
+    let audit = f.client().get_emergency_audit(&action_id);
+    assert!(audit.success);
+    assert_eq!(audit.participant_signers.len(), 4);
+    assert_eq!(audit.escrow_id, id);
+    assert_eq!(audit.amount, 10_000);
 }
 
 #[test]
-#[should_panic(expected = "Insufficient multi-sig approvals")]
-fn test_emergency_release_rejected_below_2_of_3_threshold() {
+fn test_emergency_release_rejected_below_4_of_7_threshold() {
     let f = TestFixture::setup_full(0, 0);
     let now = f.env.ledger().timestamp();
     let id = f.create_escrow_at(1_000, now, "EMG4");
-    simulate_3_failed_attempts(&f, id);
-    assert_eq!(f.client().get_auto_release_attempts(&id), 3);
+    simulate_max_failed_attempts(&f, id);
 
-    let action_id: u32 = 5;
-    let ms = f.env.register_contract(None, MockMultisigContract);
-    MockMultisigContractClient::new(&f.env, &ms).configure(
-        &2u32,
-        &action_id,
-        &f.env.current_contract_address(),
-        &Symbol::new(&f.env, "emergency_release"),
-        &id,
-        &1u32,
-        &(f.env.ledger().timestamp() + 1_000_000u64),
-    );
-    f.client().set_multisig_admin(&f.admin, &ms);
+    let signers = setup_emergency_signers(&f);
+    let emergency_admin = Address::generate(&f.env);
+    f.client()
+        .grant_emergency_admin(&f.admin, &emergency_admin);
 
     let reason = BytesN::<32>::from_array(&f.env, &[0xBBu8; 32]);
+    // Only proposer approval (1-of-7) — below exact 4
+    let action_id = f.client().propose_emergency_action(
+        &signers.get(0).unwrap(),
+        &id,
+        &reason,
+    );
+    advance_time(&f.env, 24 * 60 * 60);
+
+    let ok = f
+        .client()
+        .execute_emergency_action(&emergency_admin, &action_id);
+    assert!(!ok, "must fail without exact 4-of-7 signatures");
+
+    // Permanently failed — cannot retry same params
+    let action = f.client().get_emergency_action(&action_id);
+    assert!(action.failed);
+    let audit = f.client().get_emergency_audit(&action_id);
+    assert!(!audit.success);
+}
+
+#[test]
+fn test_emergency_release_requires_24h_timelock() {
+    let f = TestFixture::setup_full(0, 0);
+    let now = f.env.ledger().timestamp();
+    let id = f.create_escrow_at(1_000, now, "EMG5");
+    simulate_max_failed_attempts(&f, id);
+
+    let signers = setup_emergency_signers(&f);
+    let emergency_admin = Address::generate(&f.env);
     f.client()
-        .emergency_release(&f.admin, &id, &reason, &action_id);
+        .grant_emergency_admin(&f.admin, &emergency_admin);
+
+    let reason = BytesN::<32>::from_array(&f.env, &[0xCCu8; 32]);
+    let action_id = f.client().propose_emergency_action(
+        &signers.get(0).unwrap(),
+        &id,
+        &reason,
+    );
+    for i in 1..4 {
+        f.client()
+            .approve_emergency_action(&signers.get(i).unwrap(), &action_id);
+    }
+
+    // Execute immediately — timelock not elapsed → permanent failure
+    let ok = f
+        .client()
+        .execute_emergency_action(&emergency_admin, &action_id);
+    assert!(!ok);
+    assert!(f.client().get_emergency_action(&action_id).failed);
+}
+
+#[test]
+fn test_emergency_admin_expires_after_72h() {
+    let f = TestFixture::setup_full(0, 0);
+    let now = f.env.ledger().timestamp();
+    let id = f.create_escrow_at(1_000, now, "EMG6");
+    simulate_max_failed_attempts(&f, id);
+
+    let signers = setup_emergency_signers(&f);
+    let emergency_admin = Address::generate(&f.env);
+    f.client()
+        .grant_emergency_admin(&f.admin, &emergency_admin);
+
+    let reason = BytesN::<32>::from_array(&f.env, &[0xDDu8; 32]);
+    let action_id = f.client().propose_emergency_action(
+        &signers.get(0).unwrap(),
+        &id,
+        &reason,
+    );
+    for i in 1..4 {
+        f.client()
+            .approve_emergency_action(&signers.get(i).unwrap(), &action_id);
+    }
+
+    // Wait past both 24h timelock and 72h admin TTL
+    advance_time(&f.env, 72 * 60 * 60 + 1);
+
+    let role = f.client().get_emergency_admin().unwrap();
+    assert!(f.env.ledger().timestamp() >= role.expires_at);
+
+    let ok = f
+        .client()
+        .execute_emergency_action(&emergency_admin, &action_id);
+    assert!(!ok, "expired emergency admin must not execute");
+}
+
+// ----- Emergency rollback (issue #825) -----
+
+fn rollback_justification(env: &Env) -> RollbackJustification {
+    RollbackJustification {
+        evidence_hash: BytesN::from_array(env, &[0x01u8; 32]),
+        incident_hash: BytesN::from_array(env, &[0x02u8; 32]),
+        description_hash: BytesN::from_array(env, &[0u8; 32]),
+    }
+}
+
+fn setup_rollback_proposal(f: &TestFixture) -> (Vec<Address>, u32) {
+    setup_rollback_proposal_with_hash(
+        f,
+        &BytesN::from_array(&f.env, &[0xBBu8; 32]),
+    )
+}
+
+fn setup_rollback_proposal_with_hash(
+    f: &TestFixture,
+    wasm_hash: &BytesN<32>,
+) -> (Vec<Address>, u32) {
+    let signers = setup_emergency_signers(f);
+    let snapshot_id = 1u32;
+    f.create_escrow_at(1_000, f.env.ledger().timestamp(), "RBK1");
+    f.client().snapshot_state(&f.admin, &snapshot_id);
+    let proposal_id = f.client().propose_emergency_rollback(
+        &signers.get(0).unwrap(),
+        &snapshot_id,
+        wasm_hash,
+        &RollbackScope::Escrow,
+        &rollback_justification(&f.env),
+    );
+    (signers, proposal_id)
+}
+
+fn approve_technical_rollback_quorum(f: &TestFixture, signers: &Vec<Address>, proposal_id: u32) {
+    for i in 1..4 {
+        f.client()
+            .approve_technical_rollback(&signers.get(i).unwrap(), &proposal_id);
+    }
+    let rollback = f.client().get_emergency_rollback(&proposal_id).unwrap();
+    assert_eq!(rollback.technical_approval_count, 4);
+}
+
+#[test]
+fn test_emergency_rollback_rejected_without_governance() {
+    let f = TestFixture::setup_with_fee(0);
+    let (signers, proposal_id) = setup_rollback_proposal(&f);
+    approve_technical_rollback_quorum(&f, &signers, proposal_id);
+    advance_time(&f.env, ROLLBACK_COMMUNITY_REVIEW_SECS);
+
+    let executor = Address::generate(&f.env);
+    let ok = f.client().emergency_rollback(&proposal_id, &executor);
+    assert!(!ok, "rollback must fail without governance approval");
+}
+
+#[test]
+fn test_emergency_rollback_rejected_before_48h_review() {
+    let f = TestFixture::setup_with_fee(0);
+    let (signers, proposal_id) = setup_rollback_proposal(&f);
+    approve_technical_rollback_quorum(&f, &signers, proposal_id);
+
+    let governance = Address::generate(&f.env);
+    f.client()
+        .set_governance_contract(&f.admin, &governance);
+    let gov_proposal_id = 1u32;
+    f.client().link_governance_rollback_review(
+        &governance,
+        &proposal_id,
+        &gov_proposal_id,
+    );
+    f.client().mark_gov_rollback_approved(
+        &governance,
+        &proposal_id,
+        &gov_proposal_id,
+    );
+
+    advance_time(&f.env, ROLLBACK_COMMUNITY_REVIEW_SECS - 1);
+    let executor = Address::generate(&f.env);
+    let ok = f.client().emergency_rollback(&proposal_id, &executor);
+    assert!(!ok, "rollback must fail before 48h community review elapses");
+}
+
+#[test]
+#[should_panic(expected = "Snapshot outside 24h rollback window")]
+fn test_rollback_rejects_snapshot_outside_24h_window() {
+    let f = TestFixture::setup_with_fee(0);
+    let signers = setup_emergency_signers(&f);
+    let snapshot_id = 1u32;
+    f.create_escrow_at(1_000, f.env.ledger().timestamp(), "RBK2");
+    f.client().snapshot_state(&f.admin, &snapshot_id);
+    advance_time(&f.env, ROLLBACK_MAX_WINDOW_SECS + 1);
+
+    let wasm_hash = BytesN::from_array(&f.env, &[0xCCu8; 32]);
+    f.client().propose_emergency_rollback(
+        &signers.get(0).unwrap(),
+        &snapshot_id,
+        &wasm_hash,
+        &RollbackScope::Escrow,
+        &rollback_justification(&f.env),
+    );
+}
+
+#[test]
+fn test_emergency_rollback_ready_after_full_authorization() {
+    let f = TestFixture::setup_with_fee(0);
+    let (signers, proposal_id) = setup_rollback_proposal(&f);
+    approve_technical_rollback_quorum(&f, &signers, proposal_id);
+
+    let governance = Address::generate(&f.env);
+    f.client()
+        .set_governance_contract(&f.admin, &governance);
+    let gov_proposal_id = 7u32;
+    f.client().link_governance_rollback_review(
+        &governance,
+        &proposal_id,
+        &gov_proposal_id,
+    );
+    f.client().mark_gov_rollback_approved(
+        &governance,
+        &proposal_id,
+        &gov_proposal_id,
+    );
+    advance_time(&f.env, ROLLBACK_COMMUNITY_REVIEW_SECS);
+
+    let rollback = f.client().get_emergency_rollback(&proposal_id).unwrap();
+    assert!(rollback.governance_approved);
+    assert_eq!(rollback.technical_approval_count, 4);
+    assert!(f.env.ledger().timestamp() >= rollback.review_ends_at);
+    assert!(f.client().validate_rollback_request(&proposal_id));
+
+    let (preserved_audits, preserved_logs) = f.client().preserve_audit_data(&proposal_id);
+    assert!(preserved_logs >= 1);
+    assert_eq!(preserved_audits, 0);
 }
 
 // =======================================================================
 // Test Mock Contracts
 // =======================================================================
 
+#[contract]
 pub struct PanicMockContract;
 
 #[contractimpl]
@@ -773,75 +1016,5 @@ impl PanicMockContract {
         _amount: i128,
     ) {
         panic!("intentional reputation outage for recovery tests");
-    }
-}
-
-pub struct MockMultisigContract;
-
-use mentorminds_escrow::ProposalRecordMirror;
-
-#[contractclient(name = "MockMultisigContractClient")]
-trait MockMultisigApi {
-    #[allow(clippy::too_many_arguments)]
-    fn configure(
-        env: Env,
-        threshold: u32,
-        action_id: u32,
-        target: Address,
-        function: Symbol,
-        escrow_id: u64,
-        approval_count: u32,
-        expiry: u64,
-    );
-    fn get_proposal(env: Env, action_id: u32) -> ProposalRecordMirror;
-    fn get_threshold(env: Env) -> u32;
-}
-
-#[contractimpl]
-impl MockMultisigApi for MockMultisigContract {
-    fn configure(
-        env: Env,
-        threshold: u32,
-        action_id: u32,
-        target: Address,
-        function: Symbol,
-        escrow_id: u64,
-        approval_count: u32,
-        expiry: u64,
-    ) {
-        let mut args: Vec<soroban_sdk::Val> = Vec::new(&env);
-        args.push_back(escrow_id.into_val(&env));
-
-        let record = ProposalRecordMirror {
-            id: action_id,
-            proposer: Address::generate(&env),
-            target,
-            function,
-            args,
-            approval_count,
-            expiry,
-            executed: false,
-            cancelled: false,
-        };
-        env.storage()
-            .persistent()
-            .set(&Symbol::new(&env, "PROP"), &record);
-        env.storage()
-            .persistent()
-            .set(&Symbol::new(&env, "THR"), &threshold);
-    }
-
-    fn get_proposal(env: Env, _action_id: u32) -> ProposalRecordMirror {
-        env.storage()
-            .persistent()
-            .get(&Symbol::new(&env, "PROP"))
-            .expect("configure not called")
-    }
-
-    fn get_threshold(env: Env) -> u32 {
-        env.storage()
-            .persistent()
-            .get(&Symbol::new(&env, "THR"))
-            .expect("configure not called")
     }
 }

@@ -1,8 +1,11 @@
 #![no_std]
+#![allow(deprecated)] // Temporarily allow deprecated Events::publish until we migrate to #[contractevent]
 
 use shared::{
-    compute_checksum, push_snapshot_index, RollbackProposal, SnapshotMeta, StateVerificationReport,
-    EMERGENCY_THRESHOLD, MAX_SNAPSHOTS,
+    compute_checksum, push_snapshot_index, MultisigValidation, RollbackAuthorization,
+    RollbackJustification, RollbackProposal, SnapshotMeta, StateVerificationReport,
+    EMERGENCY_MSIG_SIGNERS, EMERGENCY_MSIG_THRESHOLD, EMERGENCY_THRESHOLD, MAX_SNAPSHOTS,
+    SecureStorageAccess,
 };
 use soroban_sdk::{
     contract, contractimpl, contracterror, contracttype, symbol_short, Address, Bytes, BytesN,
@@ -30,6 +33,10 @@ pub enum Error {
     Cancelled          = 10,
     Expired            = 11,
     InvalidThreshold   = 12,
+    /// Emergency signature set failed 4-of-7 validation.
+    InvalidEmergencySignatures = 13,
+    /// Duplicate or unregistered emergency signer in aggregation.
+    InvalidEmergencySigner = 14,
 }
 
 // ---------------------------------------------------------------------------
@@ -63,6 +70,8 @@ const EXPIRY_SECONDS: u64 = 7 * 24 * 60 * 60; // 7 days
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Threshold,
     SignerCount,
     ProposalCount,
@@ -122,6 +131,8 @@ impl MultisigAdminContract {
         signers: Vec<Address>,
         threshold: u32,
     ) -> Result<(), Error> {
+        SecureStorageAccess::install_namespace(&env, &DataKey::NamespaceRoot, symbol_short!("mm_msig"));
+
         if env.storage().instance().has(&DataKey::Threshold) {
             return Err(Error::AlreadyInitialized);
         }
@@ -349,6 +360,66 @@ impl MultisigAdminContract {
             .ok_or(Error::NotInitialized)
     }
 
+    // -----------------------------------------------------------------------
+    // Emergency signature validation (4-of-7)
+    // -----------------------------------------------------------------------
+
+    /// Validate that `approvals` is an exact 4-of-7 set drawn from the
+    /// registered governance emergency signers.
+    ///
+    /// Used by escrow and other consumers that need host-side confirmation
+    /// that an aggregated emergency signature set meets threshold policy.
+    pub fn validate_emergency_signatures(
+        env: Env,
+        approvals: Vec<Address>,
+    ) -> Result<bool, Error> {
+        let registered: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovEmergencySigners)
+            .ok_or(Error::NotInitialized)?;
+        if !MultisigValidation::validate_emergency_signatures(&registered, &approvals) {
+            return Err(Error::InvalidEmergencySignatures);
+        }
+        Ok(true)
+    }
+
+    /// Aggregate a newly authenticated emergency signer into an approval set.
+    ///
+    /// `signer` must `require_auth` and must be a registered emergency signer.
+    /// Returns the updated approval vector (deduplicated).
+    pub fn aggregate_signatures(
+        env: Env,
+        signer: Address,
+        mut approvals: Vec<Address>,
+    ) -> Result<Vec<Address>, Error> {
+        let registered: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovEmergencySigners)
+            .ok_or(Error::NotInitialized)?;
+        if !MultisigValidation::is_emergency_signer(&registered, &signer) {
+            return Err(Error::InvalidEmergencySigner);
+        }
+        signer.require_auth();
+        MultisigValidation::aggregate_signatures(&mut approvals, signer);
+        // Cap at threshold — callers should stop collecting once exact 4 is reached.
+        if (approvals.len() as u32) > EMERGENCY_MSIG_THRESHOLD {
+            return Err(Error::InvalidEmergencySignatures);
+        }
+        Ok(approvals)
+    }
+
+    /// Return the emergency multisig threshold constant (always 4).
+    pub fn get_emergency_threshold(_env: Env) -> u32 {
+        EMERGENCY_MSIG_THRESHOLD
+    }
+
+    /// Return the emergency signer slot count constant (always 7).
+    pub fn get_emergency_signer_slots(_env: Env) -> u32 {
+        EMERGENCY_MSIG_SIGNERS
+    }
+
     // =======================================================================
     // Disaster Recovery — Governance Contract
     // =======================================================================
@@ -382,7 +453,7 @@ impl MultisigAdminContract {
             return Err(Error::NotSigner);
         }
         caller.require_auth();
-        if signers.len() != shared::EMERGENCY_SIGNERS {
+        if !MultisigValidation::is_valid_emergency_config(&signers, EMERGENCY_MSIG_THRESHOLD) {
             return Err(Error::InvalidThreshold);
         }
         env.storage()
@@ -811,6 +882,34 @@ impl MultisigAdminContract {
         env.storage()
             .persistent()
             .get(&DataKey::GovRollbackProposal(proposal_id))
+    }
+
+    /// Validate cryptographic rollback evidence digests (non-zero required).
+    pub fn validate_rollback_evidence(
+        env: Env,
+        evidence_hash: BytesN<32>,
+        incident_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        let justification = RollbackJustification {
+            evidence_hash,
+            incident_hash,
+            description_hash: RollbackAuthorization::zero_hash(&env),
+        };
+        if RollbackAuthorization::validate_justification(&env, &justification) {
+            Ok(())
+        } else {
+            Err(Error::InvalidEmergencySignatures)
+        }
+    }
+
+    /// Validate that a snapshot timestamp is within the 24-hour rollback window.
+    pub fn validate_rollback_scope(env: Env, snapshot_created_at: u64) -> Result<(), Error> {
+        if RollbackAuthorization::validate_scope_window(env.ledger().timestamp(), snapshot_created_at)
+        {
+            Ok(())
+        } else {
+            Err(Error::InvalidEmergencySignatures)
+        }
     }
 }
 

@@ -31,6 +31,8 @@ pub struct GrantProgram {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     /// Admin address
     GrantAdmin,
     /// Treasury contract address

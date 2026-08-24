@@ -99,7 +99,7 @@ impl Fixture {
         mock.mint(&staking, &100_000i128); // pool for reward payouts
 
         let client = StakingContractClient::new(&env, &staking);
-        client.initialize(&admin, &mnt);
+        client.initialize(&admin, &mnt, &None);
 
         Fixture { env, staking_id: staking, admin, mentor, mnt }
     }
@@ -137,9 +137,9 @@ pub fn run() -> Vec<BenchResult> {
     // --- unstake ---
     {
         let f = Fixture::new();
-        f.client().stake(&f.mentor, &1_000i128, &1u32);
+        f.client().stake(&f.mentor, &1_000i128, &30u32);
         // Advance past lock period
-        f.env.ledger().with_mut(|li| li.timestamp += 86_401);
+        f.env.ledger().with_mut(|li| li.timestamp += 30 * 86_400 + 1);
         let snap = measure(&f.env, || {
             f.client().unstake(&f.mentor);
         });

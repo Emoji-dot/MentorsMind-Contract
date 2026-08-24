@@ -23,6 +23,8 @@ pub struct RentHealth {
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     /// XLM reserve balance per contract (in stroops).
     ContractRentBalance(Address),
     /// Minimum balance (stroops) before auto-topup triggers.

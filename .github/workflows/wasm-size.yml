@@ -7,7 +7,6 @@ on:
       - '.github/workflows/wasm-size.yml'
 
 env:
-  RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -41,6 +40,10 @@ jobs:
           for manifest in contracts/*/Cargo.toml; do
             contract_dir="$(dirname "$manifest")"
             contract_name="$(basename "$contract_dir")"
+            if [ "$contract_name" = "shared" ]; then
+              echo "Skipping shared library crate (not a deployable contract)"
+              continue
+            fi
             package_name="$(sed -n 's/^name = "\(.*\)"/\1/p' "$manifest" | head -n1)"
             wasm_name="${package_name//-/_}.wasm"
 

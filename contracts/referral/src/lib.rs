@@ -47,6 +47,8 @@ pub struct ReferralConfig {
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     MNTToken,
     Referral(Address),

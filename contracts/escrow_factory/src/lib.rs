@@ -77,6 +77,8 @@ const MAX_PAST_START_SECS: u64 = 5 * 60; // 5 minutes
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     HighValueThreshold,
     PendingHighValueSession(Symbol),
 }

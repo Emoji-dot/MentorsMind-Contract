@@ -73,6 +73,8 @@ const SLASH_DISPUTE_LOST: i128 = 50_000_000; // 50 MNT
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     MntToken,
     InsurancePool,

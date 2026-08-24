@@ -7,14 +7,18 @@ use soroban_sdk::contracterror;
 ///
 /// Centralizing these definitions keeps authorization and state-transition
 /// behavior aligned across contracts that make the same safety assumptions.
+pub mod admin;
 pub mod cross_contract_auth;
 pub mod disaster_recovery;
+pub mod emergency;
+pub mod emergency_rollback;
 pub mod escrow;
 pub mod events;
 pub mod gas_estimation;
 pub mod governance_voting;
 pub mod pause_guard;
 pub mod reentrancy_guard;
+pub mod safe_math;
 pub mod sig_validation;
 pub mod state_machine;
 pub mod staking;
@@ -24,15 +28,28 @@ pub mod ttl_utils;
 pub mod interface_id;
 pub mod validation;
 pub mod reputation;
-pub mod assessment_security;
-pub mod ml_security;
-pub mod cartel_detection;
-pub mod transfer_security;
+pub mod failure_tracking;
+pub mod atomic_state;
 
+pub use admin::{
+    AdminChangeProposal, AdminTransfer, ADMIN_COOLING_OFF_SECS, MIN_ADMIN_TIMELOCK_SECS,
+};
 pub use disaster_recovery::{
     compute_checksum, push_snapshot_index, RollbackApproval, RollbackProposal, SnapshotMeta,
     StateVerificationReport, EMERGENCY_SIGNERS, EMERGENCY_THRESHOLD, MAX_SNAPSHOTS,
 };
+pub use emergency::{
+    EmergencyAction, EmergencyAdminRole, EmergencyAuditRecord, EmergencyCircuitBreaker,
+    EmergencyMultisig, MultisigValidation, EMERGENCY_ADMIN_TTL_SECS, EMERGENCY_CIRCUIT_WINDOW_SECS,
+    EMERGENCY_MSIG_SIGNERS, EMERGENCY_MSIG_THRESHOLD, EMERGENCY_RELEASE_CAP_BPS,
+    EMERGENCY_TIMELOCK_SECS,
+};
+pub use emergency_rollback::{
+    EmergencyRollback, ImmutableRollbackAuditRecord, RollbackAuthorization, RollbackJustification,
+    RollbackScope, ROLLBACK_COMMUNITY_REVIEW_SECS, ROLLBACK_GOVERNANCE_QUORUM_BPS,
+    ROLLBACK_MAX_WINDOW_SECS,
+};
+pub use safe_math::SafeMath;
 pub use cross_contract_auth::{ContractRegistry, CrossContractAuth, InterfaceRegistryLookup};
 pub use escrow::{EscrowRecord, EscrowStatus, EscrowTransitionLog};
 pub use gas_estimation::GasEstimate;
@@ -63,6 +80,11 @@ pub use staking::{
     BASIS_POINTS, PATTERN_DETECTION_WINDOW, SUSPICIOUS_CYCLE_THRESHOLD_SECS,
 };
 pub use storage::{EternalStorage, StorageType, InstanceKey, PersistentKey, TempKey};
+pub use storage::{
+    CollisionDetector, CollisionDetector as CollisionDetection, SecureStorageAccess,
+    StorageAccessControl, StorageIntegrity, StorageKeyDerivation, StorageKeyFingerprint,
+    StorageIntegrityRecord, StorageNamespace, StorageSecurityError, STORAGE_DERIVE_CTX,
+};
 pub use storage_compatibility::{
     CompatibilityError, CompatibilityReport, CompatibilityValidator, GradualMigrationStatus,
     MigrationScript, StorageField, StorageFieldType, StorageLayoutSchema, StorageVersion,
@@ -80,22 +102,22 @@ pub use reputation::{
     analyze_review_pattern, detect_sybil, interaction_commitment, BehavioralAnalysis,
     ReputationProof, SybilDetection,
 };
-pub use assessment_security::{
-    AssessmentSecurity, AssessmentSecurityError, GamingDetectionResult,
-    ProgressAuthenticityRecord, ManipulationRecord, GamingFlag,
+pub use failure_tracking::{
+    ReleaseFailure, FailureClassification, ExponentialBackoff, RecoveryState,
+    calculate_backoff_delay, classify_failure, calculate_next_retry, compute_failure_hash,
+    MAX_AUTO_RELEASE_ATTEMPTS, MANUAL_RECOVERY_THRESHOLD,
 };
-pub use ml_security::{
-    MLSecurity, MLSecurityError, AttackDetectionResult, ModelRobustnessReport,
-    AIPerformanceMetrics, TrainingDataIntegrityRecord, PoisoningRecord, AdversarialAttackType,
+pub use atomic_state::{
+    StateTransitionContext, PreConditionCheck, PostConditionCheck, CrossContractStateCheck,
+    StateTransitionProof, InvalidStateRecord, AtomicStateValidator, compute_transition_proof_hash,
+    all_checkpoints_passed, is_transition_expired, STATE_TRANSITION_TIMEOUT_SECS,
+    STATE_TRANSITION_LOCK_TTL, MAX_CHECKPOINT_COUNT,
 };
-pub use cartel_detection::{
-    CartelDetection, CartelDetectionError, CartelDetectionResult, TimeSlotFairnessAnalysis,
-    CartelActivityRecord, CartelSeverity,
-};
-pub use transfer_security::{
-    TransferSecurity, TransferSecurityError, FraudDetectionResult, TransferIntegrityResult,
-    CredentialAuthenticityProof, CrossPlatformVerification, CredentialFraudType,
-};
+
+/// Economic sanity ceiling for a single financial amount (token smallest units).
+pub const MAX_FINANCIAL_AMOUNT: i128 = 1_000_000_000_000_000;
+/// Absolute upper bound for fee basis-points helpers in shared validation.
+pub const MAX_FEE_BPS: u32 = 10_000;
 
 /// Common error codes shared across all MentorsMind contracts.
 ///

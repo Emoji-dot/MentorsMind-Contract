@@ -62,6 +62,8 @@ pub struct RouterTokenApprovalEvent {
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Config,
     Route(BytesN<32>),
     ProcessedTx(BytesN<32>),

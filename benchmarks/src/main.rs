@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports)]
 /// MentorsMind Soroban Benchmark Harness
 ///
 /// Uses soroban-sdk testutils to measure CPU instruction count and storage I/O

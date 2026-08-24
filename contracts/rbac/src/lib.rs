@@ -14,6 +14,8 @@ pub enum Error {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     SuperAdmin,
     RoleMember(Symbol, Address),
     RoleMembers(Symbol),

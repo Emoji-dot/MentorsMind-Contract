@@ -3,10 +3,7 @@
 
 #![allow(unused_imports)]
 
-use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol};
-use alloc::vec::Vec as CoreVec;
-
-extern crate alloc;
+use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol, Vec};
 
 const LOCK_PREFIX: Symbol = symbol_short!("RGUARD");
 const CALLER_STACK_PREFIX: Symbol = symbol_short!("RG_CALL");
@@ -271,7 +268,7 @@ pub enum BatchOp {
 
 pub struct AtomicBatch<'a> {
     env: &'a Env,
-    ops: CoreVec<BatchOp>,
+    ops: Vec<BatchOp>,
     committed: bool,
 }
 
@@ -279,7 +276,7 @@ impl<'a> AtomicBatch<'a> {
     pub fn new(env: &'a Env) -> Self {
         Self {
             env,
-            ops: CoreVec::new(),
+            ops: Vec::new(env),
             committed: false,
         }
     }
@@ -291,14 +288,14 @@ impl<'a> AtomicBatch<'a> {
         to: Address,
         amount: i128,
     ) -> u32 {
-        let idx = self.ops.len() as u32;
-        self.ops.push(BatchOp::Transfer(token, from, to, amount, false));
+        let idx = self.ops.len();
+        self.ops.push_back(BatchOp::Transfer(token, from, to, amount, false));
         idx
     }
 
     pub fn add_invoke(&mut self, contract: Address, function: Symbol) -> u32 {
-        let idx = self.ops.len() as u32;
-        self.ops.push(BatchOp::Invoke(contract, function, false));
+        let idx = self.ops.len();
+        self.ops.push_back(BatchOp::Invoke(contract, function, false));
         idx
     }
 
@@ -306,28 +303,28 @@ impl<'a> AtomicBatch<'a> {
     where
         F: FnMut(&Env, &BatchOp) -> Result<(), E>,
     {
-        let mut executed_indices = CoreVec::new();
+        let mut executed_indices = Vec::new(self.env);
         let mut i = 0u32;
 
         for op in self.ops.iter() {
-            let result = executor(self.env, op);
+            let result = executor(self.env, &op);
             match result {
                 Ok(()) => {
-                    executed_indices.push(i);
+                    executed_indices.push_back(i);
                 }
                 Err(e) => {
                     self.rollback_indices(&executed_indices);
                     return Err(e);
                 }
             }
-            i += 1;
+            i = i.saturating_add(1);
         }
 
         self.committed = true;
         Ok(())
     }
 
-    fn rollback_indices(&mut self, _indices: &CoreVec<u32>) {
+    fn rollback_indices(&mut self, _indices: &Vec<u32>) {
         self.env.events().publish(
             (symbol_short!("batch"), symbol_short!("rollback")),
             self.env.ledger().timestamp(),
@@ -335,11 +332,11 @@ impl<'a> AtomicBatch<'a> {
     }
 
     pub fn len(&self) -> u32 {
-        self.ops.len() as u32
+        self.ops.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.ops.len() == 0
+        self.ops.is_empty()
     }
 }
 

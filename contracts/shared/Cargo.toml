@@ -11,4 +11,4 @@ testutils = ["soroban-sdk/testutils"]
 
 [lib]
 path = "src/lib.rs"
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]

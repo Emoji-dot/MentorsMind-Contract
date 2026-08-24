@@ -8,7 +8,7 @@ use mentorminds_dispute_evidence::{DisputeEvidenceContract, DisputeEvidenceContr
 use soroban_sdk::{
     contract, contractimpl, contracttype,
     testutils::{Address as _, Ledger},
-    Address, Env, Symbol,
+    Address, BytesN, Env, Symbol,
 };
 
 const CONTRACT: &str = "dispute_evidence";
@@ -78,6 +78,10 @@ impl MockEscrow {
             sessions_completed: 0,
         }
     }
+}
+
+fn dummy_hash(env: &Env) -> BytesN<32> {
+    BytesN::from_array(env, &[0xab; 32])
 }
 
 // ---------------------------------------------------------------------------
@@ -150,7 +154,9 @@ pub fn run() -> Vec<BenchResult> {
             f.client().submit_evidence(
                 &2u64,
                 &f.mentor,
-                &Symbol::new(&f.env, "proof_hash"),
+                &dummy_hash(&f.env),
+                &dummy_hash(&f.env),
+                &None,
             );
         });
         results.push(BenchResult {
@@ -171,7 +177,9 @@ pub fn run() -> Vec<BenchResult> {
         f.client().submit_evidence(
             &3u64,
             &f.mentor,
-            &Symbol::new(&f.env, "evidence"),
+            &dummy_hash(&f.env),
+            &dummy_hash(&f.env),
+            &None,
         );
         
         // Advance past minimum resolution delay
@@ -181,6 +189,7 @@ pub fn run() -> Vec<BenchResult> {
             f.client().submit_resolution(
                 &3u64,
                 &f.arbitrator,
+                &false,
                 &true,
                 &Symbol::new(&f.env, "resolved"),
             );
