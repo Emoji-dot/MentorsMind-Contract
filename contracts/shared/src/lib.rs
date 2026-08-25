@@ -136,7 +136,7 @@ pub use storage_compatibility::{
     StorageVersion,
 };
 pub use zk_audit::{commit_audit_entry, verify_audit_commitment, AuditCommitment};
-pub use proof_of_personhood::{is_attestation_valid, PersonhoodAttestation};
+pub use proof_of_personhood::{create_attestation, is_attestation_valid, PersonhoodAttestation};
 pub use post_quantum::{is_algorithm_supported, SignatureAlgorithm};
 pub use ttl_utils::{
     next_bump_interval, should_bump_ttl, AlertLevel, DataBackupRecord, DataDependencyTracker,
