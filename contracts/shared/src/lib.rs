@@ -208,7 +208,7 @@ pub use platform_authenticity::{
 pub use dynamic_fees::{
     calculate_dynamic_fee, detect_fee_gaming,
     DynamicFeeResult, FeeEvasionResult,
-    BASE_FEE_BPS, MAX_FEE_BPS, MIN_FEE_BPS, HIGH_LOAD_THRESHOLD,
+    BASE_FEE_BPS, MIN_FEE_BPS, HIGH_LOAD_THRESHOLD,
 };
 
 /// Economic sanity ceiling for a single financial amount (token smallest units).
