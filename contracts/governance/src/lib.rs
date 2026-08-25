@@ -36,6 +36,12 @@ const CANCEL_COOLDOWN_SECS: u64 = 7 * 24 * 60 * 60; // 7-day cancel cooldown per
 const CANCEL_ESCALATION_WINDOW_SECS: u64 = 30 * 24 * 60 * 60; // 30-day window for multi-sig escalation
 const CANCEL_ESCALATION_THRESHOLD: u32 = 3; // > 3 cancels in 30 days triggers multi-sig
 
+// Proposal spam-prevention and deposit config keys (stored in instance storage)
+const PROPOSAL_DEPOSIT_SYM: Symbol = symbol_short!("PROP_DEP");
+const MIN_PROPOSER_BALANCE_SYM: Symbol = symbol_short!("MIN_PROP_BAL");
+const MAX_ACTIVE_PROPOSALS_SYM: Symbol = symbol_short!("MAX_ACT_PROPS");
+const TREASURY_BALANCE_SYM: Symbol = symbol_short!("TREASURY_BAL");
+
 // ---------------------------------------------------------------------------
 // Gas-estimation heuristic constants (#761). Calibrated against
 // `env.budget().cpu_instruction_cost()` measured around a real `vote()`
@@ -186,6 +192,11 @@ pub enum DataKey {
     /// Contract-isolated storage namespace root (#826).
     NamespaceRoot,
     Proposal(u32),
+    /// Per-address count of currently active (not executed/failed/cancelled)
+    /// proposals. Used to limit active proposals per address.
+    ActiveProposalCount(Address),
+    /// Per-proposal escrow deposit amount (in token smallest units)
+    ProposalDeposit(u32),
     Vote(u32, Address),
     VoteWeight(u32, Address),
     ApprovedAsset(Address),
@@ -270,6 +281,9 @@ impl GovernanceContract {
         delegation_contract: Address,
         voting_period_secs: Option<u64>,
         quorum_bps: Option<u32>,
+        proposal_deposit: Option<i128>,
+        min_proposer_balance: Option<i128>,
+        max_active_proposals_per_address: Option<u32>,
     ) {
         SecureStorageAccess::install_namespace(&env, &DataKey::NamespaceRoot, GOV_STORAGE_SCOPE);
 
@@ -293,6 +307,18 @@ impl GovernanceContract {
         env.storage().instance().set(&VOTING_PERIOD_SECS, &period);
         env.storage().instance().set(&QUORUM_BPS, &quorum);
         env.storage().instance().set(&PROPOSAL_COUNT, &0u32);
+        // Configure proposal spam / deposit defaults
+        let deposit_val: i128 = proposal_deposit.unwrap_or(0i128);
+        let min_bal: i128 = min_proposer_balance.unwrap_or(0i128);
+        let max_active: u32 = max_active_proposals_per_address.unwrap_or(3u32);
+
+        env.storage().instance().set(&PROPOSAL_DEPOSIT_SYM, &deposit_val);
+        env.storage()
+            .instance()
+            .set(&MIN_PROPOSER_BALANCE_SYM, &min_bal);
+        env.storage()
+            .instance()
+            .set(&MAX_ACTIVE_PROPOSALS_SYM, &max_active);
         env.storage()
             .instance()
             .set(&DataKey::DelegationContract, &delegation_contract);
@@ -311,6 +337,13 @@ impl GovernanceContract {
 
         env.storage().persistent().set(&QUORUM_BPS, &quorum);
         env.storage().persistent().set(&PROPOSAL_COUNT, &0u32);
+        env.storage().persistent().set(&PROPOSAL_DEPOSIT_SYM, &deposit_val);
+        env.storage()
+            .persistent()
+            .set(&MIN_PROPOSER_BALANCE_SYM, &min_bal);
+        env.storage()
+            .persistent()
+            .set(&MAX_ACTIVE_PROPOSALS_SYM, &max_active);
     }
 
     pub fn propose_admin_change(
@@ -555,11 +588,60 @@ impl GovernanceContract {
             timelock_op_id: BytesN::from_array(&env, &[0; 32]),
         };
 
-        // === OPTIMIZATION: Batch storage writes for better performance ===
+        // === Anti-griefing: enforce per-address active proposal limits ===
+        let max_active: u32 = env
+            .storage()
+            .instance()
+            .get(&MAX_ACTIVE_PROPOSALS_SYM)
+            .unwrap_or(3u32);
+        let current_active: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveProposalCount(proposer.clone()))
+            .unwrap_or(0u32);
+        if current_active >= max_active {
+            panic!("exceeds max active proposals per address");
+        }
+
+        // Check proposer balance at snapshot time against min_proposer_balance
+        let min_bal: i128 = env
+            .storage()
+            .instance()
+            .get(&MIN_PROPOSER_BALANCE_SYM)
+            .unwrap_or(0i128);
+        if min_bal > 0 {
+            let proposer_balance: i128 = env.invoke_contract(
+                &snapshot_contract,
+                &Symbol::new(&env, "get_snapshot_balance"),
+                (count, proposer.clone()).into_val(&env),
+            );
+            if proposer_balance < min_bal {
+                panic!("insufficient proposer balance at snapshot");
+            }
+        }
+
+        // Store proposal and update counters
         env.storage().instance().set(&PROPOSAL_COUNT, &count);
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(count), &proposal);
+
+        // Track active proposals per proposer
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveProposalCount(proposer.clone()), &(current_active + 1u32));
+
+        // If configured, record deposit amount per-proposal (escrow bookkeeping)
+        let deposit: i128 = env
+            .storage()
+            .instance()
+            .get(&PROPOSAL_DEPOSIT_SYM)
+            .unwrap_or(0i128);
+        if deposit > 0 {
+            env.storage()
+                .persistent()
+                .set(&DataKey::ProposalDeposit(count), &deposit);
+        }
 
         emit_governance_event(
             &env,
@@ -827,6 +909,22 @@ impl GovernanceContract {
             env.storage()
                 .persistent()
                 .set(&DataKey::Proposal(proposal_id), &proposal);
+            // Cleanup: decrement active proposals and release any escrow bookkeeping
+            let proposer = proposal.proposer.clone();
+            let mut active: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::ActiveProposalCount(proposer.clone()))
+                .unwrap_or(0u32);
+            if active > 0 {
+                active = active - 1;
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::ActiveProposalCount(proposer.clone()), &active);
+            }
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ProposalDeposit(proposal_id));
             emit_governance_event(
                 &env,
                 evt_gov_proposal_failed(&env),
@@ -835,7 +933,7 @@ impl GovernanceContract {
             return;
         }
 
-        Self::transition_proposal_status(&env, &mut proposal, ProposalStatus::Passed);
+            Self::transition_proposal_status(&env, &mut proposal, ProposalStatus::Passed);
         emit_governance_event(
             &env,
             evt_gov_proposal_passed(&env),
@@ -843,7 +941,7 @@ impl GovernanceContract {
         );
 
         // ExecuteCall requires an additional 7-day delay after voting ends
-        if let ProposalAction::ExecuteCall(_, _, _) = &proposal.action {
+            if let ProposalAction::ExecuteCall(_, _, _) = &proposal.action {
             let earliest_execute = proposal
                 .voting_ends_at
                 .checked_add(EXECUTE_CALL_TIMELOCK_SECS)
@@ -894,6 +992,23 @@ impl GovernanceContract {
                 .persistent()
                 .set(&DataKey::Proposal(proposal_id), &proposal);
 
+            // Cleanup after execution: decrement active proposals and clear escrow record
+            let proposer = proposal.proposer.clone();
+            let mut active: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::ActiveProposalCount(proposer.clone()))
+                .unwrap_or(0u32);
+            if active > 0 {
+                active = active - 1;
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::ActiveProposalCount(proposer.clone()), &active);
+            }
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ProposalDeposit(proposal_id));
+
             emit_governance_event(&env, evt_gov_proposal_executed(&env), true);
         }
     }
@@ -919,6 +1034,23 @@ impl GovernanceContract {
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
+
+        // Cleanup after execution: decrement active proposals and clear escrow record
+        let proposer = proposal.proposer.clone();
+        let mut active: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveProposalCount(proposer.clone()))
+            .unwrap_or(0u32);
+        if active > 0 {
+            active = active - 1;
+            env.storage()
+                .persistent()
+                .set(&DataKey::ActiveProposalCount(proposer.clone()), &active);
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ProposalDeposit(proposal_id));
 
         emit_governance_event(&env, evt_gov_proposal_executed(&env), true);
     }
@@ -1051,6 +1183,42 @@ impl GovernanceContract {
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
+
+        // If a deposit was recorded for this proposal, slash it to treasury
+        let deposit: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProposalDeposit(proposal_id))
+            .unwrap_or(0i128);
+        if deposit > 0 {
+            // Add to treasury balance (bookkeeping only)
+            let mut tbal: i128 = env
+                .storage()
+                .persistent()
+                .get(&TREASURY_BALANCE_SYM)
+                .unwrap_or(0i128);
+            tbal = tbal.checked_add(deposit).expect("treasury overflow");
+            env.storage()
+                .persistent()
+                .set(&TREASURY_BALANCE_SYM, &tbal);
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ProposalDeposit(proposal_id));
+        }
+
+        // Decrement active proposal count for proposer
+        let proposer = proposal.proposer.clone();
+        let mut active: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveProposalCount(proposer.clone()))
+            .unwrap_or(0u32);
+        if active > 0 {
+            active = active - 1;
+            env.storage()
+                .persistent()
+                .set(&DataKey::ActiveProposalCount(proposer.clone()), &active);
+        }
 
         // Update cooldown timestamp for (admin, action_type)
         env.storage()
@@ -3233,6 +3401,53 @@ mod tests {
         );
         assert_eq!(weighted_for, 1100, "110% of 1000 = 1100");
         assert_eq!(raw_for, 1000, "raw should remain 1000");
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds max active proposals per address")]
+    fn test_spam_fourth_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let gov_id = env.register_contract(None, GovernanceContract);
+        let token_id = env.register_contract(None, MockMntToken);
+        let snapshot_id = env.register_contract(None, MockSnapshot);
+        let delegation_id = env.register_contract(None, MockDelegation);
+        let gov = GovernanceContractClient::new(&env, &gov_id);
+        let token = MockMntTokenClient::new(&env, &token_id);
+        let snapshot = MockSnapshotClient::new(&env, &snapshot_id);
+        snapshot.set_token(&token_id);
+
+        let admin = Address::generate(&env);
+        let voter = Address::generate(&env);
+        gov.initialize(
+            &admin,
+            &token_id,
+            &snapshot_id,
+            &delegation_id,
+            &Some(10u64),
+            &Some(1_000u32),
+            &Some(0i128),
+            &Some(0i128),
+            &Some(3u32),
+        );
+        token.set_total_supply(&1_000i128);
+
+        for i in 0..3 {
+            let title = Bytes::from_slice(&env, format!("p{}", i).as_bytes());
+            let description_hash = BytesN::from_array(&env, &[(i + 1) as u8; 32]);
+            gov.create_proposal(
+                &voter,
+                &title,
+                &description_hash,
+                &ProposalAction::UpdateFee(300 + i as u32),
+            );
+        }
+
+        // 4th proposal should be rejected
+        let title = Bytes::from_slice(&env, b"p4");
+        let description_hash = BytesN::from_array(&env, &[9u8; 32]);
+        gov.create_proposal(&voter, &title, &description_hash, &ProposalAction::UpdateFee(999));
     }
 
     #[test]
