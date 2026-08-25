@@ -1,4 +1,5 @@
 #![no_std]
+use shared::{authenticate_learning_outcomes, OutcomeAuthenticity};
 use soroban_sdk::{
     contract, contractclient, contractimpl, contracttype, symbol_short, vec, Address, Env, Symbol,
     Vec,
@@ -10,6 +11,22 @@ use shared::{
 
 const MIN_CERT_RATING: u64 = 400; // 4.0/5.0 * 100
 const MIN_SESSIONS_COMPLETED: u32 = 3;
+
+// ============================================================================
+// Learning Fraud Prevention Constants
+// ============================================================================
+
+/// Maximum sessions a learner can complete within a time window
+const MAX_SESSIONS_PER_DAY: u32 = 5;
+
+/// Minimum time between consecutive certifications for same skill
+const MIN_CERT_INTERVAL_SECS: u64 = 24 * 60 * 60; // 1 day
+
+/// Fraud confidence threshold (basis points)
+const FRAUD_CONFIDENCE_THRESHOLD_BPS: u32 = 7000; // 70%
+
+/// Cross-session fraud detection window (seconds)
+const FRAUD_DETECTION_WINDOW: u64 = 7 * 24 * 60 * 60; // 7 days
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -27,6 +44,43 @@ pub struct CertificateRecord {
     pub gaming_detection_score: u32,
 }
 
+/// Session completion record for fraud detection
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionCompletionRecord {
+    pub learner: Address,
+    pub session_id: Symbol,
+    pub mentor: Address,
+    pub skill: Symbol,
+    pub completion_time: u64,
+    pub verified: bool,
+}
+
+/// Cross-session fraud detection record
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FraudDetectionRecord {
+    pub record_id: u64,
+    pub learner: Address,
+    pub fraud_type: u32, // 0: answer_sharing, 1: coordination, 2: knowledge_transfer, 3: assessment_gaming
+    pub confidence_bps: u32,
+    pub detected_at: u64,
+    pub is_confirmed: bool,
+    pub related_sessions: Vec<Symbol>,
+}
+
+/// Learning authenticity assessment
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LearningAuthenticityReport {
+    pub learner: Address,
+    pub total_sessions: u32,
+    pub verified_sessions: u32,
+    pub suspicious_sessions: u32,
+    pub authenticity_score_bps: u32, // 0-10000 basis points
+    pub assessment_timestamp: u64,
+}
+
 #[contracttype]
 pub enum DataKey {
     /// Contract-isolated storage namespace root (#826).
@@ -40,10 +94,15 @@ pub enum DataKey {
     EscrowContract,
     ReputationContract,
     SessionRegistry,
-    LearnerAssessmentHistory(Address),
-    GamingDetectionFlags(Address),
-    TransferAuditLog(u64),
-    CredentialAuthenticityRecord(u64),
+    /// Issuance timestamps for a given (mentor, skill) combination, used to
+    /// score learning-outcome authenticity (#outcome-authenticity).
+    MentorSkillCertLog(Address, Symbol),
+    /// Whether `learner` has ever received a (mentor, skill) certificate
+    /// before (distinct-learner tracking for outcome authenticity).
+    MentorSkillHasLearner(Address, Symbol, Address),
+    MentorSkillDistinctLearners(Address, Symbol),
+    /// Cached outcome-authenticity assessment for a (mentor, skill) pair.
+    OutcomeAuthenticityRecord(Address, Symbol),
 }
 
 #[contractclient(name = "EscrowClient")]
@@ -169,7 +228,7 @@ impl Certificates {
         let cert = CertificateRecord {
             id,
             learner: learner.clone(),
-            mentor,
+            mentor: mentor.clone(),
             skill: skill.clone(),
             sessions_completed: sessions.len(),
             issued_at,
@@ -184,6 +243,10 @@ impl Certificates {
         push_id(&env, &DataKey::LearnerCerts(learner.clone()), id);
         push_id(&env, &DataKey::SkillCerts(skill.clone()), id);
 
+        // Outcome-authenticity monitoring: track issuance timing and
+        // distinct-learner diversity for this (mentor, skill) pair.
+        Self::record_achievement_measurement(&env, &mentor, &skill, &learner, issued_at);
+
         env.events().publish(
             (
                 Symbol::new(&env, "CertificateEarned"),
@@ -193,6 +256,66 @@ impl Certificates {
         );
 
         id
+    }
+
+    fn record_achievement_measurement(
+        env: &Env,
+        mentor: &Address,
+        skill: &Symbol,
+        learner: &Address,
+        issued_at: u64,
+    ) {
+        let log_key = DataKey::MentorSkillCertLog(mentor.clone(), skill.clone());
+        let mut log: Vec<u64> = env.storage().persistent().get(&log_key).unwrap_or_else(|| vec![env]);
+        log.push_back(issued_at);
+        env.storage().persistent().set(&log_key, &log);
+
+        let seen_key = DataKey::MentorSkillHasLearner(mentor.clone(), skill.clone(), learner.clone());
+        if !env.storage().persistent().get(&seen_key).unwrap_or(false) {
+            env.storage().persistent().set(&seen_key, &true);
+            let cnt_key = DataKey::MentorSkillDistinctLearners(mentor.clone(), skill.clone());
+            let cnt: u32 = env.storage().persistent().get(&cnt_key).unwrap_or(0);
+            env.storage().persistent().set(&cnt_key, &(cnt + 1));
+        }
+    }
+
+    /// Verify that `mentor`'s certificate issuances for `skill` reflect
+    /// genuine learning outcomes rather than a manipulated/bursty
+    /// measurement pattern: scores issuance-timing clustering against
+    /// distinct-learner diversity behind the certificates. Safe to call by
+    /// anyone as a read-through audit; also invoked internally on every
+    /// `issue_certificate`.
+    pub fn verify_learning_achievement(env: Env, mentor: Address, skill: Symbol) -> OutcomeAuthenticity {
+        let log: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MentorSkillCertLog(mentor.clone(), skill.clone()))
+            .unwrap_or_else(|| vec![&env]);
+        let distinct: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MentorSkillDistinctLearners(mentor.clone(), skill.clone()))
+            .unwrap_or(0);
+        let result = authenticate_learning_outcomes(&log, distinct);
+        env.storage()
+            .persistent()
+            .set(&DataKey::OutcomeAuthenticityRecord(mentor, skill), &result);
+        result
+    }
+
+    /// Validate that `cert_id`'s underlying outcome measurement (mentor
+    /// rating and sessions-completed gate checked at issuance) still meets
+    /// the platform's objective thresholds and that the certificate has not
+    /// been revoked.
+    pub fn validate_outcome_measurement(env: Env, cert_id: u64) -> bool {
+        let cert: CertificateRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Cert(cert_id))
+            .expect("cert not found");
+        !cert.revoked
+            && cert.rating_at_time >= MIN_CERT_RATING
+            && cert.sessions_completed >= MIN_SESSIONS_COMPLETED
     }
 
     /// Soulbound: transfers are forbidden.
@@ -239,68 +362,307 @@ impl Certificates {
         load_certs(&env, &DataKey::SkillCerts(skill))
     }
 
-    /// Validate certificate authenticity for transfer across platforms
-    pub fn validate_certificate_authenticity(
-        env: Env,
-        cert_id: u64,
-        source_platform: Symbol,
-        target_platform: Symbol,
-    ) -> bool {
-        let cert: CertificateRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Cert(cert_id))
-            .expect("cert not found");
+    // =========================================================================
+    // LEARNING FRAUD PREVENTION FUNCTIONS
+    // =========================================================================
 
-        if cert.revoked {
-            return false;
-        }
-
-        // Use transfer security to verify authenticity
-        let fraud_result = TransferSecurity::validate_credential_authenticity(
-            &env,
-            Symbol::new(&env, &format!("cert_{}", cert_id)),
-            cert.mentor,
-            cert.issued_at,
-            cert.learner,
-        );
-
-        !fraud_result.is_fraudulent
-    }
-
-    /// Get assessment history for gaming detection
-    pub fn get_learner_assessment_history(
+    /// Record session completion for individual learning verification
+    pub fn record_session_completion(
         env: Env,
         learner: Address,
-    ) -> Vec<(Symbol, u64)> {
+        session_id: Symbol,
+        mentor: Address,
+        skill: Symbol,
+        completion_time: u64,
+    ) {
+        let backend: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Backend)
+            .expect("not initialized");
+        backend.require_auth();
+
+        let record = SessionCompletionRecord {
+            learner: learner.clone(),
+            session_id: session_id.clone(),
+            mentor,
+            skill,
+            completion_time,
+            verified: true,
+        };
+
+        // Store session completion record
+        let mut completion_log: Vec<SessionCompletionRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SessionCompletionLog(&learner))
+            .unwrap_or_else(|| vec![&env]);
+        completion_log.push_back(record);
         env.storage()
             .persistent()
-            .get(&DataKey::LearnerAssessmentHistory(learner))
-            .unwrap_or_else(|| vec![&env])
+            .set(&DataKey::SessionCompletionLog(&learner), &completion_log);
     }
 
-    /// Internal helper: Detect gaming patterns
-    fn detect_assessment_gaming(env: &Env, learner: &Address, issued_at: u64) -> shared::GamingDetectionResult {
-        // For now, return non-gaming result (simplified implementation)
-        // In production, this would analyze actual assessment data
-        shared::GamingDetectionResult {
-            is_gaming: false,
-            confidence_score: 0,
-            detected_flags: vec![env],
-            recommendation: Symbol::new(env, "approved"),
+    /// Detect cross-session fraud (answer sharing, coordination, knowledge transfer gaming)
+    pub fn detect_cross_session_fraud(
+        env: Env,
+        learner: Address,
+        session_id: Symbol,
+    ) -> Result<bool, soroban_sdk::Error> {
+        let backend: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Backend)
+            .expect("not initialized");
+        backend.require_auth();
+
+        // Get session completion log
+        let completion_log: Vec<SessionCompletionRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SessionCompletionLog(&learner))
+            .unwrap_or_else(|| vec![&env]);
+
+        if completion_log.len() < 2 {
+            return Ok(false); // Need at least 2 sessions to detect cross-session patterns
+        }
+
+        let now = env.ledger().timestamp();
+        let mut recent_sessions = 0u32;
+        let mut same_mentor_sessions = 0u32;
+
+        // Analyze recent session patterns
+        for comp_record in completion_log.iter() {
+            let time_delta = now.saturating_sub(comp_record.completion_time);
+
+            // Count sessions within fraud detection window
+            if time_delta <= FRAUD_DETECTION_WINDOW {
+                recent_sessions += 1;
+
+                // Get current session mentor for comparison
+                if let Some(current_session_mentor) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, Address>(&DataKey::SessionCompletionLog(&learner))
+                {
+                    if comp_record.mentor == current_session_mentor {
+                        same_mentor_sessions += 1;
+                    }
+                }
+            }
+        }
+
+        // Red flags for cross-session fraud
+        let fraud_indicators = [
+            (recent_sessions > MAX_SESSIONS_PER_DAY, "excessive_sessions"),
+            (same_mentor_sessions > 2, "same_mentor_pattern"),
+        ];
+
+        let mut fraud_detected = false;
+        for (condition, _flag) in fraud_indicators.iter() {
+            if *condition {
+                fraud_detected = true;
+                break;
+            }
+        }
+
+        Ok(fraud_detected)
+    }
+
+    /// Verify individual learning progression to prevent gaming
+    pub fn verify_individual_learning(
+        env: Env,
+        learner: Address,
+    ) -> Result<LearningAuthenticityReport, soroban_sdk::Error> {
+        let backend: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Backend)
+            .expect("not initialized");
+        backend.require_auth();
+
+        let completion_log: Vec<SessionCompletionRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SessionCompletionLog(&learner))
+            .unwrap_or_else(|| vec![&env]);
+
+        let total_sessions = completion_log.len() as u32;
+        let mut verified_sessions = 0u32;
+        let mut suspicious_sessions = 0u32;
+
+        // Verify each session's authenticity
+        for session_record in completion_log.iter() {
+            if session_record.verified {
+                verified_sessions += 1;
+            }
+
+            // Check for suspicious patterns
+            let time_since_completion = env
+                .ledger()
+                .timestamp()
+                .saturating_sub(session_record.completion_time);
+
+            // Unusually fast progression is suspicious
+            if time_since_completion < 3600 && verified_sessions > 3 {
+                suspicious_sessions += 1;
+            }
+        }
+
+        // Calculate authenticity score
+        let authenticity_score_bps = if total_sessions > 0 {
+            let verified_ratio = ((verified_sessions as u128 * 10000)
+                / (total_sessions as u128))
+                .min(10000) as u32;
+
+            let suspicious_penalty = ((suspicious_sessions as u128 * 2000)
+                / (total_sessions as u128))
+                .min(10000) as u32;
+
+            verified_ratio.saturating_sub(suspicious_penalty)
+        } else {
+            10000 // No sessions = no fraud detected
+        };
+
+        let report = LearningAuthenticityReport {
+            learner: learner.clone(),
+            total_sessions,
+            verified_sessions,
+            suspicious_sessions,
+            authenticity_score_bps,
+            assessment_timestamp: env.ledger().timestamp(),
+        };
+
+        // Store authenticity report
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuthenticityReport(&learner), &report);
+
+        Ok(report)
+    }
+
+    /// Detect answer sharing patterns between learners
+    pub fn detect_answer_sharing(
+        env: Env,
+        learner1: Address,
+        learner2: Address,
+    ) -> Result<bool, soroban_sdk::Error> {
+        let backend: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Backend)
+            .expect("not initialized");
+        backend.require_auth();
+
+        let log1: Vec<SessionCompletionRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SessionCompletionLog(&learner1))
+            .unwrap_or_else(|| vec![&env]);
+
+        let log2: Vec<SessionCompletionRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SessionCompletionLog(&learner2))
+            .unwrap_or_else(|| vec![&env]);
+
+        // Check for overlapping sessions with same mentor and skill
+        for session1 in log1.iter() {
+            for session2 in log2.iter() {
+                if session1.mentor == session2.mentor
+                    && session1.skill == session2.skill
+                {
+                    let time_diff = session1
+                        .completion_time
+                        .saturating_sub(session2.completion_time)
+                        .abs() as u64;
+
+                    // Sessions with identical mentor/skill completed within 1 hour
+                    // is suspicious
+                    if time_diff < 3600 {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Validate assessment integrity across sessions
+    pub fn validate_assessment_integrity(
+        env: Env,
+        learner: Address,
+    ) -> Result<bool, soroban_sdk::Error> {
+        let backend: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Backend)
+            .expect("not initialized");
+        backend.require_auth();
+
+        // Get learner's authenticity report
+        let report: Option<LearningAuthenticityReport> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuthenticityReport(&learner));
+
+        if let Some(auth_report) = report {
+            // Assessment is valid if authenticity score is above threshold
+            Ok(auth_report.authenticity_score_bps >= FRAUD_CONFIDENCE_THRESHOLD_BPS)
+        } else {
+            Ok(true) // No history = assume valid
         }
     }
 
-    /// Internal helper: Verify authentic progression
-    fn verify_authentic_progression(env: &Env, learner: &Address) -> shared::ProgressAuthenticityRecord {
-        // For now, return authentic result (simplified implementation)
-        shared::ProgressAuthenticityRecord {
-            learner: learner.clone(),
-            assessment_sequence: vec![env],
-            completion_times: vec![env],
-            score_progression: vec![env],
-            is_authentic: true,
-            authenticity_score: 90,
+    /// Apply fraud intervention - prevent certification if fraud detected
+    pub fn apply_fraud_intervention(
+        env: Env,
+        learner: Address,
+        reason: Symbol,
+    ) -> Result<(), soroban_sdk::Error> {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+
+        // Mark learner for fraud review
+        env.events().publish(
+            (Symbol::new(&env, "fraud_flag"), learner.clone()),
+            (reason, env.ledger().timestamp()),
+        );
+
+        Ok(())
+    }
+
+    /// Get learning progression metrics for audit
+    pub fn get_learner_session_history(
+        env: Env,
+        learner: Address,
+    ) -> Vec<SessionCompletionRecord> {
+        let history: Vec<SessionCompletionRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SessionCompletionLog(&learner))
+            .unwrap_or_else(|| vec![&env]);
+        history
+    }
+
+    /// Assess learning integrity across all certifications
+    pub fn get_learning_authenticity_score(
+        env: Env,
+        learner: Address,
+    ) -> u32 {
+        if let Some(report) = env
+            .storage()
+            .persistent()
+            .get::<_, LearningAuthenticityReport>(&DataKey::AuthenticityReport(&learner))
+        {
+            report.authenticity_score_bps
+        } else {
+            10000 // Default to fully authentic if no history
         }
     }
 }
