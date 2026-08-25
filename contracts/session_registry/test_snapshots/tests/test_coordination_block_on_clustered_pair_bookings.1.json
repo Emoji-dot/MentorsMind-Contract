@@ -17,7 +17,7 @@
               "function_name": "register_session",
               "args": [
                 {
-                  "symbol": "sess1"
+                  "symbol": "coordA1"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -29,7 +29,7 @@
                   "u64": "2000000"
                 },
                 {
-                  "u32": 60
+                  "u32": 5
                 },
                 {
                   "i128": "100"
@@ -44,7 +44,81 @@
         }
       ]
     ],
-    []
+    [
+      [
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+        {
+          "function": {
+            "contract_fn": {
+              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "function_name": "register_session",
+              "args": [
+                {
+                  "symbol": "coordA2"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                },
+                {
+                  "u64": "2003500"
+                },
+                {
+                  "u32": 5
+                },
+                {
+                  "i128": "100"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                }
+              ]
+            }
+          },
+          "sub_invocations": []
+        }
+      ]
+    ],
+    [],
+    [
+      [
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+        {
+          "function": {
+            "contract_fn": {
+              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "function_name": "register_session",
+              "args": [
+                {
+                  "symbol": "coordA4"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                },
+                {
+                  "u64": "2020000"
+                },
+                {
+                  "u32": 5
+                },
+                {
+                  "i128": "100"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                }
+              ]
+            }
+          },
+          "sub_invocations": []
+        }
+      ]
+    ]
   ],
   "ledger": {
     "protocol_version": 25,
@@ -78,7 +152,7 @@
               },
               "durability": "persistent",
               "val": {
-                "u32": 1
+                "u32": 3
               }
             }
           },
@@ -108,7 +182,67 @@
               },
               "durability": "persistent",
               "val": {
-                "symbol": "sess1"
+                "symbol": "coordA1"
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 4095
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "LearnerSessionAt"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                  },
+                  {
+                    "u32": 1
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "symbol": "coordA2"
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 4095
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "LearnerSessionAt"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                  },
+                  {
+                    "u32": 2
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "symbol": "coordA4"
               }
             }
           },
@@ -135,7 +269,7 @@
               },
               "durability": "persistent",
               "val": {
-                "u32": 1
+                "u32": 3
               }
             }
           },
@@ -162,7 +296,7 @@
               },
               "durability": "persistent",
               "val": {
-                "u32": 1
+                "u32": 3
               }
             }
           },
@@ -189,7 +323,7 @@
               },
               "durability": "persistent",
               "val": {
-                "i128": "100"
+                "i128": "300"
               }
             }
           },
@@ -249,7 +383,7 @@
                       "symbol": "recurrence_count"
                     },
                     "val": {
-                      "u32": 1
+                      "u32": 3
                     }
                   },
                   {
@@ -293,7 +427,7 @@
                       "symbol": "clustered_timing_count"
                     },
                     "val": {
-                      "u32": 0
+                      "u32": 1
                     }
                   },
                   {
@@ -301,7 +435,7 @@
                       "symbol": "repeated_pair_count"
                     },
                     "val": {
-                      "u32": 1
+                      "u32": 3
                     }
                   },
                   {
@@ -309,7 +443,7 @@
                       "symbol": "risk_score"
                     },
                     "val": {
-                      "u32": 0
+                      "u32": 30
                     }
                   },
                   {
@@ -460,6 +594,12 @@
                 "vec": [
                   {
                     "u64": "2000000"
+                  },
+                  {
+                    "u64": "2003500"
+                  },
+                  {
+                    "u64": "2020000"
                   }
                 ]
               }
@@ -489,6 +629,12 @@
               "durability": "persistent",
               "val": {
                 "vec": [
+                  {
+                    "u64": "1000000"
+                  },
+                  {
+                    "u64": "1000000"
+                  },
                   {
                     "u64": "1000000"
                   }
@@ -522,37 +668,7 @@
               },
               "durability": "persistent",
               "val": {
-                "symbol": "sess1"
-              }
-            }
-          },
-          "ext": "v0"
-        },
-        "live_until": 1000000
-      },
-      {
-        "entry": {
-          "last_modified_ledger_seq": 0,
-          "data": {
-            "contract_data": {
-              "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-              "key": {
-                "vec": [
-                  {
-                    "symbol": "MentorScheduleSlot"
-                  },
-                  {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                  },
-                  {
-                    "u64": "1112"
-                  }
-                ]
-              },
-              "durability": "persistent",
-              "val": {
-                "symbol": "sess1"
+                "symbol": "coordA1"
               }
             }
           },
@@ -582,7 +698,37 @@
               },
               "durability": "persistent",
               "val": {
-                "symbol": "sess1"
+                "symbol": "coordA2"
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 1000000
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "MentorScheduleSlot"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                  },
+                  {
+                    "u64": "1122"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "symbol": "coordA4"
               }
             }
           },
@@ -612,7 +758,67 @@
               },
               "durability": "persistent",
               "val": {
-                "symbol": "sess1"
+                "symbol": "coordA1"
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 4095
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "MentorSessionAt"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                  },
+                  {
+                    "u32": 1
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "symbol": "coordA2"
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 4095
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "MentorSessionAt"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                  },
+                  {
+                    "u32": 2
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "symbol": "coordA4"
               }
             }
           },
@@ -639,7 +845,7 @@
               },
               "durability": "persistent",
               "val": {
-                "u32": 1
+                "u32": 3
               }
             }
           },
@@ -666,7 +872,7 @@
               },
               "durability": "persistent",
               "val": {
-                "u32": 60
+                "u32": 15
               }
             }
           },
@@ -691,6 +897,12 @@
               "durability": "persistent",
               "val": {
                 "vec": [
+                  {
+                    "u64": "1000000"
+                  },
+                  {
+                    "u64": "1000000"
+                  },
                   {
                     "u64": "1000000"
                   }
@@ -721,6 +933,12 @@
                 "vec": [
                   {
                     "i128": "100"
+                  },
+                  {
+                    "i128": "100"
+                  },
+                  {
+                    "i128": "100"
                   }
                 ]
               }
@@ -743,7 +961,7 @@
                     "symbol": "Session"
                   },
                   {
-                    "symbol": "sess1"
+                    "symbol": "coordA1"
                   }
                 ]
               },
@@ -763,7 +981,7 @@
                       "symbol": "duration_mins"
                     },
                     "val": {
-                      "u32": 60
+                      "u32": 5
                     }
                   },
                   {
@@ -803,7 +1021,215 @@
                       "symbol": "session_id"
                     },
                     "val": {
-                      "symbol": "sess1"
+                      "symbol": "coordA1"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "status"
+                    },
+                    "val": {
+                      "vec": [
+                        {
+                          "symbol": "Pending"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "token"
+                    },
+                    "val": {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 1000000
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "Session"
+                  },
+                  {
+                    "symbol": "coordA2"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "map": [
+                  {
+                    "key": {
+                      "symbol": "amount"
+                    },
+                    "val": {
+                      "i128": "100"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "duration_mins"
+                    },
+                    "val": {
+                      "u32": 5
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "learner"
+                    },
+                    "val": {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "mentor"
+                    },
+                    "val": {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "registered_at"
+                    },
+                    "val": {
+                      "u64": "1000000"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "scheduled_at"
+                    },
+                    "val": {
+                      "u64": "2003500"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "session_id"
+                    },
+                    "val": {
+                      "symbol": "coordA2"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "status"
+                    },
+                    "val": {
+                      "vec": [
+                        {
+                          "symbol": "Pending"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "token"
+                    },
+                    "val": {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 1000000
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "Session"
+                  },
+                  {
+                    "symbol": "coordA4"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "map": [
+                  {
+                    "key": {
+                      "symbol": "amount"
+                    },
+                    "val": {
+                      "i128": "100"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "duration_mins"
+                    },
+                    "val": {
+                      "u32": 5
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "learner"
+                    },
+                    "val": {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "mentor"
+                    },
+                    "val": {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "registered_at"
+                    },
+                    "val": {
+                      "u64": "1000000"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "scheduled_at"
+                    },
+                    "val": {
+                      "u64": "2020000"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "session_id"
+                    },
+                    "val": {
+                      "symbol": "coordA4"
                     }
                   },
                   {
@@ -859,7 +1285,7 @@
                       "symbol": "burst_count"
                     },
                     "val": {
-                      "u32": 0
+                      "u32": 2
                     }
                   },
                   {
@@ -867,7 +1293,7 @@
                       "symbol": "distinct_requester_bps"
                     },
                     "val": {
-                      "u32": 10000
+                      "u32": 3333
                     }
                   },
                   {
@@ -883,7 +1309,7 @@
                       "symbol": "risk_score"
                     },
                     "val": {
-                      "u32": 0
+                      "u32": 20
                     }
                   }
                 ]
@@ -950,6 +1376,46 @@
         "entry": {
           "last_modified_ledger_seq": 0,
           "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+              "key": {
+                "ledger_key_nonce": {
+                  "nonce": "4837995959683129791"
+                }
+              },
+              "durability": "temporary",
+              "val": "void"
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 6311999
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+              "key": {
+                "ledger_key_nonce": {
+                  "nonce": "5541220902715666415"
+                }
+              },
+              "durability": "temporary",
+              "val": "void"
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 6311999
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
             "contract_code": {
               "ext": "v0",
               "hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -962,5 +1428,42 @@
       }
     ]
   },
-  "events": []
+  "events": [
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "session"
+              },
+              {
+                "symbol": "session_registered"
+              },
+              {
+                "symbol": "coordA4"
+              }
+            ],
+            "data": {
+              "vec": [
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                },
+                {
+                  "u64": "2020000"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    }
+  ]
 }

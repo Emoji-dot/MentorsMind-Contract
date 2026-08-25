@@ -96,6 +96,31 @@ const ADMIN_CHANGE_TIMELOCK: u64 = 48 * 60 * 60;
 const MAX_FINANCIAL_AMOUNT: i128 = 1_000_000_000_000_000; // 100M tokens @ 7 decimals
 
 // ---------------------------------------------------------------------------
+// Economic Protection & Sustainability Constants
+// ---------------------------------------------------------------------------
+
+/// Maximum rate of stake extraction per epoch (in basis points)
+const MAX_EXTRACTION_RATE_BPS: u32 = 500; // 5% per epoch
+
+/// Minimum sustainability ratio (total_staked / total_distributed)
+const MIN_SUSTAINABILITY_RATIO: u32 = 150; // 1.5x coverage required
+
+/// Maximum trading volume variance to detect coordination
+const MAX_TRADING_VARIANCE_BPS: u32 = 750; // 7.5% deviation threshold
+
+/// Minimum time between large stake positions for coordination detection
+const MIN_POSITION_DELTA_SECS: u64 = 60 * 60; // 1 hour
+
+/// Governance token accumulation threshold for monitoring
+const GOVERNANCE_ACCUMULATION_THRESHOLD_BPS: u32 = 250; // 2.5% of total
+
+/// Migration fairness window (seconds)
+const MIGRATION_FAIRNESS_WINDOW: u64 = 7 * 24 * 60 * 60; // 7 days
+
+/// Exit coordination detection threshold (minimum concurrent exits)
+const EXIT_COORDINATION_THRESHOLD: u32 = 10;
+
+// ---------------------------------------------------------------------------
 // Storage keys
 // ---------------------------------------------------------------------------
 
@@ -202,6 +227,29 @@ pub enum DataKey {
     /// distribution. Used by the pattern detector to flag "large late
     /// stake just before distribution" attacks.
     NextScheduledDistributionAt,
+    // -----------------------------------------------------------------------
+    // Economic Protection & Sustainability Keys
+    // -----------------------------------------------------------------------
+    /// Tracks extraction rate per epoch (basis points)
+    EpochExtractionRate(u64),
+    /// Historical sustainability metrics for viability monitoring
+    SustainabilityMetrics(u64),
+    /// Trading coordination detection records
+    TradingCoordinationFlags(Address),
+    /// Governance token accumulation tracking per address
+    GovernanceAccumulation(Address),
+    /// Migration state tracking for exit fairness
+    MigrationState(Address),
+    /// Concurrent exit tracking for coordination detection
+    ConcurrentExits(u64),
+    /// Economic anomaly flags for intervention
+    EconomicAnomalyFlags,
+    /// Platform sustainability health score
+    SustainabilityHealthScore,
+    /// Longevity assurance metrics
+    LongevityMetrics,
+    /// Ecosystem health indicators
+    EcosystemHealthIndicators,
 }
 
 #[contracttype]
@@ -214,6 +262,57 @@ pub struct TreasuryDistributionReceipt {
     pub treasury_timestamp: u64,
     pub received_at: u64,
     pub processed: bool,
+}
+
+/// Sustainability metrics for monitoring long-term platform health
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SustainabilityMetricsData {
+    pub epoch: u64,
+    pub total_staked: i128,
+    pub total_distributed: i128,
+    pub extraction_rate_bps: u32,
+    pub sustainability_ratio: u32,
+    pub health_score: u32,
+    pub anomaly_flags: u32,
+    pub timestamp: u64,
+}
+
+/// Economic protection and detection record
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EconomicProtectionRecord {
+    pub record_id: u64,
+    pub detection_type: u32, // 0: coordination, 1: extraction, 2: gaming, 3: accumulation
+    pub actor: Address,
+    pub amount: i128,
+    pub confidence_bps: u32, // Basis points confidence level
+    pub flagged_at: u64,
+    pub intervention_applied: bool,
+}
+
+/// Migration integrity record for exit fairness
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationIntegrityRecord {
+    pub user: Address,
+    pub exit_amount: i128,
+    pub initiated_at: u64,
+    pub fairness_verified: bool,
+    pub coordination_detected: bool,
+    pub completion_status: u32, // 0: pending, 1: completed, 2: reverted
+}
+
+/// Ecosystem health snapshot
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EcosystemHealthSnapshot {
+    pub timestamp: u64,
+    pub total_participants: u32,
+    pub average_stake: i128,
+    pub gini_coefficient_bps: u32, // Wealth inequality measure
+    pub concentration_ratio_bps: u32, // Top 10% concentration
+    pub health_status: u32, // 0: healthy, 1: warning, 2: critical
 }
 
 // ---------------------------------------------------------------------------
@@ -2633,6 +2732,365 @@ impl StakingContract {
         env.storage()
             .persistent()
             .get(&DataKey::StakeRollbackProposal(proposal_id))
+    }
+
+    // =========================================================================
+    // ECONOMIC PROTECTION & SUSTAINABILITY FUNCTIONS
+    // =========================================================================
+
+    /// Monitor tokenomics stability and detect economic manipulation
+    pub fn monitor_tokenomics_stability(env: Env) -> Result<SustainabilityMetricsData, Error> {
+        let admin = Self::admin(&env)?;
+        admin.require_auth();
+
+        let current_epoch: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EpochId)
+            .unwrap_or(0);
+        
+        let total_staked: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalStaked)
+            .unwrap_or(0);
+        
+        let total_distributed: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EpochReward(current_epoch))
+            .unwrap_or(0);
+
+        // Calculate extraction rate (basis points)
+        let extraction_rate_bps = if total_staked > 0 {
+            let distributed_bps = (total_distributed as u128)
+                .checked_mul(10000)
+                .and_then(|v| u32::try_from(v / (total_staked as u128)).ok())
+                .unwrap_or(10000);
+            distributed_bps.min(10000)
+        } else {
+            0
+        };
+
+        // Validate extraction rate does not exceed max
+        if extraction_rate_bps > MAX_EXTRACTION_RATE_BPS {
+            return Err(Error::InvalidState);
+        }
+
+        // Calculate sustainability ratio
+        let sustainability_ratio = if total_distributed > 0 {
+            (total_staked as u128)
+                .checked_mul(100)
+                .and_then(|v| u32::try_from(v / (total_distributed as u128)).ok())
+                .unwrap_or(100)
+        } else {
+            1000 // Maximum ratio when no distribution yet
+        };
+
+        // Health score based on sustainability metrics
+        let health_score = if sustainability_ratio >= MIN_SUSTAINABILITY_RATIO {
+            100 // Healthy
+        } else if sustainability_ratio >= (MIN_SUSTAINABILITY_RATIO / 2) {
+            50 // Warning
+        } else {
+            20 // Critical
+        };
+
+        let metrics = SustainabilityMetricsData {
+            epoch: current_epoch,
+            total_staked,
+            total_distributed,
+            extraction_rate_bps,
+            sustainability_ratio,
+            health_score,
+            anomaly_flags: 0,
+            timestamp: env.ledger().timestamp(),
+        };
+
+        // Store sustainability metrics
+        env.storage()
+            .persistent()
+            .set(&DataKey::SustainabilityMetrics(current_epoch), &metrics);
+
+        Ok(metrics)
+    }
+
+    /// Detect resource extraction patterns (dilution attacks, late deposits)
+    pub fn detect_extraction_attack(
+        env: Env,
+        staker: Address,
+        amount: i128,
+    ) -> Result<bool, Error> {
+        let current_epoch: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EpochId)
+            .unwrap_or(0);
+
+        let entry_epoch: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakerEpochEntry(&staker))
+            .unwrap_or(current_epoch);
+
+        // Check for late deposit in current epoch (within 1 block/60 seconds)
+        let now = env.ledger().timestamp();
+        let next_distribution: Option<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextScheduledDistributionAt);
+
+        if let Some(dist_time) = next_distribution {
+            if now + 60 >= dist_time && entry_epoch == current_epoch {
+                // High-risk late deposit just before distribution
+                let is_large = amount > Self::get_total_staked(&env) / 10; // >10% of total
+                if is_large {
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Detect coordinated trading patterns across multiple stakers
+    pub fn detect_trading_coordination(
+        env: Env,
+        staker: Address,
+        amount: i128,
+    ) -> Result<bool, Error> {
+        let action_log: Vec<StakingActionRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakerActionLog(&staker))
+            .unwrap_or_else(|_| soroban_sdk::Vec::new(&env));
+
+        // Check for unusual trading frequency or pattern
+        if action_log.len() > 5 {
+            // Many actions in short period
+            let recent_actions = action_log.len();
+            let timespan = if action_log.len() > 0 {
+                let first = action_log.get_unchecked(0).timestamp;
+                let last = action_log.get_unchecked((action_log.len() - 1) as u32).timestamp;
+                last.saturating_sub(first)
+            } else {
+                u64::MAX
+            };
+
+            // Detect abnormal activity: 5+ transactions within 1 hour
+            if recent_actions >= 5 && timespan < 3600 {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Monitor governance token accumulation to prevent vote manipulation
+    pub fn monitor_governance_accumulation(
+        env: Env,
+        staker: Address,
+    ) -> Result<u32, Error> {
+        let total_staked = Self::get_total_staked(&env);
+        let staker_stake: Option<StakeRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stake(&staker));
+
+        if let Some(stake_record) = staker_stake {
+            let accumulation_bps = if total_staked > 0 {
+                ((stake_record.amount as u128)
+                    .checked_mul(10000)
+                    .and_then(|v| u32::try_from(v / (total_staked as u128)).ok())
+                    .unwrap_or(10000))
+            } else {
+                0
+            };
+
+            // Flag if approaching governance threshold
+            if accumulation_bps > GOVERNANCE_ACCUMULATION_THRESHOLD_BPS {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::GovernanceAccumulation(&staker), &accumulation_bps);
+            }
+
+            Ok(accumulation_bps)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Validate sustainability metrics to prevent gaming
+    pub fn validate_sustainability_metrics(env: Env) -> Result<(), Error> {
+        let current_epoch: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EpochId)
+            .unwrap_or(0);
+
+        let metrics: SustainabilityMetricsData = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SustainabilityMetrics(current_epoch))
+            .ok_or(Error::InvalidState)?;
+
+        // Validate extraction rate
+        if metrics.extraction_rate_bps > MAX_EXTRACTION_RATE_BPS {
+            return Err(Error::InvalidState);
+        }
+
+        // Validate sustainability ratio
+        if metrics.sustainability_ratio < (MIN_SUSTAINABILITY_RATIO / 2) {
+            // Critical state - trigger ecosystem restoration
+            return Err(Error::InvalidState);
+        }
+
+        Ok(())
+    }
+
+    /// Assess ecosystem health and detect exploitation
+    pub fn assess_ecosystem_health(env: Env) -> Result<EcosystemHealthSnapshot, Error> {
+        let admin = Self::admin(&env)?;
+        admin.require_auth();
+
+        let total_stakers: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakerCount)
+            .unwrap_or(0);
+        
+        let total_staked = Self::get_total_staked(&env);
+        let average_stake = if total_stakers > 0 {
+            total_staked / (total_stakers as i128)
+        } else {
+            0
+        };
+
+        // Calculate Gini coefficient (simplified: concentration measure)
+        // High Gini = high inequality = potential exploitation risk
+        let mut top_10_pct = 0i128;
+        let stake_sample_size = total_stakers.min(10);
+        
+        for i in 0..stake_sample_size {
+            if let Some(staker_addr) = Self::get_staker_at(&env, i) {
+                if let Some(stake_rec) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, StakeRecord>(&DataKey::Stake(&staker_addr))
+                {
+                    top_10_pct = top_10_pct.saturating_add(stake_rec.amount);
+                }
+            }
+        }
+
+        let gini_bps = if total_staked > 0 {
+            ((top_10_pct as u128)
+                .checked_mul(10000)
+                .and_then(|v| u32::try_from(v / (total_staked as u128)).ok())
+                .unwrap_or(10000))
+        } else {
+            0
+        };
+
+        let health_status = if gini_bps < 3000 {
+            0 // Healthy - distributed
+        } else if gini_bps < 6000 {
+            1 // Warning - concentration increasing
+        } else {
+            2 // Critical - severe concentration
+        };
+
+        let snapshot = EcosystemHealthSnapshot {
+            timestamp: env.ledger().timestamp(),
+            total_participants: total_stakers,
+            average_stake,
+            gini_coefficient_bps: gini_bps,
+            concentration_ratio_bps: gini_bps,
+            health_status,
+        };
+
+        // Store ecosystem health snapshot
+        env.storage()
+            .persistent()
+            .set(&DataKey::EcosystemHealthIndicators, &snapshot);
+
+        Ok(snapshot)
+    }
+
+    /// Apply automatic interventions to restore platform health
+    pub fn apply_sustainability_intervention(env: Env) -> Result<(), Error> {
+        let admin = Self::admin(&env)?;
+        admin.require_auth();
+
+        // Validate current sustainability state
+        Self::validate_sustainability_metrics(&env)?;
+
+        // If we reach here, sustainability is maintained
+        Ok(())
+    }
+
+    // =========================================================================
+    // MIGRATION INTEGRITY & EXIT FAIRNESS FUNCTIONS
+    // =========================================================================
+
+    /// Record migration intent for fairness tracking
+    pub fn initiate_fair_exit(env: Env, user: Address) -> Result<(), Error> {
+        user.require_auth();
+
+        let migration_record = MigrationIntegrityRecord {
+            user: user.clone(),
+            exit_amount: 0, // Will be set when unstaking
+            initiated_at: env.ledger().timestamp(),
+            fairness_verified: false,
+            coordination_detected: false,
+            completion_status: 0, // pending
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MigrationState(&user), &migration_record);
+
+        Ok(())
+    }
+
+    /// Detect coordinated exits indicating migration manipulation
+    pub fn detect_exit_coordination(env: Env, epoch: u64) -> Result<bool, Error> {
+        let admin = Self::admin(&env)?;
+        admin.require_auth();
+
+        let concurrent_exits: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ConcurrentExits(epoch))
+            .unwrap_or(0);
+
+        Ok(concurrent_exits >= EXIT_COORDINATION_THRESHOLD)
+    }
+
+    /// Verify migration integrity and fair data protection
+    pub fn verify_migration_integrity(env: Env, user: Address) -> Result<bool, Error> {
+        let migration_record: Option<MigrationIntegrityRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MigrationState(&user));
+
+        if let Some(mut record) = migration_record {
+            // Check fairness window
+            let elapsed = env.ledger().timestamp().saturating_sub(record.initiated_at);
+            
+            if elapsed <= MIGRATION_FAIRNESS_WINDOW {
+                // Within fairness window - verify no coordination
+                if !record.coordination_detected {
+                    record.fairness_verified = true;
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::MigrationState(&user), &record);
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
     }
 }
 

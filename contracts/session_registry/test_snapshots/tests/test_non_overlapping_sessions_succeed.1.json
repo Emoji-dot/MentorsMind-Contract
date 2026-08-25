@@ -1,6 +1,6 @@
 {
   "generators": {
-    "address": 5,
+    "address": 6,
     "nonce": 0,
     "mux_id": 0
   },
@@ -17,7 +17,7 @@
               "function_name": "register_session",
               "args": [
                 {
-                  "symbol": "sess1"
+                  "symbol": "sess_nooverlap_1"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -35,7 +35,7 @@
                   "i128": "100"
                 },
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
                 }
               ]
             }
@@ -108,7 +108,7 @@
               },
               "durability": "persistent",
               "val": {
-                "symbol": "sess1"
+                "symbol": "sess_nooverlap_1"
               }
             }
           },
@@ -522,7 +522,7 @@
               },
               "durability": "persistent",
               "val": {
-                "symbol": "sess1"
+                "symbol": "sess_nooverlap_1"
               }
             }
           },
@@ -552,7 +552,7 @@
               },
               "durability": "persistent",
               "val": {
-                "symbol": "sess1"
+                "symbol": "sess_nooverlap_1"
               }
             }
           },
@@ -582,7 +582,7 @@
               },
               "durability": "persistent",
               "val": {
-                "symbol": "sess1"
+                "symbol": "sess_nooverlap_1"
               }
             }
           },
@@ -612,7 +612,7 @@
               },
               "durability": "persistent",
               "val": {
-                "symbol": "sess1"
+                "symbol": "sess_nooverlap_1"
               }
             }
           },
@@ -743,7 +743,7 @@
                     "symbol": "Session"
                   },
                   {
-                    "symbol": "sess1"
+                    "symbol": "sess_nooverlap_1"
                   }
                 ]
               },
@@ -803,7 +803,7 @@
                       "symbol": "session_id"
                     },
                     "val": {
-                      "symbol": "sess1"
+                      "symbol": "sess_nooverlap_1"
                     }
                   },
                   {
@@ -823,7 +823,7 @@
                       "symbol": "token"
                     },
                     "val": {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
                     }
                   }
                 ]

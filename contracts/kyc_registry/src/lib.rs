@@ -1,4 +1,8 @@
 #![no_std]
+use shared::{
+    check_access, compute_privacy_intervention, detect_exploitation, minimize_to_need_to_know,
+    AccessDecision, ConsentRecord, PrivacyInterventionRecord, PrivacyMonitoringResult, ALL_FIELDS,
+};
 use soroban_sdk::{
     contract, contractclient, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
     Symbol, Vec,
@@ -38,7 +42,17 @@ pub enum DataKey {
     Rbac,
     Kyc(Address),
     KycExpiryAlert(Address),
+    /// Subject-granted consent for a purpose (privacy protection, #data-access-control).
+    Consent(Address, Symbol),
+    /// Timestamps of `accessor` reading `subject`'s data, for exploitation monitoring.
+    AccessLog(Address, Address),
+    /// Automatic-isolation flag set when exploitative access is detected.
+    PrivacyIsolated(Address),
 }
+
+/// Maximum length of the rolling per-(accessor,subject) access log kept for
+/// exploitation scoring.
+const ACCESS_LOG_CAP: u32 = 20;
 
 /// Alerts are raised once expiry is within this window (30 days).
 const EXPIRY_ALERT_WINDOW: u64 = 30 * 24 * 60 * 60;
@@ -242,6 +256,134 @@ impl KycRegistry {
             .remove(&DataKey::KycExpiryAlert(user.clone()));
 
         env.events().publish((symbol_short!("kyc_rvk"), user), ());
+    }
+
+    /// Grant or update a subject's consent for `purpose`, scoping exactly
+    /// which data-category fields (see `shared::FIELD_*` bitmask) may be
+    /// accessed and for how long. Only the subject may manage their own
+    /// consent (self-sovereign privacy).
+    pub fn manage_data_privacy(
+        env: Env,
+        subject: Address,
+        purpose: Symbol,
+        granted_fields: u32,
+        duration_secs: u64,
+    ) -> ConsentRecord {
+        subject.require_auth();
+        let now = env.ledger().timestamp();
+        let record = ConsentRecord {
+            subject: subject.clone(),
+            purpose: purpose.clone(),
+            granted_fields: granted_fields & ALL_FIELDS,
+            granted_at: now,
+            expires_at: now.saturating_add(duration_secs),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Consent(subject.clone(), purpose.clone()), &record);
+        // A fresh consent grant lifts any prior automatic isolation.
+        env.storage()
+            .persistent()
+            .set(&DataKey::PrivacyIsolated(subject.clone()), &false);
+        env.events()
+            .publish((symbol_short!("consent"), subject), (purpose, record.granted_fields));
+        record
+    }
+
+    /// Enforce access control for `accessor` reading `subject`'s data for
+    /// `purpose`: minimizes the request to the need-to-know field set,
+    /// checks it against the subject's consent, records the access for
+    /// exploitation monitoring, and automatically isolates the subject's
+    /// data (denying all further access) when the access pattern turns
+    /// exploitative or the consent scope is violated.
+    pub fn enforce_access_controls(
+        env: Env,
+        accessor: Address,
+        subject: Address,
+        purpose: Symbol,
+        requested_fields: u32,
+    ) -> AccessDecision {
+        accessor.require_auth();
+        let now = env.ledger().timestamp();
+
+        let isolated: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PrivacyIsolated(subject.clone()))
+            .unwrap_or(false);
+
+        let minimized = minimize_to_need_to_know(&env, &purpose, requested_fields);
+        let consent: Option<ConsentRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Consent(subject.clone(), purpose));
+
+        let mut access = match &consent {
+            Some(record) => check_access(record, minimized, now),
+            None => AccessDecision {
+                allowed: false,
+                allowed_fields: 0,
+                denied_fields: minimized,
+            },
+        };
+        if isolated {
+            access.allowed = false;
+        }
+
+        // Record the access attempt and re-score exploitation risk.
+        let log_key = DataKey::AccessLog(accessor, subject.clone());
+        let mut log: Vec<u64> = env.storage().persistent().get(&log_key).unwrap_or(Vec::new(&env));
+        log.push_back(now);
+        while log.len() > ACCESS_LOG_CAP {
+            log.remove(0);
+        }
+        env.storage().persistent().set(&log_key, &log);
+
+        let monitoring = detect_exploitation(&log, now);
+        let intervention = compute_privacy_intervention(&env, access, monitoring);
+        if intervention.isolate {
+            env.storage()
+                .persistent()
+                .set(&DataKey::PrivacyIsolated(subject.clone()), &true);
+            access.allowed = false;
+            env.events().publish(
+                (symbol_short!("privacy"), symbol_short!("isolate")),
+                (subject, intervention.reason),
+            );
+        }
+
+        access
+    }
+
+    /// Audit `accessor`'s access history against `subject`'s data for
+    /// exploitative extraction patterns (read-only; does not mutate the
+    /// access log, which `enforce_access_controls` owns).
+    pub fn monitor_data_usage(env: Env, accessor: Address, subject: Address) -> PrivacyMonitoringResult {
+        let log: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AccessLog(accessor, subject))
+            .unwrap_or(Vec::new(&env));
+        detect_exploitation(&log, env.ledger().timestamp())
+    }
+
+    /// Whether `subject`'s data is currently under automatic privacy isolation.
+    pub fn is_privacy_isolated(env: Env, subject: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PrivacyIsolated(subject))
+            .unwrap_or(false)
+    }
+
+    /// Restore access once the subject grants fresh consent, or an admin
+    /// lifts isolation after review.
+    pub fn restore_privacy_access(env: Env, admin: Address, subject: Address) {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PrivacyIsolated(subject.clone()), &false);
+        env.events()
+            .publish((symbol_short!("privacy"), symbol_short!("restore")), subject);
     }
 
     /// Internal helper to require admin authorization.
