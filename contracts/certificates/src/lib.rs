@@ -5,6 +5,10 @@ use soroban_sdk::{
     Vec,
 };
 
+use shared::{
+    AssessmentSecurity, AssessmentSecurityError, TransferSecurity, TransferSecurityError,
+};
+
 const MIN_CERT_RATING: u64 = 400; // 4.0/5.0 * 100
 const MIN_SESSIONS_COMPLETED: u32 = 3;
 
@@ -36,6 +40,8 @@ pub struct CertificateRecord {
     pub revoked: bool,
     pub session_id: Symbol,
     pub rating_at_time: u64,
+    pub authenticity_verified: bool,
+    pub gaming_detection_score: u32,
 }
 
 /// Session completion record for fraud detection
@@ -146,6 +152,7 @@ impl Certificates {
 
     /// Issue a gated certificate. Platform backend only.
     /// Verifies: escrow released, mentor rating >= 4.0, learner completed >= N sessions.
+    /// ENHANCED: Performs gaming detection and authenticity verification
     pub fn issue_certificate(
         env: Env,
         learner: Address,
@@ -197,6 +204,19 @@ impl Certificates {
             panic!("insufficient sessions completed");
         }
 
+        // NEW: Detect potential gaming patterns
+        let gaming_detection = Self::detect_assessment_gaming(&env, &learner, issued_at);
+        if gaming_detection.is_gaming {
+            env.events().publish(
+                (Symbol::new(&env, "GamingDetected"), learner.clone()),
+                (skill.clone(), gaming_detection.confidence_score),
+            );
+            panic!("gaming patterns detected");
+        }
+
+        // NEW: Verify authentic progression
+        let authenticity = Self::verify_authentic_progression(&env, &learner);
+
         let id: u64 = env
             .storage()
             .persistent()
@@ -215,6 +235,8 @@ impl Certificates {
             revoked: false,
             session_id: session_id.clone(),
             rating_at_time: rating,
+            authenticity_verified: authenticity.is_authentic,
+            gaming_detection_score: gaming_detection.confidence_score,
         };
 
         env.storage().persistent().set(&DataKey::Cert(id), &cert);
