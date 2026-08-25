@@ -26,6 +26,8 @@ use shared::{
     MarketMetrics, DemandAuthenticityResult, PriceDiscoveryValidation,
     // ML security (main's integrity systems)
     MLSecurity,
+    // Skill verification & specialization-fraud protection (#891)
+    detect_skill_fraud, SkillFraudFlag,
 };
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal,
@@ -36,6 +38,9 @@ use soroban_sdk::{
 const ESCROW: Symbol = symbol_short!("ESCROW");
 const TTL_THRESHOLD: u32 = 500_000;
 const TTL_BUMP: u32 = 1_000_000;
+/// Maximum rolling outcome scores retained per (mentor, specialization) for
+/// expertise/fraud tracking (#891).
+const MAX_SPECIALIZATION_HISTORY: u32 = 20;
 
 // ── Types ────────────────────────────────────────────────────────────────────
 #[contracttype]
@@ -141,6 +146,11 @@ pub enum DataKey {
     // Market monitoring (#915)
     SpecializationMetrics(Symbol),
     MarketManipulationAlert(Symbol),
+    // Skill verification & specialization-fraud protection (#891)
+    /// Rolling session-outcome scores (bps) for a mentor's claimed specialization.
+    SpecializationOutcomeHistory(Address, Symbol),
+    /// Cached expertise/fraud assessment for a mentor's claimed specialization.
+    SpecializationExpertiseFlag(Address, Symbol),
 }
 
 /// Cooldown before an intervened mentor's community access is eligible for
@@ -1724,6 +1734,80 @@ impl ReputationContract {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Expertise monitoring & specialization performance (#891)
+    // -----------------------------------------------------------------------
+
+    /// Record a completed session's outcome score (basis points) toward a
+    /// mentor's claimed specialization and re-assess misrepresentation risk
+    /// from the resulting performance history.
+    pub fn track_specialization_performance(
+        env: Env,
+        mentor: Address,
+        specialization: Symbol,
+        session_outcome_score_bps: u32,
+    ) -> SkillFraudFlag {
+        let key = DataKey::SpecializationOutcomeHistory(mentor.clone(), specialization.clone());
+        let mut history: Vec<u32> = env.storage().persistent().get(&key).unwrap_or(Vec::new(&env));
+        history.push_back(session_outcome_score_bps);
+        while history.len() > MAX_SPECIALIZATION_HISTORY {
+            history.remove(0);
+        }
+        env.storage().persistent().set(&key, &history);
+
+        // Credential authenticity is owned by the verification contract;
+        // here we score purely on observed session-outcome performance.
+        let flag = detect_skill_fraud(&history, true);
+        env.storage().persistent().set(
+            &DataKey::SpecializationExpertiseFlag(mentor.clone(), specialization.clone()),
+            &flag,
+        );
+
+        if flag.fraud_suspected {
+            env.events().publish(
+                (symbol_short!("special"), Symbol::new(&env, "underperform")),
+                (mentor, specialization, flag.risk_score),
+            );
+        }
+
+        flag
+    }
+
+    /// Return the average learning-outcome score (basis points) and number
+    /// of tracked sessions for a mentor's claimed specialization.
+    pub fn measure_learning_outcomes(
+        env: Env,
+        mentor: Address,
+        specialization: Symbol,
+    ) -> (u32, u32) {
+        let history: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SpecializationOutcomeHistory(mentor, specialization))
+            .unwrap_or(Vec::new(&env));
+        let count = history.len();
+        if count == 0 {
+            return (0, 0);
+        }
+        let mut total: u64 = 0;
+        for score in history.iter() {
+            total = total.saturating_add(score as u64);
+        }
+        ((total / count as u64) as u32, count)
+    }
+
+    /// Return the cached expertise/fraud assessment for a mentor's claimed
+    /// specialization, if one has been recorded.
+    pub fn get_specialization_expertise(
+        env: Env,
+        mentor: Address,
+        specialization: Symbol,
+    ) -> Option<SkillFraudFlag> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SpecializationExpertiseFlag(mentor, specialization))
+    }
+
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -2061,5 +2145,41 @@ mod tests {
             li.timestamp = status.restoration_eligible_at;
         });
         client.restore_fair_participation(&arbitrator, &mentor);
+    }
+
+    // -----------------------------------------------------------------------
+    // Expertise monitoring & specialization performance (#891)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_track_specialization_performance_no_fraud_on_good_outcomes() {
+        let (env, client, _escrow_id, mentor, _learner) = setup();
+        let specialization = Symbol::new(&env, "rust_dev");
+
+        client.track_specialization_performance(&mentor, &specialization, &9000u32);
+        client.track_specialization_performance(&mentor, &specialization, &8500u32);
+        let flag = client.track_specialization_performance(&mentor, &specialization, &8800u32);
+
+        assert!(!flag.fraud_suspected);
+
+        let (avg, count) = client.measure_learning_outcomes(&mentor, &specialization);
+        assert_eq!(count, 3);
+        assert!(avg > 8000);
+    }
+
+    #[test]
+    fn test_track_specialization_performance_flags_underperformance() {
+        let (env, client, _escrow_id, mentor, _learner) = setup();
+        let specialization = Symbol::new(&env, "rust_dev");
+
+        client.track_specialization_performance(&mentor, &specialization, &1000u32);
+        client.track_specialization_performance(&mentor, &specialization, &1500u32);
+        let flag = client.track_specialization_performance(&mentor, &specialization, &2000u32);
+
+        assert!(flag.fraud_suspected);
+        assert_eq!(flag.underperformance_count, 3);
+
+        let cached = client.get_specialization_expertise(&mentor, &specialization).unwrap();
+        assert_eq!(cached.risk_score, flag.risk_score);
     }
 }
