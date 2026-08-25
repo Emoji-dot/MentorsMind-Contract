@@ -10,6 +10,14 @@ use shared::{
     DemandAuthenticity, FairAccessDecision, FairResourceAllocation, LoadValidationResult,
     PerformanceInterventionRecord, PriceCoordinationFlag, ReputationProof,
     ResourceCompetitionFlag, SocialProofRecord, PERFORMANCE_RESTORATION_COOLDOWN_SECS,
+    // learner protection
+    assess_vulnerability, enforce_learner_fair_pricing as shared_enforce_learner_fair_pricing,
+    compute_learner_protection_intervention, compute_emergency_intervention,
+    is_protection_restoration_eligible,
+    detect_predatory_behavior as shared_detect_predatory_behavior,
+    identify_exploitation_patterns as shared_identify_exploitation_patterns,
+    compute_welfare_status as shared_compute_welfare_status,
+    VulnerabilityAssessment, EmergencyIntervention, LearnerProtectionRecord,
 };
 
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec};
@@ -95,6 +103,27 @@ pub enum DataKey {
     /// Cached combined performance-protection intervention record for a
     /// mentor.
     PerformanceIntervention(Address),
+    // ── Learner protection (#917) ──────────────────────────────────────────
+    /// Total session count between a specific learner and mentor pair, used
+    /// for recurrence/dependency vulnerability assessment.
+    LearnerMentorSessionCount(Address, Address),
+    /// Rolling sum of session prices paid by a learner (for avg computation).
+    LearnerTotalSpend(Address),
+    /// Total session count for a learner across all mentors.
+    LearnerTotalSessionCount(Address),
+    /// Cached vulnerability assessment for a learner/mentor pair.
+    LearnerVulnerabilityRecord(Address, Address),
+    /// Cached predatory-behaviour detection result for a mentor (from the
+    /// session registry's perspective – complaint/quality signals come from
+    /// the reputation contract; this stores the combined view once pushed
+    /// here by `monitor_mentor_behavior`).
+    MentorPredatoryBehaviorRecord(Address),
+    /// Cached learner-protection intervention record for a mentor.
+    LearnerProtectionIntervention(Address),
+    /// Emergency intervention record for a mentor.
+    MentorEmergencyIntervention(Address),
+    /// Whether a mentor is currently under an active emergency suspension.
+    MentorSuspended(Address),
 }
 
 /// Maximum length of the rolling price/pair/request logs kept for scoring.
@@ -158,6 +187,25 @@ impl SessionRegistry {
         if !access.access_granted {
             panic!("CommunityAccessRestricted");
         }
+
+        // Learner protection: update learner/mentor pair session count and
+        // learner spend totals, then assess vulnerability and enforce fair pricing.
+        let pair_cnt_key = DataKey::LearnerMentorSessionCount(learner.clone(), mentor.clone());
+        let pair_cnt: u32 = env.storage().persistent().get(&pair_cnt_key).unwrap_or(0);
+        env.storage().persistent().set(&pair_cnt_key, &pair_cnt.saturating_add(1));
+        env.storage().persistent().extend_ttl(&pair_cnt_key, TTL_THRESHOLD, TTL_BUMP);
+
+        let spend_key = DataKey::LearnerTotalSpend(learner.clone());
+        let spend: i128 = env.storage().persistent().get(&spend_key).unwrap_or(0);
+        env.storage().persistent().set(&spend_key, &spend.saturating_add(amount));
+
+        let lsc_key = DataKey::LearnerTotalSessionCount(learner.clone());
+        let lsc: u32 = env.storage().persistent().get(&lsc_key).unwrap_or(0);
+        env.storage().persistent().set(&lsc_key, &lsc.saturating_add(1));
+
+        // Assess vulnerability and apply fair-pricing enforcement.
+        let _assessed_price = Self::enforce_fair_pricing(env.clone(), learner.clone(), mentor.clone(), amount);
+        Self::assess_learner_vulnerability(env.clone(), learner.clone(), mentor.clone(), amount);
 
         // Scalability protection: track requested booking-capacity units and
         // re-score this mentor's resource-competition/load risk before
@@ -732,11 +780,345 @@ impl SessionRegistry {
         record
     }
 
+    // ─── Learner vulnerability protection (#917) ───────────────────────────
+
+    /// Assess a learner's vulnerability when booking with `mentor`.
+    ///
+    /// Reads the learner/mentor pair session count and the learner's average
+    /// historical spend from storage, calls the shared scoring function, and
+    /// persists + returns the result. Safe to call by anyone as a
+    /// read-through audit; also invoked internally on `register_session`.
+    pub fn assess_learner_vulnerability(
+        env: Env,
+        learner: Address,
+        mentor: Address,
+        latest_session_price: i128,
+    ) -> VulnerabilityAssessment {
+        let pair_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LearnerMentorSessionCount(learner.clone(), mentor.clone()))
+            .unwrap_or(0);
+
+        let total_spend: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LearnerTotalSpend(learner.clone()))
+            .unwrap_or(0);
+        let total_session_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LearnerTotalSessionCount(learner.clone()))
+            .unwrap_or(0);
+        let avg_historical_price = if total_session_count > 0 {
+            total_spend / total_session_count as i128
+        } else {
+            0
+        };
+
+        let assessment =
+            assess_vulnerability(pair_count, latest_session_price, avg_historical_price);
+
+        env.storage().persistent().set(
+            &DataKey::LearnerVulnerabilityRecord(learner.clone(), mentor.clone()),
+            &assessment,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::LearnerVulnerabilityRecord(learner.clone(), mentor.clone()),
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        if assessment.at_risk {
+            env.events().publish(
+                (symbol_short!("vuln"), Symbol::new(&env, "at_risk")),
+                (learner, mentor, assessment.risk_score),
+            );
+        }
+
+        assessment
+    }
+
+    /// Monitor and score a mentor's behaviour for predatory patterns.
+    ///
+    /// The platform backend pushes aggregated conduct signals
+    /// (`consecutive_low_quality`, `complaint_count`, `total_sessions`,
+    /// `price_above_market_bps`) collected from the reputation contract and
+    /// off-chain analytics. The result is persisted and, when predatory
+    /// behaviour is detected alongside an at-risk learner, an emergency
+    /// intervention record is written and the mentor is flagged as
+    /// suspended. Only callable by the platform backend.
+    pub fn monitor_mentor_behavior(
+        env: Env,
+        mentor: Address,
+        learner: Address,
+        consecutive_low_quality: u32,
+        complaint_count: u32,
+        total_sessions: u32,
+        price_above_market_bps: u32,
+    ) -> LearnerProtectionRecord {
+        let backend = Self::require_backend(&env);
+        backend.require_auth();
+
+        let behavior = shared_detect_predatory_behavior(
+            consecutive_low_quality,
+            complaint_count,
+            total_sessions,
+            price_above_market_bps,
+        );
+
+        env.storage().persistent().set(
+            &DataKey::MentorPredatoryBehaviorRecord(mentor.clone()),
+            &behavior,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::MentorPredatoryBehaviorRecord(mentor.clone()),
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        // Retrieve the latest cached vulnerability for this learner/mentor pair.
+        let vulnerability: VulnerabilityAssessment = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LearnerVulnerabilityRecord(
+                learner.clone(),
+                mentor.clone(),
+            ))
+            .unwrap_or(VulnerabilityAssessment {
+                at_risk: false,
+                risk_score: 0,
+                high_recurrence: false,
+                affordability_concern: false,
+                recurrence_count: 0,
+            });
+
+        // Identify exploitation patterns and compute welfare status.
+        let patterns =
+            shared_identify_exploitation_patterns(&env, vulnerability, behavior);
+        let pattern_count = patterns.len();
+        let welfare =
+            shared_compute_welfare_status(vulnerability, pattern_count);
+
+        let now = env.ledger().timestamp();
+        let protection = compute_learner_protection_intervention(
+            &env,
+            vulnerability,
+            behavior,
+            welfare,
+            now,
+        );
+
+        env.storage().persistent().set(
+            &DataKey::LearnerProtectionIntervention(mentor.clone()),
+            &protection,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::LearnerProtectionIntervention(mentor.clone()),
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        if protection.emergency_suspension {
+            let emergency = compute_emergency_intervention(&env, &protection, now);
+            env.storage().persistent().set(
+                &DataKey::MentorEmergencyIntervention(mentor.clone()),
+                &emergency,
+            );
+            env.storage().persistent().set(
+                &DataKey::MentorSuspended(mentor.clone()),
+                &true,
+            );
+            env.storage().persistent().extend_ttl(
+                &DataKey::MentorEmergencyIntervention(mentor.clone()),
+                TTL_THRESHOLD,
+                TTL_BUMP,
+            );
+            env.events().publish(
+                (symbol_short!("emerg"), Symbol::new(&env, "suspended")),
+                (mentor.clone(), protection.combined_risk_score),
+            );
+        } else if behavior.predatory {
+            env.events().publish(
+                (symbol_short!("mentor"), Symbol::new(&env, "predatory")),
+                (mentor.clone(), behavior.risk_score),
+            );
+        }
+
+        protection
+    }
+
+    /// Enforce fair pricing for a learner before a session is committed.
+    ///
+    /// When a learner has a cached vulnerability assessment, the proposed
+    /// session price is run through the shared affordability-cap logic and
+    /// the (possibly adjusted) price is returned. If `mentor` is currently
+    /// suspended the call panics to block the booking. Callable by anyone.
+    pub fn enforce_fair_pricing(
+        env: Env,
+        learner: Address,
+        mentor: Address,
+        proposed_price: i128,
+    ) -> i128 {
+        // Block bookings with suspended mentors.
+        let suspended: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MentorSuspended(mentor.clone()))
+            .unwrap_or(false);
+        if suspended {
+            panic!("MentorSuspended");
+        }
+
+        let vulnerability: VulnerabilityAssessment = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LearnerVulnerabilityRecord(
+                learner.clone(),
+                mentor.clone(),
+            ))
+            .unwrap_or(VulnerabilityAssessment {
+                at_risk: false,
+                risk_score: 0,
+                high_recurrence: false,
+                affordability_concern: false,
+                recurrence_count: 0,
+            });
+
+        // Compute the learner's average historical spend for the cap.
+        let total_spend: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LearnerTotalSpend(learner.clone()))
+            .unwrap_or(0);
+        let total_session_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LearnerTotalSessionCount(learner.clone()))
+            .unwrap_or(0);
+        let avg_historical_price = if total_session_count > 0 {
+            total_spend / total_session_count as i128
+        } else {
+            0
+        };
+
+        // Platform average: approximate from the rolling price log.
+        let prices: soroban_sdk::Vec<i128> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RecentSessionPrices)
+            .unwrap_or(soroban_sdk::Vec::new(&env));
+        let platform_avg_price = if prices.is_empty() {
+            0i128
+        } else {
+            let sum: i128 = {
+                let mut s = 0i128;
+                for i in 0..prices.len() {
+                    s = s.saturating_add(prices.get(i).unwrap_or(0));
+                }
+                s
+            };
+            sum / prices.len() as i128
+        };
+
+        let (enforced_price, adjusted) = shared_enforce_learner_fair_pricing(
+            proposed_price,
+            avg_historical_price,
+            platform_avg_price,
+            vulnerability,
+        );
+
+        if adjusted {
+            env.events().publish(
+                (symbol_short!("price"), Symbol::new(&env, "adjusted")),
+                (learner, mentor, proposed_price, enforced_price),
+            );
+        }
+
+        enforced_price
+    }
+
+    /// Trigger an emergency protection action for a learner under active
+    /// exploitation.
+    ///
+    /// When the stored `LearnerProtectionIntervention` for `mentor` has
+    /// `emergency_suspension = true`, this writes (or refreshes) the
+    /// `MentorEmergencyIntervention` and `MentorSuspended` storage keys and
+    /// emits an event. Callable only by the platform backend.
+    pub fn trigger_emergency_protection(
+        env: Env,
+        mentor: Address,
+        learner: Address,
+    ) -> EmergencyIntervention {
+        let backend = Self::require_backend(&env);
+        backend.require_auth();
+
+        let protection: LearnerProtectionRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LearnerProtectionIntervention(mentor.clone()))
+            .expect("NoProtectionInterventionOnRecord");
+
+        let now = env.ledger().timestamp();
+        let emergency = compute_emergency_intervention(&env, &protection, now);
+
+        env.storage().persistent().set(
+            &DataKey::MentorEmergencyIntervention(mentor.clone()),
+            &emergency,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::MentorSuspended(mentor.clone()), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::MentorEmergencyIntervention(mentor.clone()),
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        env.events().publish(
+            (symbol_short!("emerg"), Symbol::new(&env, "triggered")),
+            (mentor.clone(), learner, emergency.combined_risk_score),
+        );
+
+        emergency
+    }
+
+    /// Restore a mentor from emergency suspension after the cooldown elapses.
+    /// Only callable by the platform backend.
+    pub fn restore_learner_protection(env: Env, mentor: Address) {
+        let backend = Self::require_backend(&env);
+        backend.require_auth();
+
+        let protection: LearnerProtectionRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LearnerProtectionIntervention(mentor.clone()))
+            .expect("NoProtectionInterventionOnRecord");
+
+        if !is_protection_restoration_eligible(&protection, env.ledger().timestamp()) {
+            panic!("LearnerProtectionRestorationNotEligible");
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::LearnerProtectionIntervention(mentor.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::MentorEmergencyIntervention(mentor.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::MentorSuspended(mentor.clone()));
+
+        env.events().publish(
+            (symbol_short!("lprest"), Symbol::new(&env, "restored")),
+            mentor,
+        );
+    }
+
     /// Restore fair resource allocation for `mentor` once the
     /// performance-protection intervention cooldown has elapsed. Only
     /// callable by the platform backend.
-    pub fn restore_fair_performance(env: Env, mentor: Address) {
-        let backend = Self::require_backend(&env);
+    pub fn restore_fair_performance(env: Env, mentor: Address) {        let backend = Self::require_backend(&env);
         backend.require_auth();
 
         let record: PerformanceInterventionRecord = env
