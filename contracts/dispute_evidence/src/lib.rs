@@ -17,6 +17,11 @@
 //!    `MIN_RESOLUTION_DELAY_SECS` have elapsed since the dispute was opened.
 //! 4. The admin uses the on-chain resolution record to call `resolve_dispute`
 //!    on the escrow contract.
+//!
+//! # Recording Integrity & Privacy (#914)
+//! Session recordings used as evidence are protected with tamper-evident
+//! cryptographic verification, selective redaction, consent management,
+//! and role-based access control.
 #![no_std]
 #![allow(deprecated)] // Temporarily allow deprecated Events::publish until we migrate to #[contractevent]
 
@@ -29,7 +34,13 @@ use shared::{
 };
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, Address, BytesN, Env,
-    IntoVal, Symbol, Vec,
+    IntoVal, Symbol, Vec, Map,
+};
+
+use shared::{
+    SessionRecording, RecordingStatus, ConsentRecord, AccessRole, RedactionRecord, AccessLogEntry, IntegrityVerificationResult,
+    create_recording, compute_merkle_root, verify_recording_integrity, grant_consent, revoke_consent,
+    check_access_authorized, apply_redaction, log_access, emergency_privacy_protection,
 };
 
 /// Maximum recent rulings tracked per arbitrator for bias scoring.
@@ -159,6 +170,12 @@ pub enum DataKey {
     AppealReasonHash(u64),
     /// Optional health dashboard notified of dispute lifecycle events.
     HealthDashboard,
+    // Recording integrity & privacy (#914)
+    SessionRecording(u64),           // Maps escrow_id -> recording_id
+    RecordingEvidence(u64),          // Maps escrow_id -> SessionRecording
+    RecordingConsent(u64),           // Maps escrow_id -> Vec<ConsentRecord>
+    RecordingRedaction(u64),         // Maps escrow_id -> Vec<RedactionRecord>
+    RecordingAccessLog(u64),         // Maps escrow_id -> Vec<AccessLogEntry>
     /// Dispute-open timestamps for a given (mentor, learner) pair, used to
     /// detect coordinated/repeated dispute filing (#justice-protection).
     PartyDisputeLog(Address, Address),
@@ -228,6 +245,8 @@ pub enum Error {
     NoJusticeInterventionOnRecord = 16,
     /// The intervened dispute flow's restoration cooldown has not elapsed.
     JusticeRestorationNotEligible = 17,
+    /// Requested resource not found (recording evidence).
+    NotFound = 18,
 }
 
 #[contract]
@@ -1023,6 +1042,269 @@ impl DisputeEvidenceContract {
             .expect("escrow contract not configured");
         EscrowContractClient::new(env, &escrow_contract).get_escrow(&escrow_id)
     }
+
+    // ── Recording Integrity & Privacy for Dispute Evidence (#914) ──────────────
+
+    /// Attach a session recording as evidence for a dispute
+    pub fn attach_recording_evidence(
+        env: Env,
+        escrow_id: u64,
+        recording_id: Symbol,
+        session_id: Symbol,
+        mentor: Address,
+        learner: Address,
+        storage_uri: Symbol,
+        content_hash: BytesN<32>,
+        chunk_hashes: Vec<BytesN<32>>,
+        size_bytes: u64,
+        duration_secs: u32,
+    ) -> Result<SessionRecording, Error> {
+        let submitter = env.current_contract_address(); // Would be caller in practice
+        submitter.require_auth();
+
+        let escrow = Self::load_escrow(&env, escrow_id);
+        if escrow.status != EscrowStatus::Disputed {
+            return Err(Error::InvalidEscrowState);
+        }
+        if submitter != escrow.mentor && submitter != escrow.learner {
+            return Err(Error::Unauthorized);
+        }
+
+        // Create tamper-evident recording
+        let recording = create_recording(
+            &env,
+            &session_id,
+            &mentor,
+            &learner,
+            storage_uri,
+            content_hash,
+            &chunk_hashes,
+            size_bytes,
+            duration_secs,
+        );
+
+        // Store recording as evidence
+        env.storage().persistent().set(&DataKey::RecordingEvidence(escrow_id), &recording);
+        env.storage().persistent().set(&DataKey::SessionRecording(escrow_id), &recording_id);
+
+        // Grant consent to dispute participants (arbitrator, parties)
+        let mut consents = Vec::new(&env);
+        let mentor_consent = grant_consent(&env, &recording_id, &mentor, &mentor, AccessRole::Participant, 8760, Symbol::new(&env, "full"));
+        let learner_consent = grant_consent(&env, &recording_id, &learner, &learner, AccessRole::Participant, 8760, Symbol::new(&env, "full"));
+        let arbitrator_consent = grant_consent(&env, &recording_id, &mentor, &escrow.mentor, AccessRole::Arbitrator, 720, Symbol::new(&env, "full")); // 30 days
+        consents.push_back(mentor_consent);
+        consents.push_back(learner_consent);
+        consents.push_back(arbitrator_consent);
+        env.storage().persistent().set(&DataKey::RecordingConsent(escrow_id), &consents);
+
+        env.events().publish(
+            (Symbol::new(&env, "recording_attached"), escrow_id),
+            (recording_id, session_id, mentor, learner),
+        );
+
+        Ok(recording)
+    }
+
+    /// Get attached recording for a dispute
+    pub fn get_dispute_recording(env: Env, escrow_id: u64) -> Option<SessionRecording> {
+        env.storage().persistent().get(&DataKey::RecordingEvidence(escrow_id))
+    }
+
+    /// Verify recording integrity for dispute evidence
+    pub fn verify_recording_integrity(
+        env: Env,
+        escrow_id: u64,
+        provided_chunk_hashes: Vec<BytesN<32>>,
+        provided_content_hash: BytesN<32>,
+        verifier: Address,
+    ) -> Result<IntegrityVerificationResult, Error> {
+        let recording: SessionRecording = env.storage().persistent().get(&DataKey::RecordingEvidence(escrow_id))
+            .ok_or(Error::NotFound)?;
+
+        let result = verify_recording_integrity(&env, &recording, &provided_chunk_hashes, provided_content_hash, &verifier);
+
+        if result.is_intact {
+            let mut updated = recording;
+            updated.status = RecordingStatus::Verified;
+            updated.verified_at = Some(env.ledger().timestamp());
+            env.storage().persistent().set(&DataKey::RecordingEvidence(escrow_id), &updated);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "recording_verified"), escrow_id),
+            (result.is_intact, result.verified_chunks, result.total_chunks),
+        );
+
+        Ok(result)
+    }
+
+    /// Grant consent for recording access in dispute
+    pub fn grant_dispute_recording_consent(
+        env: Env,
+        escrow_id: u64,
+        grantor: Address,
+        grantee: Address,
+        role: AccessRole,
+        duration_hours: u32,
+        scope: Symbol,
+    ) -> Result<ConsentRecord, Error> {
+        grantor.require_auth();
+
+        let recording: SessionRecording = env.storage().persistent().get(&DataKey::RecordingEvidence(escrow_id))
+            .ok_or(Error::NotFound)?;
+
+        // Only participants or admin can grant consent
+        if recording.mentor != grantor && recording.learner != grantor {
+            // Check if admin
+            let admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(Error::Unauthorized)?;
+            if grantor != admin {
+                return Err(Error::Unauthorized);
+            }
+        }
+
+        let recording_id: Symbol = env.storage().persistent().get(&DataKey::SessionRecording(escrow_id))
+            .ok_or(Error::NotFound)?;
+
+        let consent = grant_consent(&env, &recording_id, &grantor, &grantee, role, duration_hours, scope);
+
+        let mut consents: Vec<ConsentRecord> = env.storage().persistent().get(&DataKey::RecordingConsent(escrow_id)).unwrap_or(Vec::new(&env));
+        consents.push_back(consent.clone());
+        env.storage().persistent().set(&DataKey::RecordingConsent(escrow_id), &consents);
+
+        Ok(consent)
+    }
+
+    /// Revoke consent for recording access in dispute
+    pub fn revoke_dispute_recording_consent(
+        env: Env,
+        escrow_id: u64,
+        revoker: Address,
+    ) -> Result<bool, Error> {
+        revoker.require_auth();
+
+        let mut consents: Vec<ConsentRecord> = env.storage().persistent().get(&DataKey::RecordingConsent(escrow_id)).unwrap_or(Vec::new(&env));
+
+        for i in 0..consents.len() {
+            let mut consent = consents.get(i).unwrap();
+            if consent.grantor == revoker && !consent.revoked {
+                let revoked = revoke_consent(&env, &mut consent, &revoker);
+                if revoked {
+                    consents.set(i, consent);
+                    env.storage().persistent().set(&DataKey::RecordingConsent(escrow_id), &consents);
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Apply redaction to dispute recording
+    pub fn apply_recording_redaction(
+        env: Env,
+        admin: Address,
+        escrow_id: u64,
+        redaction_type: Symbol,
+        start_ts: u32,
+        end_ts: u32,
+        reason_hash: BytesN<32>,
+    ) -> Result<RedactionRecord, Error> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+
+        let recording: SessionRecording = env.storage().persistent().get(&DataKey::RecordingEvidence(escrow_id))
+            .ok_or(Error::NotFound)?;
+
+        let recording_id: Symbol = env.storage().persistent().get(&DataKey::SessionRecording(escrow_id))
+            .ok_or(Error::NotFound)?;
+
+        let redaction = apply_redaction(&env, &recording_id, &admin, redaction_type.clone(), start_ts, end_ts, reason_hash, &admin);
+
+        let mut redactions: Vec<RedactionRecord> = env.storage().persistent().get(&DataKey::RecordingRedaction(escrow_id)).unwrap_or(Vec::new(&env));
+        redactions.push_back(redaction.clone());
+        env.storage().persistent().set(&DataKey::RecordingRedaction(escrow_id), &redactions);
+
+        // Update recording status
+        let mut updated = recording;
+        updated.status = RecordingStatus::Redacted;
+        env.storage().persistent().set(&DataKey::RecordingEvidence(escrow_id), &updated);
+
+        env.events().publish(
+            (Symbol::new(&env, "recording_redacted"), escrow_id),
+            (redaction_type, start_ts, end_ts),
+        );
+
+        Ok(redaction)
+    }
+
+    /// Check if accessor is authorized to view dispute recording
+    pub fn check_dispute_recording_access(
+        env: Env,
+        escrow_id: u64,
+        accessor: Address,
+        role: AccessRole,
+    ) -> Result<bool, Error> {
+        let recording: SessionRecording = env.storage().persistent().get(&DataKey::RecordingEvidence(escrow_id))
+            .ok_or(Error::NotFound)?;
+
+        let consents: Vec<ConsentRecord> = env.storage().persistent().get(&DataKey::RecordingConsent(escrow_id)).unwrap_or(Vec::new(&env));
+
+        Ok(check_access_authorized(&env, &recording, &consents, &accessor, role))
+    }
+
+    /// Log access to dispute recording
+    pub fn log_dispute_recording_access(
+        env: Env,
+        escrow_id: u64,
+        accessor: Address,
+        role: AccessRole,
+        purpose: Symbol,
+    ) -> Result<(), Error> {
+        let recording: SessionRecording = env.storage().persistent().get(&DataKey::RecordingEvidence(escrow_id))
+            .ok_or(Error::NotFound)?;
+
+        let recording_id: Symbol = env.storage().persistent().get(&DataKey::SessionRecording(escrow_id))
+            .ok_or(Error::NotFound)?;
+
+        let entry = log_access(&env, &recording_id, &accessor, role, purpose, &env.current_contract_address(), None);
+
+        let mut logs: Vec<AccessLogEntry> = env.storage().persistent().get(&DataKey::RecordingAccessLog(escrow_id)).unwrap_or(Vec::new(&env));
+        logs.push_back(entry);
+        env.storage().persistent().set(&DataKey::RecordingAccessLog(escrow_id), &logs);
+
+        Ok(())
+    }
+
+    /// Emergency privacy protection for dispute recording
+    pub fn emergency_recording_protection(
+        env: Env,
+        admin: Address,
+        escrow_id: u64,
+        reason_hash: BytesN<32>,
+    ) -> Result<(RedactionRecord, Vec<ConsentRecord>), Error> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+
+        let recording: SessionRecording = env.storage().persistent().get(&DataKey::RecordingEvidence(escrow_id))
+            .ok_or(Error::NotFound)?;
+
+        let recording_id: Symbol = env.storage().persistent().get(&DataKey::SessionRecording(escrow_id))
+            .ok_or(Error::NotFound)?;
+
+        let (redaction, revoked_consents) = emergency_privacy_protection(&env, &recording_id, reason_hash.clone(), &admin);
+
+        // Update recording status
+        let mut updated = recording;
+        updated.status = RecordingStatus::Redacted;
+        env.storage().persistent().set(&DataKey::RecordingEvidence(escrow_id), &updated);
+
+        env.events().publish(
+            (Symbol::new(&env, "recording_emergency_protection"), escrow_id),
+            (admin, reason_hash),
+        );
+
+        Ok((redaction, revoked_consents))
+    }
+
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

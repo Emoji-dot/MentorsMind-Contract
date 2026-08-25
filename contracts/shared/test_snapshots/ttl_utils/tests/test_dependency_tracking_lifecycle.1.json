@@ -1,16 +1,17 @@
 {
   "generators": {
-    "address": 2,
+    "address": 1,
     "nonce": 0,
     "mux_id": 0
   },
   "auth": [
+    [],
     []
   ],
   "ledger": {
     "protocol_version": 25,
     "sequence_number": 0,
-    "timestamp": 50000,
+    "timestamp": 0,
     "network_id": "0000000000000000000000000000000000000000000000000000000000000000",
     "base_reserve": 0,
     "min_persistent_entry_ttl": 4096,
@@ -56,5 +57,39 @@
       }
     ]
   },
-  "events": []
+  "events": [
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "ttl"
+              },
+              {
+                "symbol": "dep_reg"
+              },
+              {
+                "symbol": "esc_101"
+              }
+            ],
+            "data": {
+              "vec": [
+                {
+                  "bytes": "a7b0eedbe4493ea61636dfe835d717a75c5104f494211e8d4c6e5be3301a280c"
+                },
+                {
+                  "u32": 0
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    }
+  ]
 }

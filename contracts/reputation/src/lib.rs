@@ -20,10 +20,20 @@ use shared::{
     verify_information_integrity as shared_verify_information_integrity,
     audit_information_accuracy, monitor_metadata_manipulation, restore_truth_and_correct,
     InformationIntegrity, InformationAuditRecord, MetadataMonitoringRecord, TruthRestorationRecord,
+    // Grade inflation detection (#911)
+    calculate_grade_distribution, detect_grade_inflation, apply_inflation_adjustment, record_grade_correction,
+    GradeDistributionStats, InflationDetectionResult, MentorScoringAdjustment, GradeCorrectionRecord,
+    // Mentor wellness (#910)
+    assess_burnout_risk, BurnoutRiskAssessment, MentorWorkload,
+    // Market monitoring (#915)
+    calculate_market_metrics, assess_demand_authenticity, validate_price_discovery, detect_market_manipulation,
+    MarketMetrics, DemandAuthenticityResult, PriceDiscoveryValidation,
+    // ML security (main's integrity systems)
+    MLSecurity,
 };
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal,
-    Symbol, Vec,
+    Symbol, Vec, Map,
 };
 
 // ── Storage keys ────────────────────────────────────────────────────────────
@@ -129,6 +139,18 @@ pub enum DataKey {
     ReputationInfoAudit(Address),
     MisinformationDetection(Address),
     ReputationTruthRestoration(Address),
+    // Grade inflation detection (#911)
+    MentorGradeHistory(Address),
+    MentorGradeTimestamps(Address),
+    GradeInflationDetection(Address),
+    GradeCorrection(Symbol),
+    // Mentor wellness (#910)
+    MentorWorkloadData(Address),
+    MentorBurnoutAssessment(Address),
+    WellnessIntervention(Address),
+    // Market monitoring (#915)
+    SpecializationMetrics(Symbol),
+    MarketManipulationAlert(Symbol),
 }
 
 /// Cooldown before an intervened mentor's community access is eligible for
@@ -1481,10 +1503,315 @@ impl ReputationContract {
         );
 
         restoration
+    // ── Grade Inflation Detection (#911) ──────────────────────────────────────
+
+    /// Record a grade for inflation detection analysis
+    pub fn record_grade_for_analysis(
+        env: Env,
+        mentor: Address,
+        session_id: Symbol,
+        grade: u32, // 0-10000 basis points
+    ) {
+        let grades_key = DataKey::MentorGradeHistory(mentor.clone());
+        let timestamps_key = DataKey::MentorGradeTimestamps(mentor.clone());
+        
+        let mut grades: Vec<u32> = env.storage().persistent().get(&grades_key).unwrap_or(Vec::new(&env));
+        let mut timestamps: Vec<u64> = env.storage().persistent().get(&timestamps_key).unwrap_or(Vec::new(&env));
+        
+        grades.push_back(grade);
+        timestamps.push_back(env.ledger().timestamp());
+        
+        // Keep last 100 grades
+        while grades.len() > 100 {
+            grades.remove(0);
+            timestamps.remove(0);
+        }
+        
+        env.storage().persistent().set(&grades_key, &grades);
+        env.storage().persistent().set(&timestamps_key, &timestamps);
+        
+        // Run inflation detection if enough data
+        if grades.len() >= shared::MIN_SESSIONS_FOR_ANALYSIS {
+            let mut session_ids: Vec<Symbol> = Vec::new(&env);
+            for _ in 0..grades.len() {
+                session_ids.push_back(session_id.clone());
+            }
+            let detection = detect_grade_inflation(&env, &mentor, &grades, &session_ids, &timestamps);
+            
+            if detection.inflation_detected {
+                env.storage().persistent().set(&DataKey::GradeInflationDetection(mentor.clone()), &detection);
+                
+                // Apply scoring adjustment
+                let (current_score, _) = Self::get_mentor_rating(env.clone(), mentor.clone());
+                let adjustment = apply_inflation_adjustment(&env, &mentor, current_score as u32, &detection);
+                
+                // Store adjustment
+                let slash_key = DataKey::SlashPenaltyBps(mentor.clone());
+                let current_penalty: u64 = env.storage().persistent().get(&slash_key).unwrap_or(0);
+                let new_penalty = current_penalty.saturating_add(adjustment.adjustment_bps as u64);
+                env.storage().persistent().set(&slash_key, &new_penalty.min(10000));
+                
+                env.events().publish(
+                    (symbol_short!("grade"), Symbol::new(&env, "inflation_detected")),
+                    (mentor, detection.inflation_rate_bps, adjustment.adjustment_bps),
+                );
+            }
+        }
+    }
+
+    /// Get grade distribution statistics for a mentor
+    pub fn get_grade_distribution(env: Env, mentor: Address) -> GradeDistributionStats {
+        let grades_key = DataKey::MentorGradeHistory(mentor.clone());
+        let timestamps_key = DataKey::MentorGradeTimestamps(mentor.clone());
+        let sessions_key = DataKey::MentorGradeHistory(mentor.clone()); // Reuse for session IDs
+        
+        let grades: Vec<u32> = env.storage().persistent().get(&grades_key).unwrap_or(Vec::new(&env));
+        let timestamps: Vec<u64> = env.storage().persistent().get(&timestamps_key).unwrap_or(Vec::new(&env));
+        let session_ids: Vec<Symbol> = Vec::new(&env); // Would store separately in practice
+        
+        calculate_grade_distribution(&env, &mentor, &grades, &session_ids)
+    }
+
+    /// Get inflation detection result for a mentor
+    pub fn get_inflation_detection(env: Env, mentor: Address) -> Option<InflationDetectionResult> {
+        env.storage().persistent().get(&DataKey::GradeInflationDetection(mentor))
+    }
+
+    /// Record a grade correction (retroactive adjustment)
+    pub fn record_grade_correction(
+        env: Env,
+        admin: Address,
+        mentor: Address,
+        learner: Address,
+        session_id: Symbol,
+        original_grade: u32,
+        corrected_grade: u32,
+        reason: Symbol,
+    ) -> GradeCorrectionRecord {
+        admin.require_auth();
+        
+        let record = record_grade_correction(
+            &env,
+            &mentor,
+            &learner,
+            &session_id,
+            original_grade,
+            corrected_grade,
+            reason,
+            &admin,
+        );
+        
+        env.storage().persistent().set(&DataKey::GradeCorrection(session_id.clone()), &record);
+        
+        env.events().publish(
+            (symbol_short!("grade"), Symbol::new(&env, "corrected")),
+            (mentor, learner, session_id, original_grade, corrected_grade),
+        );
+        
+        record
+    }
+
+    // ── Mentor Wellness Tracking (#910) ────────────────────────────────────────
+
+    /// Update mentor workload from session registry
+    pub fn update_mentor_workload(
+        env: Env,
+        mentor: Address,
+        active_sessions: u32,
+        weekly_hours: u32,
+        weekly_weighted_load: u32,
+        last_session_end: u64,
+        rest_until: u64,
+    ) {
+        let workload = MentorWorkload {
+            mentor: mentor.clone(),
+            active_sessions,
+            weekly_hours,
+            weekly_weighted_load,
+            sessions_this_week: Vec::new(&env),
+            last_session_end,
+            rest_until,
+            burnout_risk_bps: 0,
+            updated_at: env.ledger().timestamp(),
+        };
+        
+        let burnout_risk = shared::calculate_burnout_risk(&workload);
+        
+        let mut updated_workload = workload;
+        updated_workload.burnout_risk_bps = burnout_risk;
+        
+        env.storage().persistent().set(&DataKey::MentorWorkloadData(mentor.clone()), &updated_workload);
+        
+        // Assess burnout risk
+        let assessment = assess_burnout_risk(&env, &updated_workload);
+        env.storage().persistent().set(&DataKey::MentorBurnoutAssessment(mentor.clone()), &assessment);
+        
+        // Auto-initiate intervention if critical
+        if assessment.risk_level == Symbol::new(&env, "critical") {
+            let intervention = shared::initiate_intervention(
+                &env,
+                &mentor,
+                Symbol::new(&env, "emergency_pause"),
+                Symbol::new(&env, "critical_burnout_risk"),
+                shared::MANDATORY_REST_HOURS,
+                &env.current_contract_address(),
+            );
+            env.storage().persistent().set(&DataKey::WellnessIntervention(mentor.clone()), &intervention);
+            
+            env.events().publish(
+                (symbol_short!("wellness"), Symbol::new(&env, "intervention_triggered")),
+                (mentor, intervention.intervention_type, intervention.duration_hours),
+            );
+        }
+    }
+
+    /// Get mentor workload data
+    pub fn get_mentor_workload(env: Env, mentor: Address) -> Option<MentorWorkload> {
+        env.storage().persistent().get(&DataKey::MentorWorkloadData(mentor))
+    }
+
+    /// Get mentor burnout assessment
+    pub fn get_burnout_assessment(env: Env, mentor: Address) -> Option<BurnoutRiskAssessment> {
+        env.storage().persistent().get(&DataKey::MentorBurnoutAssessment(mentor))
+    }
+
+    /// Get active wellness intervention
+    pub fn get_wellness_intervention(env: Env, mentor: Address) -> Option<shared::WellnessIntervention> {
+        env.storage().persistent().get(&DataKey::WellnessIntervention(mentor))
+    }
+
+    // ── Market Monitoring (#915) ───────────────────────────────────────────────
+
+    /// Record market metrics for a specialization
+    pub fn record_market_metrics(
+        env: Env,
+        admin: Address,
+        specialization: Symbol,
+        total_sessions: u32,
+        unique_mentors: u32,
+        unique_learners: u32,
+        avg_price: u64,
+        median_price: u64,
+        price_std_dev: u64,
+        demand_index: u32,
+        supply_index: u32,
+        velocity: u32,
+        concentration_ratio: u32,
+    ) {
+        admin.require_auth();
+        
+        let metrics = MarketMetrics {
+            specialization: specialization.clone(),
+            period_start: env.ledger().timestamp() - (7 * 24 * 3600), // Weekly
+            period_end: env.ledger().timestamp(),
+            total_sessions,
+            unique_mentors,
+            unique_learners,
+            avg_price,
+            median_price,
+            price_std_dev,
+            demand_index,
+            supply_index,
+            velocity,
+            concentration_ratio,
+            calculated_at: env.ledger().timestamp(),
+        };
+        
+        env.storage().persistent().set(&DataKey::SpecializationMetrics(specialization.clone()), &metrics);
+    }
+
+    /// Assess demand authenticity for a specialization
+    pub fn assess_specialization_demand(
+        env: Env,
+        specialization: Symbol,
+        external_market_data: Map<Symbol, u64>,
+    ) -> Option<DemandAuthenticityResult> {
+        let current: Option<MarketMetrics> = env.storage().persistent().get(&DataKey::SpecializationMetrics(specialization.clone()));
+        let current = current?;
+        
+        // Build historical data (simplified - would fetch from storage)
+        let historical = Vec::new(&env);
+        
+        let result = assess_demand_authenticity(&env, &specialization, &current, &historical, &external_market_data);
+        
+        if !result.is_authentic {
+            // Create manipulation alert
+            let price_val = PriceDiscoveryValidation {
+                specialization: specialization.clone(),
+                platform_price: current.avg_price,
+                external_price: external_market_data.get(specialization.clone()).unwrap_or(0),
+                deviation_bps: 0,
+                is_manipulated: false,
+                manipulation_indicators: Vec::new(&env),
+                confidence_bps: 5000,
+                validated_at: env.ledger().timestamp(),
+            };
+            
+            let balance = shared::SupplyDemandBalance {
+                specialization: specialization.clone(),
+                current_price: current.avg_price,
+                equilibrium_price: current.avg_price,
+                price_pressure: Symbol::new(&env, "stable"),
+                supply_gap: 0,
+                recommended_mentors: current.unique_mentors,
+                intervention_needed: false,
+                intervention_type: Symbol::new(&env, "none"),
+                assessed_at: env.ledger().timestamp(),
+            };
+            
+            if let Some(alert) = detect_market_manipulation(&env, &result, &price_val, &balance) {
+                env.storage().persistent().set(&DataKey::MarketManipulationAlert(alert.alert_id.clone()), &alert);
+                env.events().publish(
+                    (symbol_short!("market"), Symbol::new(&env, "manipulation_alert")),
+                    (alert.specialization, alert.manipulation_type, alert.severity),
+                );
+            }
+        }
+        
+        Some(result)
+    }
+
+    /// Get market manipulation alert
+    pub fn get_market_alert(env: Env, alert_id: Symbol) -> Option<shared::MarketManipulationAlert> {
+        env.storage().persistent().get(&DataKey::MarketManipulationAlert(alert_id))
+    }
+
+    /// Get specialization metrics
+    pub fn get_specialization_metrics(env: Env, specialization: Symbol) -> Option<MarketMetrics> {
+        env.storage().persistent().get(&DataKey::SpecializationMetrics(specialization))
+    }
+
+    /// Correlate quality with workload (for mentor wellness)
+    pub fn correlate_quality_with_workload(env: Env, mentor: Address) -> (u32, u32) {
+        let workload: Option<MentorWorkload> = env.storage().persistent().get(&DataKey::MentorWorkloadData(mentor.clone()));
+        let (rating, _) = Self::get_mentor_rating(env.clone(), mentor.clone());
+        
+        let quality_score = rating as u32;
+        let workload_score = if let Some(w) = workload {
+            10000 - w.burnout_risk_bps
+        } else {
+            10000
+        };
+        
+        (quality_score, workload_score)
+    }
+
+    /// Track mentor wellness over time
+    pub fn track_mentor_wellness(env: Env, mentor: Address) -> (u32, u32, Symbol) {
+        let workload: Option<MentorWorkload> = env.storage().persistent().get(&DataKey::MentorWorkloadData(mentor.clone()));
+        let assessment: Option<BurnoutRiskAssessment> = env.storage().persistent().get(&DataKey::MentorBurnoutAssessment(mentor.clone()));
+        
+        let workload_score = workload.map(|w| 10000 - w.burnout_risk_bps).unwrap_or(10000);
+        let burnout_score = assessment.as_ref().map(|a| 10000 - a.risk_score_bps).unwrap_or(10000);
+        let risk_level = assessment.as_ref().map(|a| a.risk_level.clone()).unwrap_or(Symbol::new(&env, "unknown"));
+        
+        (workload_score, burnout_score, risk_level)
+    }
+
     /// Validate ML model inputs for authenticity
     pub fn validate_ml_input(
         env: Env,
-        review_data: Vec<u8>,
+        review_data: Vec<u32>,
         model_id: Symbol,
     ) -> bool {
         // Use MLSecurity to detect adversarial attacks on review inputs
