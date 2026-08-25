@@ -18,6 +18,10 @@ use shared::{
     identify_exploitation_patterns as shared_identify_exploitation_patterns,
     compute_welfare_status as shared_compute_welfare_status,
     VulnerabilityAssessment, EmergencyIntervention, LearnerProtectionRecord,
+    // resource management
+    allocate_system_resources, manage_session_load, detect_abuse_patterns, check_emergency_trigger,
+    // platform authenticity
+    verify_session_authenticity, detect_platform_bypass, PenaltyTier,
 };
 
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec};
@@ -124,6 +128,13 @@ pub enum DataKey {
     MentorEmergencyIntervention(Address),
     /// Whether a mentor is currently under an active emergency suspension.
     MentorSuspended(Address),
+    // ── Resource Management ────────────────────────────────────────────────
+    MentorRequestCount(Address, u32),
+    ActiveSessions(Address),
+    TotalRequests(Address),
+    CancelledRequests(Address),
+    // ── Platform Authenticity ──────────────────────────────────────────────
+    MentorLowFeeCount(Address, Address),
 }
 
 /// Maximum length of the rolling price/pair/request logs kept for scoring.
@@ -178,6 +189,47 @@ impl SessionRegistry {
 
         // Check for scheduling conflicts and buffer enforcement
         Self::check_scheduling_conflicts(&env, &mentor, scheduled_at, duration_mins);
+
+        // ── Resource Management & Rate Limiting ──────────────────────────────────
+        let req_key = DataKey::MentorRequestCount(mentor.clone(), env.ledger().sequence());
+        let mut req_count: u32 = env.storage().temporary().get(&req_key).unwrap_or(0);
+        req_count += 1;
+        env.storage().temporary().set(&req_key, &req_count);
+
+        let limit_status = manage_session_load(&env, req_count, false);
+        if !limit_status.allowed {
+            panic!("Rate limit exceeded");
+        }
+
+        let active_key = DataKey::ActiveSessions(mentor.clone());
+        let current_active: u32 = env.storage().persistent().get(&active_key).unwrap_or(0);
+        let allocation = allocate_system_resources(&env, current_active, 1);
+        if !allocation.granted {
+            panic!("Resource quota exceeded");
+        }
+        env.storage().persistent().set(&active_key, &(current_active + 1));
+
+        let tot_req_key = DataKey::TotalRequests(mentor.clone());
+        let total_requests: u32 = env.storage().persistent().get(&tot_req_key).unwrap_or(0) + 1;
+        env.storage().persistent().set(&tot_req_key, &total_requests);
+
+        let can_req_key = DataKey::CancelledRequests(mentor.clone());
+        let cancelled_requests: u32 = env.storage().persistent().get(&can_req_key).unwrap_or(0);
+        
+        let abuse_status = detect_abuse_patterns(&env, total_requests, cancelled_requests);
+        if abuse_status.is_abusive {
+            panic!("Abuse pattern detected");
+        }
+        
+        let low_fee_key = DataKey::MentorLowFeeCount(mentor.clone(), learner.clone());
+        let current_low_fee: u32 = env.storage().persistent().get(&low_fee_key).unwrap_or(0);
+        let collusion = detect_platform_bypass(&env, current_low_fee, amount);
+        env.storage().persistent().set(&low_fee_key, &collusion.low_fee_count);
+        
+        if collusion.penalty_tier == PenaltyTier::PermanentBan || collusion.penalty_tier == PenaltyTier::TemporarySuspension {
+            panic!("Collusion detected: platform bypass");
+        }
+        // ─────────────────────────────────────────────────────────────────────────
 
         // Community-dynamics monitoring: track pair/demand/pricing signals and
         // gate on automatic fair-access intervention before committing state.
@@ -293,6 +345,20 @@ impl SessionRegistry {
 
         let old_status = record.status.clone();
         
+        // Resource Management updates
+        let is_terminal = status == SessionStatus::Cancelled || status == SessionStatus::Completed;
+        if is_terminal && (old_status != SessionStatus::Cancelled && old_status != SessionStatus::Completed) {
+            let active_key = DataKey::ActiveSessions(record.mentor.clone());
+            let current_active: u32 = env.storage().persistent().get(&active_key).unwrap_or(1);
+            env.storage().persistent().set(&active_key, &current_active.saturating_sub(1));
+        }
+
+        if status == SessionStatus::Cancelled && old_status != SessionStatus::Cancelled {
+            let can_req_key = DataKey::CancelledRequests(record.mentor.clone());
+            let cancelled: u32 = env.storage().persistent().get(&can_req_key).unwrap_or(0);
+            env.storage().persistent().set(&can_req_key, &(cancelled + 1));
+        }
+
         // Release time buckets if transitioning to Cancelled
         if status == SessionStatus::Cancelled && old_status != SessionStatus::Cancelled {
             Self::release_time_buckets(&env, &record.mentor, record.scheduled_at, record.duration_mins);
@@ -301,6 +367,10 @@ impl SessionRegistry {
         record.status = status.clone();
         env.storage().persistent().set(&session_key, &record);
         if status == SessionStatus::Completed {
+            let auth = verify_session_authenticity(&env, record.duration_mins, true);
+            if !auth.is_authentic {
+                panic!("Session is not authentic");
+            }
             Self::store_completion_proof(&env, &record);
         }
         env.storage()
@@ -382,6 +452,21 @@ impl SessionRegistry {
             .expect("Session not found");
 
         let old_status = record.status.clone();
+        
+        // Resource Management updates
+        let is_terminal = status == SessionStatus::Cancelled || status == SessionStatus::Completed;
+        if is_terminal && (old_status != SessionStatus::Cancelled && old_status != SessionStatus::Completed) {
+            let active_key = DataKey::ActiveSessions(record.mentor.clone());
+            let current_active: u32 = env.storage().persistent().get(&active_key).unwrap_or(1);
+            env.storage().persistent().set(&active_key, &current_active.saturating_sub(1));
+        }
+
+        if matches!(status, SessionStatus::Cancelled) && !matches!(old_status, SessionStatus::Cancelled) {
+            let can_req_key = DataKey::CancelledRequests(record.mentor.clone());
+            let cancelled: u32 = env.storage().persistent().get(&can_req_key).unwrap_or(0);
+            env.storage().persistent().set(&can_req_key, &(cancelled + 1));
+        }
+
         if matches!(status, SessionStatus::Cancelled)
             && !matches!(old_status, SessionStatus::Cancelled)
         {
@@ -395,6 +480,10 @@ impl SessionRegistry {
         record.status = status.clone();
         env.storage().persistent().set(&session_key, &record);
         if status == SessionStatus::Completed {
+            let auth = verify_session_authenticity(&env, record.duration_mins, true);
+            if !auth.is_authentic {
+                panic!("Session is not authentic");
+            }
             Self::store_completion_proof(&env, &record);
         }
         env.events().publish(

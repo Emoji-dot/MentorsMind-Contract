@@ -37,6 +37,10 @@ pub mod justice_protection;
 pub mod outcome_authenticity;
 pub mod scalability_protection;
 pub mod learner_protection;
+pub mod mev_protection;
+pub mod resource_management;
+pub mod platform_authenticity;
+pub mod dynamic_fees;
 
 pub use admin::{
     AdminChangeProposal, AdminTransfer, ADMIN_COOLING_OFF_SECS, MIN_ADMIN_TIMELOCK_SECS,
@@ -185,6 +189,26 @@ pub use learner_protection::{
     PREDATORY_COMPLAINT_RATIO_BPS, PREDATORY_RISK_THRESHOLD,
     EMERGENCY_PATTERN_THRESHOLD, EMERGENCY_SUSPENSION_COOLDOWN_SECS,
     LEARNER_PROTECTION_COOLDOWN_SECS,
+};
+pub use mev_protection::{
+    detect_atomic_arbitrage, enforce_protocol_isolation, compute_mev_redistribution, record_mev_monitoring,
+    MevProtectionFlag, FairValueExtractionRecord, MevMonitoringRecord,
+    MEV_ARBITRAGE_RISK_THRESHOLD, DEFAULT_MEV_PENALTY_BPS, MAX_MEV_PENALTY_BPS,
+};
+pub use resource_management::{
+    allocate_system_resources, manage_session_load, detect_abuse_patterns, check_emergency_trigger,
+    RateLimitStatus, ResourceAllocation, AbuseDetectionResult,
+    DEFAULT_MAX_REQUESTS_PER_MINUTE, ABUSE_PATTERN_THRESHOLD_BPS, EMERGENCY_THROTTLE_RATE, RESOURCE_QUOTA_MAX_SESSIONS,
+};
+pub use platform_authenticity::{
+    verify_session_authenticity, detect_platform_bypass, detect_fee_evasion,
+    AuthenticityResult, CollusionResult, EconomicAuditResult, PenaltyTier,
+    MAX_LOW_FEE_SESSIONS_PER_PAIR, LOW_FEE_THRESHOLD, REQUIRED_INTERACTION_MINUTES, FEE_EVASION_TOLERANCE_BPS,
+};
+pub use dynamic_fees::{
+    calculate_dynamic_fee, detect_fee_gaming,
+    DynamicFeeResult, FeeEvasionResult,
+    BASE_FEE_BPS, MAX_FEE_BPS, MIN_FEE_BPS, HIGH_LOAD_THRESHOLD,
 };
 
 /// Economic sanity ceiling for a single financial amount (token smallest units).
