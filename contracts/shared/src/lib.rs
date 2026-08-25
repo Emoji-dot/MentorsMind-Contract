@@ -44,6 +44,13 @@ pub mod outcome_authenticity;
 pub mod scalability_protection;
 pub mod learner_protection;
 
+// Security integrity system modules (added on main; module declarations
+// restored here — main shipped the files without registering them).
+pub mod assessment_security;
+pub mod transfer_security;
+pub mod ml_security;
+pub mod cartel_detection;
+
 pub use admin::{
     AdminChangeProposal, AdminTransfer, ADMIN_COOLING_OFF_SECS, MIN_ADMIN_TIMELOCK_SECS,
 };
@@ -224,6 +231,17 @@ pub use learner_protection::{
     PREDATORY_COMPLAINT_RATIO_BPS, PREDATORY_RISK_THRESHOLD,
     EMERGENCY_PATTERN_THRESHOLD, EMERGENCY_SUSPENSION_COOLDOWN_SECS,
     LEARNER_PROTECTION_COOLDOWN_SECS,
+};
+pub use assessment_security::{
+    AssessmentRecord, AssessmentSecurity, AssessmentSecurityError, GamingDetectionResult,
+    GamingFlag, ManipulationRecord, ProgressAuthenticityRecord,
+};
+pub use ml_security::{AIPerformanceMetrics, MLSecurity, ModelRobustnessReport};
+pub use cartel_detection::{CoordinationPattern, CartelDetectionResult, TimeSlotFairnessAnalysis};
+pub use transfer_security::{
+    CredentialAuthenticityProof, CredentialFraudType, CredentialTransfer,
+    CreditInflationRecord, CrossPlatformVerification, FraudDetectionResult,
+    TransferIntegrityResult, TransferSecurity, TransferSecurityError,
 };
 
 /// Economic sanity ceiling for a single financial amount (token smallest units).

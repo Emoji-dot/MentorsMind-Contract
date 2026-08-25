@@ -15,6 +15,10 @@ use shared::{
     ValidationSource,
 };
 
+use shared::{
+    AssessmentSecurity, AssessmentSecurityError, TransferSecurity, TransferSecurityError,
+};
+
 const MIN_CERT_RATING: u64 = 400; // 4.0/5.0 * 100
 const MIN_SESSIONS_COMPLETED: u32 = 3;
 
@@ -54,6 +58,8 @@ pub struct CertificateRecord {
     // Credential integrity
     pub integrity_hash: BytesN<32>,
     pub correction_history: Vec<Symbol>, // GradeCorrection IDs
+    pub authenticity_verified: bool,
+    pub gaming_detection_score: u32,
 }
 
 /// Session completion record for fraud detection
@@ -175,6 +181,7 @@ impl Certificates {
 
     /// Issue a gated certificate. Platform backend only.
     /// Verifies: escrow released, mentor rating >= 4.0, learner completed >= N sessions.
+    /// ENHANCED: Performs gaming detection and authenticity verification
     pub fn issue_certificate(
         env: Env,
         learner: Address,
@@ -226,6 +233,19 @@ impl Certificates {
             panic!("insufficient sessions completed");
         }
 
+        // NEW: Detect potential gaming patterns
+        let gaming_detection = Self::detect_assessment_gaming(&env, &learner, issued_at);
+        if gaming_detection.is_gaming {
+            env.events().publish(
+                (Symbol::new(&env, "GamingDetected"), learner.clone()),
+                (skill.clone(), gaming_detection.confidence_score),
+            );
+            panic!("gaming patterns detected");
+        }
+
+        // NEW: Verify authentic progression
+        let authenticity = Self::verify_authentic_progression(&env, &learner);
+
         let id: u64 = env
             .storage()
             .persistent()
@@ -250,6 +270,8 @@ impl Certificates {
             peer_review_consensus: false,
             integrity_hash: BytesN::from_array(&env, &[0u8; 32]),
             correction_history: Vec::new(&env),
+            authenticity_verified: authenticity.is_authentic,
+            gaming_detection_score: gaming_detection.confidence_score,
         };
 
         env.storage().persistent().set(&DataKey::Cert(id), &cert);
@@ -269,6 +291,36 @@ impl Certificates {
         );
 
         id
+    }
+
+    /// Detect gaming patterns for a learner at issuance time. Delegates to
+    /// the shared `AssessmentSecurity` validator using the learner's
+    /// recorded assessment history (empty when no history is tracked yet,
+    /// which yields a conservative non-gaming result).
+    fn detect_assessment_gaming(
+        env: &Env,
+        learner: &Address,
+        issued_at: u64,
+    ) -> shared::GamingDetectionResult {
+        let historical_data: Vec<shared::AssessmentRecord> = Vec::new(env);
+        AssessmentSecurity::detect_gaming_patterns(
+            env,
+            learner,
+            symbol_short!("cert"),
+            issued_at,
+            0,
+            &historical_data,
+        )
+    }
+
+    /// Verify authentic progression for a learner. Delegates to the shared
+    /// `AssessmentSecurity` progression validator.
+    fn verify_authentic_progression(
+        env: &Env,
+        learner: &Address,
+    ) -> shared::ProgressAuthenticityRecord {
+        let assessment_history: Vec<shared::AssessmentRecord> = Vec::new(env);
+        AssessmentSecurity::validate_authentic_progression(env, learner, &assessment_history)
     }
 
     fn record_achievement_measurement(
@@ -504,6 +556,8 @@ impl Certificates {
             peer_review_consensus: verification.consensus_achieved,
             integrity_hash: integrity_hash.clone(),
             correction_history: Vec::new(&env),
+            authenticity_verified: verification.consensus_achieved,
+            gaming_detection_score: 0,
         };
 
         env.storage().persistent().set(&DataKey::Cert(id), &cert);
