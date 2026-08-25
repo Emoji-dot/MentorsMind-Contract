@@ -18,29 +18,21 @@ use shared::{
     identify_exploitation_patterns as shared_identify_exploitation_patterns,
     compute_welfare_status as shared_compute_welfare_status,
     VulnerabilityAssessment, EmergencyIntervention, LearnerProtectionRecord,
-    // market control protection
-    detect_network_concentration as shared_detect_network_concentration,
-    assess_competition_barriers as shared_assess_competition_barriers,
-    detect_pricing_coordination as shared_detect_pricing_coordination,
-    compute_market_protection_intervention as shared_compute_market_protection_intervention,
-    is_market_restoration_eligible,
-    DecentralizationMonitoring, CompetitionProtection, MarketFairness,
-    MarketProtectionRecord,
-    MARKET_INTERVENTION_COOLDOWN_SECS,
-    // algorithm transparency
-    assess_algorithm_transparency as shared_assess_algo_transparency,
-    detect_reverse_engineering as shared_detect_reverse_engineering,
-    compute_transparency_balance as shared_compute_transparency_balance,
-    monitor_ranking_algorithm as shared_monitor_ranking_algorithm,
-    audit_algorithm_transparency as shared_audit_algo_transparency,
-    compute_algo_protection_intervention as shared_compute_algo_protection,
-    is_algo_restoration_eligible,
-    AlgorithmTransparency, ReverseEngineeringProtection, TransparencyBalance,
-    AlgorithmMonitoringResult, TransparencyAuditRecord, AlgorithmProtectionRecord,
-    ALGO_PROTECTION_COOLDOWN_SECS,
+    // Mentor wellness (#910)
+    MentorWorkload, BurnoutRiskAssessment, SessionDifficulty, SessionDistributionRequest, FairDistributionResult,
+    WellnessIntervention, EmergencyProtection,
+    update_mentor_workload, calculate_burnout_risk, assess_burnout_risk, distribute_sessions_fairly,
+    initiate_intervention, activate_emergency_protection, can_accept_session,
+    // Session recording (#914)
+    SessionRecording, RecordingStatus, ConsentRecord, AccessRole, RedactionRecord, AccessLogEntry, IntegrityVerificationResult,
+    create_recording, compute_merkle_root, verify_recording_integrity, grant_consent, revoke_consent,
+    check_access_authorized, apply_redaction, log_access, emergency_privacy_protection,
+    // Market monitoring (#915)
+    MarketMetrics, DemandAuthenticityResult, SupplyDemandBalance, PriceDiscoveryValidation, MarketManipulationAlert, EmergencyStabilization,
+    calculate_market_metrics, assess_demand_authenticity, balance_supply_demand, validate_price_discovery, detect_market_manipulation, trigger_emergency_stabilization,
 };
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec, Map, BytesN};
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
 const BACKEND: Symbol = symbol_short!("BACKEND");
@@ -144,56 +136,19 @@ pub enum DataKey {
     MentorEmergencyIntervention(Address),
     /// Whether a mentor is currently under an active emergency suspension.
     MentorSuspended(Address),
-    // ── Market control protection ──────────────────────────────────────────
-    /// Per-network session count used for HHI/concentration computation.
-    NetworkSessionCount(Symbol),
-    /// All tracked network IDs in the segment, for iteration.
-    NetworkIds,
-    /// Total session count across all mentors in the segment.
-    SegmentTotalSessions,
-    /// Count of independent (non-network-affiliated) active mentors.
-    IndependentMentorCount,
-    /// Total active mentor count (network + independent).
-    TotalActiveMentorCount,
-    /// Rolling log of price-change timestamps for coordination detection.
-    MarketPriceTimestamps,
-    /// Rolling log of price-change magnitudes (bps) for coordination detection.
-    MarketPriceChangesBps,
-    /// Cached decentralization monitoring result.
-    DecentralizationMonitoringRecord,
-    /// Cached competition protection assessment.
-    CompetitionProtectionRecord,
-    /// Cached market fairness assessment.
-    MarketFairnessRecord,
-    /// Cached market protection intervention record.
-    MarketProtectionIntervention,
-    /// Whether a market segment is currently under a market-control intervention.
-    MarketControlActive,
-    /// Count of barrier signals detected against independent mentors.
-    BarrierSignalCount,
-    // ── Algorithm transparency protection ─────────────────────────────────
-    /// Rolling log of probe timestamps for a caller (reverse-engineering detection).
-    AlgoProbeLog(Address),
-    /// Count of distinct input variations used in probes by an address.
-    AlgoProbeVariations(Address),
-    /// Cached reverse-engineering protection assessment for an address.
-    AlgoProbeProtection(Address),
-    /// Rolling log of ranking score deviation timestamps.
-    RankingScoreTimestamps,
-    /// Rolling log of ranking score deviation magnitudes (bps).
-    RankingScoreDeviations,
-    /// Count of coordinated actors observed in the last gaming window.
-    RankingCoordinatedActors,
-    /// Cached algorithm monitoring result.
-    AlgoMonitoringResult,
-    /// Cached algorithm transparency assessment.
-    AlgoTransparencyRecord,
-    /// Cached algorithm protection intervention record.
-    AlgoProtectionRecord,
-    /// Whether algorithm protection is currently active.
-    AlgoProtectionActive,
-    /// Cached transparency audit record.
-    AlgoTransparencyAudit,
+    // Mentor wellness (#910)
+    MentorWorkload(Address),
+    MentorBurnoutAssessment(Address),
+    WellnessIntervention(Address),
+    // Session recording (#914)
+    SessionRecording(Symbol),
+    RecordingConsent(Symbol),
+    RecordingRedaction(Symbol),
+    RecordingAccessLog(Symbol),
+    // Market monitoring (#915)
+    SpecializationMetrics(Symbol),
+    MarketManipulationAlert(Symbol),
+    EmergencyStabilization(Symbol),
 }
 
 /// Maximum length of the rolling price/pair/request logs kept for scoring.
@@ -1325,6 +1280,531 @@ impl SessionRegistry {
         result
     }
 
+    // ── Mentor Wellness & Workload Monitoring (#910) ───────────────────────────
+
+    /// Update mentor workload after session registration
+    pub fn update_mentor_workload(
+        env: Env,
+        mentor: Address,
+        session_id: Symbol,
+        difficulty: SessionDifficulty,
+        hours: u32,
+        is_start: bool,
+    ) {
+        let backend = Self::require_backend(&env);
+        backend.require_auth();
+
+        let mut workload: Option<MentorWorkload> = env.storage().persistent().get(&DataKey::MentorWorkload(mentor.clone()));
+        
+        if workload.is_none() {
+            workload = Some(MentorWorkload {
+                mentor: mentor.clone(),
+                active_sessions: 0,
+                weekly_hours: 0,
+                weekly_weighted_load: 0,
+                sessions_this_week: Vec::new(&env),
+                last_session_end: 0,
+                rest_until: 0,
+                burnout_risk_bps: 0,
+                updated_at: env.ledger().timestamp(),
+            });
+        }
+        
+        let mut w = workload.unwrap();
+        let difficulty_weight = shared::DIFFICULTY_WEIGHTS[difficulty as u32 as usize];
+        let weighted_hours = (hours as u64 * difficulty_weight as u64 / 10000) as u32;
+        
+        if is_start {
+            w.active_sessions = w.active_sessions.saturating_add(1);
+            w.weekly_hours = w.weekly_hours.saturating_add(hours);
+            w.weekly_weighted_load = w.weekly_weighted_load.saturating_add(weighted_hours);
+            w.sessions_this_week.push_back(session_id);
+        } else {
+            w.active_sessions = w.active_sessions.saturating_sub(1);
+            w.last_session_end = env.ledger().timestamp();
+            w.rest_until = env.ledger().timestamp() + (shared::MIN_REST_HOURS as u64 * 3600);
+        }
+        
+        w.updated_at = env.ledger().timestamp();
+        w.burnout_risk_bps = calculate_burnout_risk(&w);
+        
+        env.storage().persistent().set(&DataKey::MentorWorkload(mentor.clone()), &w);
+        
+        // Assess burnout risk
+        let assessment = assess_burnout_risk(&env, &w);
+        env.storage().persistent().set(&DataKey::MentorBurnoutAssessment(mentor.clone()), &assessment);
+        
+        // Auto-initiate intervention if critical
+        if assessment.risk_level == Symbol::new(&env, "critical") {
+            let intervention = initiate_intervention(
+                &env,
+                &mentor,
+                Symbol::new(&env, "emergency_pause"),
+                Symbol::new(&env, "critical_burnout_risk"),
+                shared::MANDATORY_REST_HOURS,
+                &env.current_contract_address(),
+            );
+            env.storage().persistent().set(&DataKey::WellnessIntervention(mentor.clone()), &intervention);
+            
+            env.events().publish(
+                (symbol_short!("wellness"), Symbol::new(&env, "intervention_triggered")),
+                (mentor, intervention.intervention_type, intervention.duration_hours),
+            );
+        }
+    }
+
+    /// Get mentor workload
+    pub fn get_mentor_workload(env: Env, mentor: Address) -> Option<MentorWorkload> {
+        env.storage().persistent().get(&DataKey::MentorWorkload(mentor))
+    }
+
+    /// Get mentor burnout assessment
+    pub fn get_mentor_burnout_assessment(env: Env, mentor: Address) -> Option<BurnoutRiskAssessment> {
+        env.storage().persistent().get(&DataKey::MentorBurnoutAssessment(mentor))
+    }
+
+    /// Get active wellness intervention
+    pub fn get_wellness_intervention(env: Env, mentor: Address) -> Option<WellnessIntervention> {
+        env.storage().persistent().get(&DataKey::WellnessIntervention(mentor))
+    }
+
+    /// Check if mentor can accept new session (workload check)
+    pub fn check_mentor_availability(env: Env, mentor: Address, additional_hours: u32) -> (bool, Symbol) {
+        let workload: Option<MentorWorkload> = env.storage().persistent().get(&DataKey::MentorWorkload(mentor));
+        if let Some(w) = workload {
+            can_accept_session(&env, &w, additional_hours)
+        } else {
+            (true, Symbol::new(&env, "ok"))
+        }
+    }
+
+    /// Fair session distribution
+    pub fn distribute_session_fairly(
+        env: Env,
+        session_id: Symbol,
+        difficulty: SessionDifficulty,
+        estimated_hours: u32,
+        preferred_mentors: Vec<Address>,
+        required_skills: Vec<Symbol>,
+    ) -> FairDistributionResult {
+        let backend = Self::require_backend(&env);
+        backend.require_auth();
+
+        let request = SessionDistributionRequest {
+            session_id: session_id.clone(),
+            difficulty,
+            estimated_hours,
+            preferred_mentors: preferred_mentors.clone(),
+            required_skills,
+        };
+        
+        // Get available mentors (simplified - would query mentor registry)
+        let available_mentors = preferred_mentors; // In practice, filter by skills and availability
+        let mut workloads = Map::new(&env);
+        for m in available_mentors.iter() {
+            if let Some(w) = env.storage().persistent().get(&DataKey::MentorWorkload(m.clone())) {
+                workloads.set(m, w);
+            }
+        }
+        
+        let result = distribute_sessions_fairly(&env, &request, &available_mentors, &workloads);
+        
+        env.events().publish(
+            (symbol_short!("session"), Symbol::new(&env, "fairly_distributed")),
+            (session_id, result.assigned_mentor.clone(), result.fairness_score_bps),
+        );
+        
+        result
+    }
+
+    // ── Session Recording & Privacy (#914) ─────────────────────────────────────
+
+    /// Create a tamper-evident session recording
+    pub fn create_session_recording(
+        env: Env,
+        session_id: Symbol,
+        mentor: Address,
+        learner: Address,
+        storage_uri: Symbol,
+        content_hash: BytesN<32>,
+        chunk_hashes: Vec<BytesN<32>>,
+        size_bytes: u64,
+        duration_secs: u32,
+    ) -> SessionRecording {
+        let backend = Self::require_backend(&env);
+        backend.require_auth();
+
+        let recording = create_recording(
+            &env,
+            &session_id,
+            &mentor,
+            &learner,
+            storage_uri,
+            content_hash,
+            &chunk_hashes,
+            size_bytes,
+            duration_secs,
+        );
+        
+        env.storage().persistent().set(&DataKey::SessionRecording(session_id.clone()), &recording);
+        
+        // Grant initial consent to participants
+        let mentor_consent = grant_consent(&env, &recording.recording_id, &mentor, &mentor, AccessRole::Participant, 8760, Symbol::new(&env, "full"));
+        let learner_consent = grant_consent(&env, &recording.recording_id, &learner, &learner, AccessRole::Participant, 8760, Symbol::new(&env, "full"));
+        
+        let mut consents = Vec::new(&env);
+        consents.push_back(mentor_consent);
+        consents.push_back(learner_consent);
+        env.storage().persistent().set(&DataKey::RecordingConsent(recording.recording_id.clone()), &consents);
+        
+        env.events().publish(
+            (symbol_short!("recording"), Symbol::new(&env, "created")),
+            (recording.recording_id.clone(), session_id, mentor, learner),
+        );
+        
+        recording
+    }
+
+    /// Get session recording
+    pub fn get_session_recording(env: Env, session_id: Symbol) -> Option<SessionRecording> {
+        env.storage().persistent().get(&DataKey::SessionRecording(session_id))
+    }
+
+    /// Verify recording integrity
+    pub fn verify_recording_integrity(
+        env: Env,
+        session_id: Symbol,
+        provided_chunk_hashes: Vec<BytesN<32>>,
+        provided_content_hash: BytesN<32>,
+        verifier: Address,
+    ) -> IntegrityVerificationResult {
+        let recording: SessionRecording = env.storage().persistent().get(&DataKey::SessionRecording(session_id.clone()))
+            .expect("Recording not found");
+        
+        let result = verify_recording_integrity(&env, &recording, &provided_chunk_hashes, provided_content_hash, &verifier);
+        
+        if result.is_intact {
+            let mut updated = recording;
+            updated.status = RecordingStatus::Verified;
+            updated.verified_at = Some(env.ledger().timestamp());
+            env.storage().persistent().set(&DataKey::SessionRecording(session_id), &updated);
+        }
+        
+        result
+    }
+
+    /// Grant consent for recording access
+    pub fn grant_recording_consent(
+        env: Env,
+        recording_id: Symbol,
+        grantor: Address,
+        grantee: Address,
+        role: AccessRole,
+        duration_hours: u32,
+        scope: Symbol,
+    ) -> ConsentRecord {
+        grantor.require_auth();
+        
+        let recording: SessionRecording = env.storage().persistent().get(&DataKey::SessionRecording(recording_id.clone()))
+            .expect("Recording not found");
+        
+        // Only participants or admin can grant consent
+        if recording.mentor != grantor && recording.learner != grantor {
+            panic!("Unauthorized to grant consent");
+        }
+        
+        let consent = grant_consent(&env, &recording_id, &grantor, &grantee, role, duration_hours, scope);
+        
+        let mut consents: Vec<ConsentRecord> = env.storage().persistent().get(&DataKey::RecordingConsent(recording_id.clone())).unwrap_or(Vec::new(&env));
+        consents.push_back(consent.clone());
+        env.storage().persistent().set(&DataKey::RecordingConsent(recording_id), &consents);
+        
+        consent
+    }
+
+    /// Revoke recording consent
+    pub fn revoke_recording_consent(
+        env: Env,
+        recording_id: Symbol,
+        revoker: Address,
+    ) -> bool {
+        revoker.require_auth();
+        
+        let mut consents: Vec<ConsentRecord> = env.storage().persistent().get(&DataKey::RecordingConsent(recording_id.clone())).unwrap_or(Vec::new(&env));
+        
+        for i in 0..consents.len() {
+            let mut consent = consents.get(i).unwrap();
+            if consent.grantor == revoker && !consent.revoked {
+                let revoked = revoke_consent(&env, &mut consent, &revoker);
+                if revoked {
+                    consents.set(i, consent);
+                    env.storage().persistent().set(&DataKey::RecordingConsent(recording_id), &consents);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Apply redaction to recording
+    pub fn apply_recording_redaction(
+        env: Env,
+        admin: Address,
+        recording_id: Symbol,
+        redaction_type: Symbol,
+        start_ts: u32,
+        end_ts: u32,
+        reason_hash: BytesN<32>,
+    ) -> RedactionRecord {
+        admin.require_auth();
+        
+        let recording: SessionRecording = env.storage().persistent().get(&DataKey::SessionRecording(recording_id.clone()))
+            .expect("Recording not found");
+        
+        let redaction = apply_redaction(&env, &recording_id, &admin, redaction_type, start_ts, end_ts, reason_hash, &admin);
+        
+        let mut redactions: Vec<RedactionRecord> = env.storage().persistent().get(&DataKey::RecordingRedaction(recording_id.clone())).unwrap_or(Vec::new(&env));
+        redactions.push_back(redaction.clone());
+        env.storage().persistent().set(&DataKey::RecordingRedaction(recording_id.clone()), &redactions);
+        
+        // Update recording status
+        let mut updated = recording;
+        updated.status = RecordingStatus::Redacted;
+        env.storage().persistent().set(&DataKey::SessionRecording(recording_id), &updated);
+        
+        redaction
+    }
+
+    /// Check recording access authorization
+    pub fn check_recording_access(
+        env: Env,
+        session_id: Symbol,
+        accessor: Address,
+        role: AccessRole,
+    ) -> bool {
+        let recording: SessionRecording = env.storage().persistent().get(&DataKey::SessionRecording(session_id.clone()))
+            .expect("Recording not found");
+        
+        let consents: Vec<ConsentRecord> = env.storage().persistent().get(&DataKey::RecordingConsent(session_id.clone())).unwrap_or(Vec::new(&env));
+        
+        check_access_authorized(&env, &recording, &consents, &accessor, role)
+    }
+
+    /// Log recording access
+    pub fn log_recording_access(
+        env: Env,
+        session_id: Symbol,
+        accessor: Address,
+        role: AccessRole,
+        purpose: Symbol,
+    ) {
+        let recording: SessionRecording = env.storage().persistent().get(&DataKey::SessionRecording(session_id.clone()))
+            .expect("Recording not found");
+        
+        let entry = log_access(&env, &recording.recording_id, &accessor, role, purpose, &env.current_contract_address(), None);
+        
+        let mut logs: Vec<AccessLogEntry> = env.storage().persistent().get(&DataKey::RecordingAccessLog(recording.recording_id.clone())).unwrap_or(Vec::new(&env));
+        logs.push_back(entry);
+        env.storage().persistent().set(&DataKey::RecordingAccessLog(recording.recording_id), &logs);
+    }
+
+    /// Emergency privacy protection
+    pub fn emergency_recording_protection(
+        env: Env,
+        admin: Address,
+        session_id: Symbol,
+        reason_hash: BytesN<32>,
+    ) -> (RedactionRecord, Vec<ConsentRecord>) {
+        admin.require_auth();
+        
+        let recording: SessionRecording = env.storage().persistent().get(&DataKey::SessionRecording(session_id.clone()))
+            .expect("Recording not found");
+        
+        let (redaction, revoked_consents) = emergency_privacy_protection(&env, &recording.recording_id, reason_hash, &admin);
+        
+        // Update recording status
+        let mut updated = recording;
+        updated.status = RecordingStatus::Redacted;
+        env.storage().persistent().set(&DataKey::SessionRecording(session_id.clone()), &updated);
+        
+        env.events().publish(
+            (symbol_short!("recording"), Symbol::new(&env, "emergency_protection")),
+            (session_id.clone(), admin),
+        );
+        
+        (redaction, revoked_consents)
+    }
+
+    // ── Market Monitoring (#915) ───────────────────────────────────────────────
+
+    /// Record market metrics for a specialization
+    pub fn record_specialization_metrics(
+        env: Env,
+        admin: Address,
+        specialization: Symbol,
+        total_sessions: u32,
+        unique_mentors: u32,
+        unique_learners: u32,
+        avg_price: u64,
+        median_price: u64,
+        price_std_dev: u64,
+        demand_index: u32,
+        supply_index: u32,
+        velocity: u32,
+        concentration_ratio: u32,
+    ) {
+        admin.require_auth();
+        
+        let metrics = MarketMetrics {
+            specialization: specialization.clone(),
+            period_start: env.ledger().timestamp() - (7 * 24 * 3600),
+            period_end: env.ledger().timestamp(),
+            total_sessions,
+            unique_mentors,
+            unique_learners,
+            avg_price,
+            median_price,
+            price_std_dev,
+            demand_index,
+            supply_index,
+            velocity,
+            concentration_ratio,
+            calculated_at: env.ledger().timestamp(),
+        };
+        
+        env.storage().persistent().set(&DataKey::SpecializationMetrics(specialization.clone()), &metrics);
+    }
+
+    /// Assess demand authenticity for a specialization
+    pub fn assess_demand_authenticity(
+        env: Env,
+        specialization: Symbol,
+        external_market_data: Map<Symbol, u64>,
+    ) -> Option<DemandAuthenticityResult> {
+        let current: Option<MarketMetrics> = env.storage().persistent().get(&DataKey::SpecializationMetrics(specialization.clone()));
+        let current = current?;
+        
+        let historical = Vec::new(&env);
+        
+        let result = assess_demand_authenticity(&env, &specialization, &current, &historical, &external_market_data);
+        
+        if !result.is_authentic {
+            let price_val = PriceDiscoveryValidation {
+                specialization: specialization.clone(),
+                platform_price: current.avg_price,
+                external_price: external_market_data.get(specialization.clone()).unwrap_or(0),
+                deviation_bps: 0,
+                is_manipulated: false,
+                manipulation_indicators: Vec::new(&env),
+                confidence_bps: 5000,
+                validated_at: env.ledger().timestamp(),
+            };
+            
+            let balance = SupplyDemandBalance {
+                specialization: specialization.clone(),
+                current_price: current.avg_price,
+                equilibrium_price: current.avg_price,
+                price_pressure: Symbol::new(&env, "stable"),
+                supply_gap: 0,
+                recommended_mentors: current.unique_mentors,
+                intervention_needed: false,
+                intervention_type: Symbol::new(&env, "none"),
+                assessed_at: env.ledger().timestamp(),
+            };
+            
+            if let Some(alert) = detect_market_manipulation(&env, &result, &price_val, &balance) {
+                env.storage().persistent().set(&DataKey::MarketManipulationAlert(alert.alert_id.clone()), &alert);
+                env.events().publish(
+                    (symbol_short!("market"), Symbol::new(&env, "manipulation_alert")),
+                    (alert.specialization, alert.manipulation_type, alert.severity),
+                );
+            }
+        }
+        
+        Some(result)
+    }
+
+    /// Balance supply and demand
+    pub fn balance_supply_demand(
+        env: Env,
+        specialization: Symbol,
+        target_velocity: u32,
+    ) -> Option<SupplyDemandBalance> {
+        let metrics: Option<MarketMetrics> = env.storage().persistent().get(&DataKey::SpecializationMetrics(specialization.clone()));
+        let metrics = metrics?;
+        
+        Some(balance_supply_demand(&env, &specialization, &metrics, target_velocity))
+    }
+
+    /// Validate price discovery
+    pub fn validate_price_discovery(
+        env: Env,
+        specialization: Symbol,
+        external_prices: Map<Symbol, u64>,
+        historical_platform_prices: Vec<u64>,
+    ) -> PriceDiscoveryValidation {
+        let metrics: MarketMetrics = env.storage().persistent().get(&DataKey::SpecializationMetrics(specialization.clone()))
+            .unwrap_or(MarketMetrics {
+                specialization: specialization.clone(),
+                period_start: 0,
+                period_end: 0,
+                total_sessions: 0,
+                unique_mentors: 0,
+                unique_learners: 0,
+                avg_price: 0,
+                median_price: 0,
+                price_std_dev: 0,
+                demand_index: 0,
+                supply_index: 0,
+                velocity: 0,
+                concentration_ratio: 0,
+                calculated_at: 0,
+            });
+        
+        validate_price_discovery(&env, &specialization, metrics.avg_price, &external_prices, &historical_platform_prices)
+    }
+
+    /// Trigger emergency market stabilization
+    pub fn trigger_market_stabilization(
+        env: Env,
+        admin: Address,
+        specialization: Symbol,
+        action_type: Symbol,
+        parameters: Map<Symbol, u64>,
+        duration_hours: u32,
+    ) -> EmergencyStabilization {
+        admin.require_auth();
+        
+        let action_type_clone = action_type.clone();
+        let stabilization = trigger_emergency_stabilization(
+            &env,
+            &specialization,
+            action_type,
+            &parameters,
+            &admin,
+            duration_hours,
+        );
+        
+        env.storage().persistent().set(&DataKey::EmergencyStabilization(specialization.clone()), &stabilization);
+        
+        env.events().publish(
+            (symbol_short!("market"), Symbol::new(&env, "stabilization_triggered")),
+            (specialization.clone(), action_type_clone, admin),
+        );
+        
+        stabilization
+    }
+
+    /// Get market manipulation alert
+    pub fn get_market_manipulation_alert(env: Env, alert_id: Symbol) -> Option<MarketManipulationAlert> {
+        env.storage().persistent().get(&DataKey::MarketManipulationAlert(alert_id))
+    }
+
+    /// Get emergency stabilization
+    pub fn get_emergency_stabilization(env: Env, specialization: Symbol) -> Option<EmergencyStabilization> {
+        env.storage().persistent().get(&DataKey::EmergencyStabilization(specialization))
+    }
+
     /// Detect potential scheduling cartels among mentors
     /// Returns cartel detection result with involved mentors and coordination patterns
     pub fn detect_scheduling_cartels(
@@ -1333,8 +1813,8 @@ impl SessionRegistry {
         time_window_secs: u64,
     ) -> shared::CartelDetectionResult {
         // Collect recent session activity for this mentor
-        let recent_sessions = Self::get_sessions_by_mentor(&env, mentor.clone());
-        
+        let recent_sessions = Self::get_sessions_by_mentor(env.clone(), mentor.clone());
+
         // In production, this would collect availability and pricing changes
         // For now, return a safe default
         shared::CartelDetectionResult {

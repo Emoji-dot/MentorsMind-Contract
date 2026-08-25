@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{Address, Env, Symbol, Vec, BytesN, contracterror};
+use soroban_sdk::{contracttype, Address, Env, Symbol, Vec, BytesN, contracterror};
 
 /// Assessment Security Error Types
 #[contracterror]
@@ -38,6 +38,7 @@ pub enum GamingFlag {
 }
 
 /// Manipulation detection record
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct ManipulationRecord {
     pub learner: Address,
@@ -45,10 +46,11 @@ pub struct ManipulationRecord {
     pub timestamp: u64,
     pub manipulation_type: u32,
     pub severity: u32, // 0-100
-    pub evidence: Vec<u8>,
+    pub evidence: Vec<u32>,
 }
 
 /// Assessment gaming detection result
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct GamingDetectionResult {
     pub is_gaming: bool,
@@ -58,6 +60,7 @@ pub struct GamingDetectionResult {
 }
 
 /// Progress authenticity verification record
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct ProgressAuthenticityRecord {
     pub learner: Address,
@@ -217,7 +220,7 @@ impl AssessmentSecurity {
 
         // Calculate average time between assessments
         let avg_interval = Self::calculate_average_interval(env, historical_data);
-        
+
         // Flag if less than 1 hour average between completions
         avg_interval < 3600
     }
@@ -353,10 +356,10 @@ impl AssessmentSecurity {
         }
 
         let mut variance = 0u64;
-        let avg = scores.iter().fold(0u64, |acc, s| acc + *s as u64) / scores.len() as u64;
+        let avg = scores.iter().fold(0u64, |acc, s| acc + s as u64) / scores.len() as u64;
 
         for score in scores.iter() {
-            let diff = (*score as i64) - (avg as i64);
+            let diff = (score as i64) - (avg as i64);
             variance += (diff * diff) as u64;
         }
 
@@ -368,6 +371,7 @@ impl AssessmentSecurity {
 }
 
 /// Assessment record structure
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct AssessmentRecord {
     pub assessment_id: Symbol,
@@ -377,6 +381,7 @@ pub struct AssessmentRecord {
 }
 
 /// Assessment metrics for integrity verification
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct AssessmentMetrics {
     pub total_attempts: u32,

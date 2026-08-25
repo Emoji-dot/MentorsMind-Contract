@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{Address, Env, Symbol, Vec, contracterror};
+use soroban_sdk::{contracttype, Address, Env, Symbol, Vec, contracterror};
 
 /// Cartel Detection Error Types
 #[contracterror]
@@ -34,6 +34,7 @@ pub enum CartelSeverity {
 }
 
 /// Cartel activity record
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct CartelActivityRecord {
     pub primary_mentor: Address,
@@ -45,6 +46,7 @@ pub struct CartelActivityRecord {
 }
 
 /// Time slot information for cartel analysis
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct TimeSlotInfo {
     pub slot_start: u64,
@@ -55,6 +57,7 @@ pub struct TimeSlotInfo {
 }
 
 /// Scheduling coordination pattern
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct CoordinationPattern {
     pub pattern_type: u32, // Type of coordination detected
@@ -65,6 +68,7 @@ pub struct CoordinationPattern {
 }
 
 /// Time slot fairness analysis result
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct TimeSlotFairnessAnalysis {
     pub total_slots: u32,
@@ -75,6 +79,7 @@ pub struct TimeSlotFairnessAnalysis {
 }
 
 /// Cartel detection result
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct CartelDetectionResult {
     pub cartel_detected: bool,
@@ -175,7 +180,7 @@ impl CartelDetection {
             if slot.price >= premium_threshold_price {
                 let mut found = false;
                 for (idx, (mentor, count)) in mentor_slot_count.iter().enumerate() {
-                    if mentor == &slot.mentor {
+                    if mentor == slot.mentor {
                         // Update count (simplified)
                         found = true;
                         break;
@@ -201,7 +206,7 @@ impl CartelDetection {
         for mentor in all_mentors.iter() {
             let mentor_premium_slots =
                 available_slots.iter().fold(0u32, |acc, slot| {
-                    if &slot.mentor == mentor && slot.price >= premium_threshold_price {
+                    if slot.mentor == mentor && slot.price >= premium_threshold_price {
                         acc + 1
                     } else {
                         acc
@@ -421,6 +426,7 @@ impl CartelDetection {
 }
 
 /// Availability change record
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct AvailabilityChange {
     pub mentor: Address,
