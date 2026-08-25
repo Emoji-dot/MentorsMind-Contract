@@ -51,6 +51,16 @@ pub mod transfer_security;
 pub mod ml_security;
 pub mod cartel_detection;
 
+// Learning, certification, scheduling, and data protection modules
+pub mod network_authenticity;
+pub mod competency_validation;
+pub mod benchmark_integrity;
+pub mod emergency_response_protection;
+pub mod learning_path_protection;
+pub mod certification_integrity;
+pub mod scheduling_integrity;
+pub mod data_protection;
+
 pub use admin::{
     AdminChangeProposal, AdminTransfer, ADMIN_COOLING_OFF_SECS, MIN_ADMIN_TIMELOCK_SECS,
 };
@@ -242,6 +252,38 @@ pub use transfer_security::{
     CredentialAuthenticityProof, CredentialFraudType, CredentialTransfer,
     CreditInflationRecord, CrossPlatformVerification, FraudDetectionResult,
     TransferIntegrityResult, TransferSecurity, TransferSecurityError,
+};
+pub use network_authenticity::{
+    NetworkAuthenticity, EngagementValidation, GrowthIntegrity, NetworkMonitoring,
+    GrowthAudit, NetworkProtection,
+};
+pub use competency_validation::{
+    CompetencyValidation, TransferAssessment, SkillIntegrity, DomainMonitoring,
+    CompetencyAudit, SkillProtection,
+};
+pub use benchmark_integrity::{
+    BenchmarkIntegrity, PerformanceValidation, EvaluationFairness, StandardMonitoring,
+    PerformanceAudit, BenchmarkProtection,
+};
+pub use emergency_response_protection::{
+    EmergencyAuthenticity, ResponseSecurity, CrisisResilience, EmergencyMonitoring,
+    CrisisAudit, EmergencyProtection,
+};
+pub use learning_path_protection::{
+    LearningPathOptimization, DependencyAnalysis, LearnerMobilityProtection,
+    OutcomeValidation, PathMonitoring, EmergencyPathCorrection,
+};
+pub use certification_integrity::{
+    CertificationValidation, CredentialAuthenticity, QualityAssurance, MentorNetworkAnalysis,
+    CertificationAudit, CertificationProtection,
+};
+pub use scheduling_integrity::{
+    ConflictVerification, TimeSlotFairness, SchedulingIntegrity, CancellationPolicyEnforcement,
+    SchedulingAudit, EmergencySchedulingIntervention,
+};
+pub use data_protection::{
+    DataAccessMonitoring, QueryPatternAnalysis, IPProtection, CompetitiveProtection,
+    DataAudit, EmergencyDataProtection,
 };
 
 /// Economic sanity ceiling for a single financial amount (token smallest units).
