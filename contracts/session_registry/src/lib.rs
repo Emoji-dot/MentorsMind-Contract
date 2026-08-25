@@ -124,6 +124,9 @@ pub enum DataKey {
     MentorEmergencyIntervention(Address),
     /// Whether a mentor is currently under an active emergency suspension.
     MentorSuspended(Address),
+    /// Minimum sessions a mentor must keep available in a window before
+    /// hoarding/artificial scarcity audits flag the account.
+    MentorMinAvailabilityQuota(Address),
 }
 
 /// Maximum length of the rolling price/pair/request logs kept for scoring.
@@ -348,6 +351,47 @@ impl SessionRegistry {
             bucket = bucket.saturating_add(1);
         }
         result
+    }
+
+    pub fn set_mentor_availability_quota(env: Env, mentor: Address, min_sessions: u32) {
+        let backend = Self::require_backend(&env);
+        backend.require_auth();
+        env.storage()
+            .persistent()
+            .set(&DataKey::MentorMinAvailabilityQuota(mentor), &min_sessions);
+    }
+
+    pub fn audit_mentor_availability_quota(
+        env: Env,
+        mentor: Address,
+        from: u64,
+        to: u64,
+    ) -> (bool, u32, u32) {
+        let quota: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MentorMinAvailabilityQuota(mentor.clone()))
+            .unwrap_or(0);
+        let sessions = Self::get_sessions_by_mentor(env.clone(), mentor.clone());
+        let mut scheduled = 0u32;
+        for sid in sessions.iter() {
+            if let Some(record) = env.storage().persistent().get::<_, SessionRecord>(&DataKey::Session(sid)) {
+                if record.scheduled_at >= from
+                    && record.scheduled_at < to
+                    && record.status != SessionStatus::Cancelled
+                {
+                    scheduled = scheduled.saturating_add(1);
+                }
+            }
+        }
+        let compliant = scheduled >= quota;
+        if !compliant {
+            env.events().publish(
+                (symbol_short!("quota"), Symbol::new(&env, "shortfall")),
+                (mentor, scheduled, quota),
+            );
+        }
+        (compliant, scheduled, quota)
     }
 
     pub fn set_session_oracle(env: Env, oracle: Address) {

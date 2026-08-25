@@ -202,6 +202,18 @@ pub struct EmergencyActionAuditEventData {
     pub success: bool,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowInvariantReport {
+    pub escrow_id: u64,
+    pub funds_conserved: bool,
+    pub transition_consistent: bool,
+    pub terminal_state_immutable: bool,
+    pub treasury_consistent: bool,
+    pub violation_count: u32,
+    pub checked_at: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Admin Events
 // ---------------------------------------------------------------------------
@@ -347,6 +359,8 @@ pub enum DataKey {
     EmergencyProposalCount,
     /// Immutable audit record for emergency action `n`.
     EmergencyAudit(u32),
+    /// Latest runtime invariant report for an escrow.
+    EscrowInvariantReport(u64),
     /// Params-hash → permanently failed (blocks retry with same parameters).
     EmergencyFailedParams(BytesN<32>),
     /// Time-bound emergency admin role.
@@ -2772,6 +2786,61 @@ impl EscrowContract {
             .persistent()
             .get(&key)
             .expect("Escrow not found")
+    }
+
+    pub fn monitor_escrow_invariants(env: Env, escrow_id: u64) -> EscrowInvariantReport {
+        let escrow = Self::get_escrow(env.clone(), escrow_id);
+        let released_amount = escrow.platform_fee.saturating_add(escrow.net_amount);
+        let funds_conserved = escrow.amount >= 0
+            && escrow.platform_fee >= 0
+            && escrow.net_amount >= 0
+            && released_amount <= escrow.amount;
+        let transition_consistent = escrow.sessions_completed <= escrow.total_sessions
+            && matches!(
+                escrow.status,
+                EscrowStatus::Pending
+                    | EscrowStatus::Active
+                    | EscrowStatus::Released
+                    | EscrowStatus::Disputed
+                    | EscrowStatus::Refunded
+                    | EscrowStatus::Resolved
+            );
+        let terminal_state_immutable = match escrow.status {
+            EscrowStatus::Released | EscrowStatus::Refunded | EscrowStatus::Resolved => {
+                !env.storage().persistent().has(&DataKey::StateTransitionLock(escrow_id))
+            }
+            _ => true,
+        };
+        let treasury_consistent = if escrow.status == EscrowStatus::Released {
+            released_amount > 0 || escrow.amount == 0
+        } else {
+            escrow.platform_fee <= escrow.amount
+        };
+        let mut violation_count = 0u32;
+        for ok in [funds_conserved, transition_consistent, terminal_state_immutable, treasury_consistent] {
+            if !ok {
+                violation_count = violation_count.saturating_add(1);
+            }
+        }
+        let report = EscrowInvariantReport {
+            escrow_id,
+            funds_conserved,
+            transition_consistent,
+            terminal_state_immutable,
+            treasury_consistent,
+            violation_count,
+            checked_at: env.ledger().timestamp(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::EscrowInvariantReport(escrow_id), &report);
+        if violation_count > 0 {
+            env.events().publish(
+                (Symbol::new(&env, "Escrow"), Symbol::new(&env, "InvariantViolation")),
+                (escrow_id, violation_count),
+            );
+        }
+        report
     }
 
     /// Heuristic instruction/IO estimate for releasing `escrow_id` (the
