@@ -17,7 +17,7 @@
               "function_name": "register_session",
               "args": [
                 {
-                  "symbol": "sess2"
+                  "symbol": "coordA1"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -29,10 +29,10 @@
                   "u64": "2000000"
                 },
                 {
-                  "u32": 45
+                  "u32": 5
                 },
                 {
-                  "i128": "200"
+                  "i128": "100"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
@@ -51,17 +51,28 @@
           "function": {
             "contract_fn": {
               "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-              "function_name": "update_status",
+              "function_name": "register_session",
               "args": [
                 {
-                  "symbol": "sess2"
+                  "symbol": "coordA2"
                 },
                 {
-                  "vec": [
-                    {
-                      "symbol": "Confirmed"
-                    }
-                  ]
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                },
+                {
+                  "u64": "2003500"
+                },
+                {
+                  "u32": 5
+                },
+                {
+                  "i128": "100"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
                 }
               ]
             }
@@ -78,17 +89,28 @@
           "function": {
             "contract_fn": {
               "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-              "function_name": "update_status",
+              "function_name": "register_session",
               "args": [
                 {
-                  "symbol": "sess2"
+                  "symbol": "coordA4"
                 },
                 {
-                  "vec": [
-                    {
-                      "symbol": "Completed"
-                    }
-                  ]
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                },
+                {
+                  "u64": "2020000"
+                },
+                {
+                  "u32": 5
+                },
+                {
+                  "i128": "100"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
                 }
               ]
             }
@@ -96,8 +118,7 @@
           "sub_invocations": []
         }
       ]
-    ],
-    []
+    ]
   ],
   "ledger": {
     "protocol_version": 25,
@@ -109,74 +130,6 @@
     "min_temp_entry_ttl": 16,
     "max_entry_ttl": 6312000,
     "ledger_entries": [
-      {
-        "entry": {
-          "last_modified_ledger_seq": 0,
-          "data": {
-            "contract_data": {
-              "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-              "key": {
-                "vec": [
-                  {
-                    "symbol": "CompletionProof"
-                  },
-                  {
-                    "symbol": "sess2"
-                  }
-                ]
-              },
-              "durability": "persistent",
-              "val": {
-                "map": [
-                  {
-                    "key": {
-                      "symbol": "commitment"
-                    },
-                    "val": {
-                      "bytes": "03eb61ed8287e24473d18679d6c219ef2e519d259372948eedd8e1fb8cf199ad"
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "completed_at"
-                    },
-                    "val": {
-                      "u64": "1000000"
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "learner"
-                    },
-                    "val": {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "mentor"
-                    },
-                    "val": {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "session_id"
-                    },
-                    "val": {
-                      "symbol": "sess2"
-                    }
-                  }
-                ]
-              }
-            }
-          },
-          "ext": "v0"
-        },
-        "live_until": 1000000
-      },
       {
         "entry": {
           "last_modified_ledger_seq": 0,
@@ -199,7 +152,67 @@
               },
               "durability": "persistent",
               "val": {
-                "symbol": "sess2"
+                "symbol": "coordA1"
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 4095
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "LearnerSessionAt"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                  },
+                  {
+                    "u32": 1
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "symbol": "coordA2"
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 4095
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "LearnerSessionAt"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                  },
+                  {
+                    "u32": 2
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "symbol": "coordA4"
               }
             }
           },
@@ -226,7 +239,7 @@
               },
               "durability": "persistent",
               "val": {
-                "u32": 1
+                "u32": 3
               }
             }
           },
@@ -259,7 +272,7 @@
                       "symbol": "clustered_timing_count"
                     },
                     "val": {
-                      "u32": 0
+                      "u32": 1
                     }
                   },
                   {
@@ -267,7 +280,7 @@
                       "symbol": "repeated_pair_count"
                     },
                     "val": {
-                      "u32": 1
+                      "u32": 3
                     }
                   },
                   {
@@ -275,7 +288,7 @@
                       "symbol": "risk_score"
                     },
                     "val": {
-                      "u32": 0
+                      "u32": 30
                     }
                   },
                   {
@@ -426,6 +439,12 @@
                 "vec": [
                   {
                     "u64": "2000000"
+                  },
+                  {
+                    "u64": "2003500"
+                  },
+                  {
+                    "u64": "2020000"
                   }
                 ]
               }
@@ -455,6 +474,12 @@
               "durability": "persistent",
               "val": {
                 "vec": [
+                  {
+                    "u64": "1000000"
+                  },
+                  {
+                    "u64": "1000000"
+                  },
                   {
                     "u64": "1000000"
                   }
@@ -488,7 +513,7 @@
               },
               "durability": "persistent",
               "val": {
-                "symbol": "sess2"
+                "symbol": "coordA1"
               }
             }
           },
@@ -512,13 +537,43 @@
                     "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                   },
                   {
-                    "u64": "1112"
+                    "u64": "1113"
                   }
                 ]
               },
               "durability": "persistent",
               "val": {
-                "symbol": "sess2"
+                "symbol": "coordA2"
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 1000000
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "MentorScheduleSlot"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                  },
+                  {
+                    "u64": "1122"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "symbol": "coordA4"
               }
             }
           },
@@ -548,7 +603,67 @@
               },
               "durability": "persistent",
               "val": {
-                "symbol": "sess2"
+                "symbol": "coordA1"
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 4095
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "MentorSessionAt"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                  },
+                  {
+                    "u32": 1
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "symbol": "coordA2"
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 4095
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "MentorSessionAt"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                  },
+                  {
+                    "u32": 2
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "symbol": "coordA4"
               }
             }
           },
@@ -575,7 +690,7 @@
               },
               "durability": "persistent",
               "val": {
-                "u32": 1
+                "u32": 3
               }
             }
           },
@@ -600,6 +715,12 @@
               "durability": "persistent",
               "val": {
                 "vec": [
+                  {
+                    "u64": "1000000"
+                  },
+                  {
+                    "u64": "1000000"
+                  },
                   {
                     "u64": "1000000"
                   }
@@ -629,7 +750,13 @@
               "val": {
                 "vec": [
                   {
-                    "i128": "200"
+                    "i128": "100"
+                  },
+                  {
+                    "i128": "100"
+                  },
+                  {
+                    "i128": "100"
                   }
                 ]
               }
@@ -652,7 +779,7 @@
                     "symbol": "Session"
                   },
                   {
-                    "symbol": "sess2"
+                    "symbol": "coordA1"
                   }
                 ]
               },
@@ -664,7 +791,7 @@
                       "symbol": "amount"
                     },
                     "val": {
-                      "i128": "200"
+                      "i128": "100"
                     }
                   },
                   {
@@ -672,7 +799,7 @@
                       "symbol": "duration_mins"
                     },
                     "val": {
-                      "u32": 45
+                      "u32": 5
                     }
                   },
                   {
@@ -712,7 +839,7 @@
                       "symbol": "session_id"
                     },
                     "val": {
-                      "symbol": "sess2"
+                      "symbol": "coordA1"
                     }
                   },
                   {
@@ -722,7 +849,215 @@
                     "val": {
                       "vec": [
                         {
-                          "symbol": "Completed"
+                          "symbol": "Pending"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "token"
+                    },
+                    "val": {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 1000000
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "Session"
+                  },
+                  {
+                    "symbol": "coordA2"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "map": [
+                  {
+                    "key": {
+                      "symbol": "amount"
+                    },
+                    "val": {
+                      "i128": "100"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "duration_mins"
+                    },
+                    "val": {
+                      "u32": 5
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "learner"
+                    },
+                    "val": {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "mentor"
+                    },
+                    "val": {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "registered_at"
+                    },
+                    "val": {
+                      "u64": "1000000"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "scheduled_at"
+                    },
+                    "val": {
+                      "u64": "2003500"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "session_id"
+                    },
+                    "val": {
+                      "symbol": "coordA2"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "status"
+                    },
+                    "val": {
+                      "vec": [
+                        {
+                          "symbol": "Pending"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "token"
+                    },
+                    "val": {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 1000000
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "Session"
+                  },
+                  {
+                    "symbol": "coordA4"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "map": [
+                  {
+                    "key": {
+                      "symbol": "amount"
+                    },
+                    "val": {
+                      "i128": "100"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "duration_mins"
+                    },
+                    "val": {
+                      "u32": 5
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "learner"
+                    },
+                    "val": {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "mentor"
+                    },
+                    "val": {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "registered_at"
+                    },
+                    "val": {
+                      "u64": "1000000"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "scheduled_at"
+                    },
+                    "val": {
+                      "u64": "2020000"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "session_id"
+                    },
+                    "val": {
+                      "symbol": "coordA4"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "status"
+                    },
+                    "val": {
+                      "vec": [
+                        {
+                          "symbol": "Pending"
                         }
                       ]
                     }
@@ -804,7 +1139,7 @@
               "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
               "key": {
                 "ledger_key_nonce": {
-                  "nonce": "1033654523790656264"
+                  "nonce": "4837995959683129791"
                 }
               },
               "durability": "temporary",
@@ -851,5 +1186,42 @@
       }
     ]
   },
-  "events": []
+  "events": [
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "session"
+              },
+              {
+                "symbol": "session_registered"
+              },
+              {
+                "symbol": "coordA4"
+              }
+            ],
+            "data": {
+              "vec": [
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                },
+                {
+                  "u64": "2020000"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    }
+  ]
 }

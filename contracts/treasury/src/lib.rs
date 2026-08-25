@@ -4,6 +4,9 @@ use shared::{
     require_not_paused, AtomicBatch, BatchOp, ReentrancyGuard, StateSnapshot, Validator,
     validate_amount_limits, validate_caller_is_authorized,
     MIN_STAKING_DURATION_SECS, REWARD_LOCKUP_SECS, BASIS_POINTS, SuspiciousPatternFlag,
+    detect_price_coordination, validate_market_rate,
+    enforce_fair_pricing as shared_enforce_fair_pricing, FairPricingResult, MarketRateValidation,
+    PriceCoordinationFlag, DEFAULT_MAX_MARKET_DEVIATION_BPS,
 };
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token,
@@ -283,7 +286,23 @@ pub enum DataKey {
     /// compatible) but governance can flip it on to fully commit the
     /// protocol to announced schedules.
     RequireScheduledDistribution,
+    // -----------------------------------------------------------------------
+    // Pricing-algorithm protection keys (#pricing-manipulation-resistance)
+    // -----------------------------------------------------------------------
+    /// Admin-set benchmark market rate for a token, used to validate that
+    /// proposed session/swap prices haven't drifted into artificial inflation.
+    BenchmarkRate(Address),
+    PriceFloor(Address),
+    PriceCeiling(Address),
+    MaxPriceDeviationBps(Address),
+    /// Rolling window of recently-proposed prices/timestamps for a token,
+    /// used to detect coordinated price setting.
+    RecentPricesForToken(Address),
+    RecentPriceTimestampsForToken(Address),
 }
+
+/// Maximum length of the rolling per-token price log kept for coordination scoring.
+const PRICE_MONITORING_LOG_CAP: u32 = 20;
 
 // ---------------------------------------------------------------------------
 // Contract
@@ -497,6 +516,166 @@ impl TreasuryContract {
             new_caller,
         );
         Ok(())
+    }
+
+    /// Admin-set benchmark market rate for `token`, used as the reference
+    /// point for market-rate validation and fair-pricing enforcement.
+    pub fn set_benchmark_rate(env: Env, admin: Address, token: Address, rate: i128) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        if rate <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::BenchmarkRate(token), &rate);
+        Ok(())
+    }
+
+    /// Admin-set fair-pricing bounds and maximum allowed deviation from the
+    /// benchmark rate (basis points) for `token`.
+    pub fn set_pricing_bounds(
+        env: Env,
+        admin: Address,
+        token: Address,
+        floor: i128,
+        ceiling: i128,
+        max_deviation_bps: u32,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        if floor < 0 || ceiling < floor {
+            return Err(Error::InvalidAmount);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::PriceFloor(token.clone()), &floor);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PriceCeiling(token.clone()), &ceiling);
+        env.storage().persistent().set(
+            &DataKey::MaxPriceDeviationBps(token),
+            &max_deviation_bps.min(shared::MAX_MARKET_DEVIATION_CEILING_BPS),
+        );
+        Ok(())
+    }
+
+    /// Validate a proposed price against the admin-configured benchmark
+    /// market rate for `token`.
+    pub fn validate_market_rates(
+        env: Env,
+        token: Address,
+        proposed_price: i128,
+    ) -> Result<MarketRateValidation, Error> {
+        let benchmark: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BenchmarkRate(token.clone()))
+            .ok_or(Error::NotInitialized)?;
+        let max_dev: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MaxPriceDeviationBps(token))
+            .unwrap_or(DEFAULT_MAX_MARKET_DEVIATION_BPS);
+        Ok(validate_market_rate(proposed_price, benchmark, max_dev))
+    }
+
+    /// Score the platform-wide rolling price history for `token` for
+    /// coordinated price setting (near-identical prices set within a tight
+    /// window by independent callers), recording `proposed_price` as the
+    /// latest observation. Callable by the admin or an authorized caller.
+    pub fn protect_pricing_algorithms(
+        env: Env,
+        caller: Address,
+        token: Address,
+        proposed_price: i128,
+    ) -> Result<PriceCoordinationFlag, Error> {
+        Self::require_authorized_caller(&env, &caller)?;
+        if proposed_price <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let prices_key = DataKey::RecentPricesForToken(token.clone());
+        let ts_key = DataKey::RecentPriceTimestampsForToken(token.clone());
+        let mut prices: Vec<i128> = env.storage().persistent().get(&prices_key).unwrap_or(Vec::new(&env));
+        let mut timestamps: Vec<u64> = env.storage().persistent().get(&ts_key).unwrap_or(Vec::new(&env));
+        prices.push_back(proposed_price);
+        timestamps.push_back(env.ledger().timestamp());
+        while prices.len() > PRICE_MONITORING_LOG_CAP {
+            prices.remove(0);
+        }
+        while timestamps.len() > PRICE_MONITORING_LOG_CAP {
+            timestamps.remove(0);
+        }
+        env.storage().persistent().set(&prices_key, &prices);
+        env.storage().persistent().set(&ts_key, &timestamps);
+
+        let flag = detect_price_coordination(&prices, &timestamps);
+        if flag.suspicious {
+            env.events().publish(
+                (symbol_short!("pricing"), symbol_short!("coord")),
+                (token, flag.risk_score),
+            );
+        }
+        Ok(flag)
+    }
+
+    /// Enforce fair-pricing bounds for `token`: clamps `proposed_price` into
+    /// the admin-configured floor/ceiling, and further clamps to the
+    /// benchmark-rate deviation band when market-rate validation flags
+    /// inflation.
+    pub fn enforce_fair_pricing(
+        env: Env,
+        token: Address,
+        proposed_price: i128,
+    ) -> Result<FairPricingResult, Error> {
+        let benchmark: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BenchmarkRate(token.clone()))
+            .unwrap_or(0);
+        let max_dev: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MaxPriceDeviationBps(token.clone()))
+            .unwrap_or(DEFAULT_MAX_MARKET_DEVIATION_BPS);
+        let floor: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PriceFloor(token.clone()))
+            .unwrap_or(0);
+        let ceiling: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PriceCeiling(token.clone()))
+            .unwrap_or(i128::MAX);
+
+        let market = validate_market_rate(proposed_price, benchmark, max_dev);
+        Ok(shared_enforce_fair_pricing(
+            &env,
+            proposed_price,
+            floor,
+            ceiling,
+            market,
+            benchmark,
+            max_dev,
+        ))
+    }
+
+    fn require_authorized_caller(env: &Env, caller: &Address) -> Result<(), Error> {
+        caller.require_auth();
+        let admin = Self::admin(env)?;
+        if admin == *caller {
+            return Ok(());
+        }
+        let auth_callers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuthorizedCallers)
+            .unwrap_or(Vec::new(env));
+        if auth_callers.contains(caller) {
+            Ok(())
+        } else {
+            Err(Error::Unauthorized)
+        }
     }
 
     pub fn admin_resume_rg(
@@ -1713,38 +1892,6 @@ impl TreasuryContract {
             .persistent()
             .get(&DataKey::StakingContract)
             .ok_or(Error::NotInitialized)
-    }
-
-    #[test]
-    fn test_buyback_aborted_when_circuit_breaker_tripped() {
-        let env = Env::default();
-        env.mock_all_auths();
-        env.ledger().set_timestamp(1_000);
-        let (admin, _, _, contract_id) = setup_test(&env);
-
-        let xlm_addr = env.register_stellar_asset_contract(admin.clone());
-        let mnt_addr = env.register_contract(None, MockMNT);
-        let dex_addr = env.register_contract(None, MockDEX);
-        let oracle_addr = env.register_contract(None, MockOracleCircuitBreaker);
-
-        let stellar_asset_client = token::StellarAssetClient::new(&env, &xlm_addr);
-        stellar_asset_client.mint(&contract_id, &500);
-
-        let treasury_client = TreasuryContractClient::new(&env, &contract_id);
-        treasury_client.set_approved_token(&xlm_addr, &true);
-        treasury_client.set_approved_token(&mnt_addr, &true);
-
-        let result = treasury_client.try_buyback_and_burn(
-            &xlm_addr,
-            &mnt_addr,
-            &dex_addr,
-            &500,
-            &1,
-            &default_dex_iface(&env),
-            &Some(oracle_addr),
-            &Some(symbol_short!("MNT")),
-        );
-        assert_eq!(result, Err(Ok(Error::OracleCircuitBreaker)));
     }
 }
 

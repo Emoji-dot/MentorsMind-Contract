@@ -1,4 +1,5 @@
 #![no_std]
+use shared::{authenticate_learning_outcomes, OutcomeAuthenticity};
 use soroban_sdk::{
     contract, contractclient, contractimpl, contracttype, symbol_short, vec, Address, Env, Symbol,
     Vec,
@@ -87,23 +88,15 @@ pub enum DataKey {
     EscrowContract,
     ReputationContract,
     SessionRegistry,
-    // =========================================================================
-    // Learning Fraud Prevention Keys
-    // =========================================================================
-    /// Session completion records for each learner
-    SessionCompletionLog(Address),
-    /// Fraud detection records
-    FraudDetectionLog(Address),
-    /// Cross-session activity tracking
-    CrossSessionActivity(Address),
-    /// Timestamp of last certification per (learner, skill) pair
-    LastCertificationTime((Address, Symbol)),
-    /// Session completion count per day for learner
-    DailySessionCount(Address),
-    /// Learning authenticity reports
-    AuthenticityReport(Address),
-    /// Individual learning verification data
-    LearnerVerificationData(Address),
+    /// Issuance timestamps for a given (mentor, skill) combination, used to
+    /// score learning-outcome authenticity (#outcome-authenticity).
+    MentorSkillCertLog(Address, Symbol),
+    /// Whether `learner` has ever received a (mentor, skill) certificate
+    /// before (distinct-learner tracking for outcome authenticity).
+    MentorSkillHasLearner(Address, Symbol, Address),
+    MentorSkillDistinctLearners(Address, Symbol),
+    /// Cached outcome-authenticity assessment for a (mentor, skill) pair.
+    OutcomeAuthenticityRecord(Address, Symbol),
 }
 
 #[contractclient(name = "EscrowClient")]
@@ -215,7 +208,7 @@ impl Certificates {
         let cert = CertificateRecord {
             id,
             learner: learner.clone(),
-            mentor,
+            mentor: mentor.clone(),
             skill: skill.clone(),
             sessions_completed: sessions.len(),
             issued_at,
@@ -228,6 +221,10 @@ impl Certificates {
         push_id(&env, &DataKey::LearnerCerts(learner.clone()), id);
         push_id(&env, &DataKey::SkillCerts(skill.clone()), id);
 
+        // Outcome-authenticity monitoring: track issuance timing and
+        // distinct-learner diversity for this (mentor, skill) pair.
+        Self::record_achievement_measurement(&env, &mentor, &skill, &learner, issued_at);
+
         env.events().publish(
             (
                 Symbol::new(&env, "CertificateEarned"),
@@ -237,6 +234,66 @@ impl Certificates {
         );
 
         id
+    }
+
+    fn record_achievement_measurement(
+        env: &Env,
+        mentor: &Address,
+        skill: &Symbol,
+        learner: &Address,
+        issued_at: u64,
+    ) {
+        let log_key = DataKey::MentorSkillCertLog(mentor.clone(), skill.clone());
+        let mut log: Vec<u64> = env.storage().persistent().get(&log_key).unwrap_or_else(|| vec![env]);
+        log.push_back(issued_at);
+        env.storage().persistent().set(&log_key, &log);
+
+        let seen_key = DataKey::MentorSkillHasLearner(mentor.clone(), skill.clone(), learner.clone());
+        if !env.storage().persistent().get(&seen_key).unwrap_or(false) {
+            env.storage().persistent().set(&seen_key, &true);
+            let cnt_key = DataKey::MentorSkillDistinctLearners(mentor.clone(), skill.clone());
+            let cnt: u32 = env.storage().persistent().get(&cnt_key).unwrap_or(0);
+            env.storage().persistent().set(&cnt_key, &(cnt + 1));
+        }
+    }
+
+    /// Verify that `mentor`'s certificate issuances for `skill` reflect
+    /// genuine learning outcomes rather than a manipulated/bursty
+    /// measurement pattern: scores issuance-timing clustering against
+    /// distinct-learner diversity behind the certificates. Safe to call by
+    /// anyone as a read-through audit; also invoked internally on every
+    /// `issue_certificate`.
+    pub fn verify_learning_achievement(env: Env, mentor: Address, skill: Symbol) -> OutcomeAuthenticity {
+        let log: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MentorSkillCertLog(mentor.clone(), skill.clone()))
+            .unwrap_or_else(|| vec![&env]);
+        let distinct: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MentorSkillDistinctLearners(mentor.clone(), skill.clone()))
+            .unwrap_or(0);
+        let result = authenticate_learning_outcomes(&log, distinct);
+        env.storage()
+            .persistent()
+            .set(&DataKey::OutcomeAuthenticityRecord(mentor, skill), &result);
+        result
+    }
+
+    /// Validate that `cert_id`'s underlying outcome measurement (mentor
+    /// rating and sessions-completed gate checked at issuance) still meets
+    /// the platform's objective thresholds and that the certificate has not
+    /// been revoked.
+    pub fn validate_outcome_measurement(env: Env, cert_id: u64) -> bool {
+        let cert: CertificateRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Cert(cert_id))
+            .expect("cert not found");
+        !cert.revoked
+            && cert.rating_at_time >= MIN_CERT_RATING
+            && cert.sessions_completed >= MIN_SESSIONS_COMPLETED
     }
 
     /// Soulbound: transfers are forbidden.
