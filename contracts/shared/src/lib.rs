@@ -30,6 +30,12 @@ pub mod validation;
 pub mod reputation;
 pub mod failure_tracking;
 pub mod atomic_state;
+pub mod objective_assessment;
+pub mod grade_inflation;
+pub mod assessment_authenticity;
+pub mod mentor_wellness;
+pub mod recording_integrity;
+pub mod market_monitoring;
 pub mod community_protection;
 pub mod pricing_protection;
 pub mod privacy_protection;
@@ -37,6 +43,13 @@ pub mod justice_protection;
 pub mod outcome_authenticity;
 pub mod scalability_protection;
 pub mod learner_protection;
+
+// Security integrity system modules (added on main; module declarations
+// restored here — main shipped the files without registering them).
+pub mod assessment_security;
+pub mod transfer_security;
+pub mod ml_security;
+pub mod cartel_detection;
 
 pub use admin::{
     AdminChangeProposal, AdminTransfer, ADMIN_COOLING_OFF_SECS, MIN_ADMIN_TIMELOCK_SECS,
@@ -120,6 +133,39 @@ pub use atomic_state::{
     all_checkpoints_passed, is_transition_expired, STATE_TRANSITION_TIMEOUT_SECS,
     STATE_TRANSITION_LOCK_TTL, MAX_CHECKPOINT_COUNT,
 };
+pub use objective_assessment::{
+    AssessmentCriteria, GradingRubric, ObjectiveAssessment, PeerReviewValidation, AssessmentCalibration,
+    validate_rubric_weights, calculate_weighted_score, validate_peer_review, calibrate_rubric, apply_calibration,
+    MAX_CRITERIA_COUNT, MIN_PEER_REVIEWERS, CONSENSUS_THRESHOLD_BPS, GRADE_STD_DEV_THRESHOLD,
+};
+pub use grade_inflation::{
+    GradeDistributionStats, InflationDetectionResult, MentorScoringAdjustment, GradeCorrectionRecord,
+    calculate_grade_distribution, detect_grade_inflation, apply_inflation_adjustment, record_grade_correction,
+    MIN_SESSIONS_FOR_ANALYSIS, OUTLIER_ZSCORE_THRESHOLD, INFLATION_WINDOW, MAX_INFLATION_RATE_BPS, INFLATION_PENALTY_BPS_PER_DETECTION,
+};
+pub use assessment_authenticity::{
+    ValidationSource, ValidationResult, AuthenticityVerification, ConsensusRecord,
+    submit_validation, verify_assessment_authenticity, perform_consensus_validation, check_source_diversity, verify_blockchain_attestation,
+    MIN_VALIDATION_SOURCES, VALIDATION_CONSENSUS_BPS, MAX_VALIDATION_AGE_SECS,
+};
+pub use mentor_wellness::{
+    SessionDifficulty, MentorWorkload, BurnoutRiskAssessment, SessionDistributionRequest, FairDistributionResult,
+    WellnessIntervention, EmergencyProtection,
+    update_mentor_workload, calculate_burnout_risk, assess_burnout_risk, distribute_sessions_fairly,
+    initiate_intervention, activate_emergency_protection, can_accept_session,
+    MAX_CONCURRENT_SESSIONS, MAX_WEEKLY_HOURS, MIN_REST_HOURS, BURNOUT_RISK_THRESHOLD_BPS, MANDATORY_REST_HOURS, DIFFICULTY_WEIGHTS,
+};
+pub use recording_integrity::{
+    RecordingStatus, AccessRole, SessionRecording, ConsentRecord, RedactionRecord, AccessLogEntry, IntegrityVerificationResult,
+    create_recording, compute_merkle_root, verify_recording_integrity, grant_consent, revoke_consent,
+    check_access_authorized, apply_redaction, log_access, emergency_privacy_protection,
+    MAX_RECORDING_SIZE_MB, MIN_CONSENT_DURATION_HOURS, DEFAULT_RETENTION_DAYS,
+};
+pub use market_monitoring::{
+    MarketMetrics, DemandAuthenticityResult, SupplyDemandBalance, PriceDiscoveryValidation, MarketManipulationAlert, EmergencyStabilization,
+    calculate_market_metrics, assess_demand_authenticity, balance_supply_demand, validate_price_discovery, detect_market_manipulation, trigger_emergency_stabilization,
+    MIN_MARKET_DATA_POINTS, MAX_PRICE_DEVIATION_BPS, ARTIFICIAL_DEMAND_THRESHOLD_BPS, SUPPLY_RESTRICTION_THRESHOLD_BPS, STABILIZATION_THRESHOLD_BPS,
+};
 pub use community_protection::{
     detect_coordination, detect_coordination_ring, validate_network_authenticity,
     verify_social_proof, evaluate_fair_access, compute_community_intervention,
@@ -140,7 +186,7 @@ pub use pricing_protection::{
 };
 pub use privacy_protection::{
     check_access, minimize_to_need_to_know, detect_exploitation, compute_privacy_intervention,
-    ConsentRecord, AccessDecision, PrivacyMonitoringResult, PrivacyInterventionRecord,
+    ConsentRecord as PrivacyConsentRecord, AccessDecision, PrivacyMonitoringResult, PrivacyInterventionRecord,
     FIELD_IDENTITY, FIELD_CONTACT, FIELD_LEARNING_HISTORY, FIELD_CAREER_DATA, FIELD_PAYMENT,
     MINIMAL_SESSION_FIELDS, ALL_FIELDS, ACCESS_MONITORING_WINDOW_SECS,
     MAX_ACCESSES_PER_WINDOW, PRIVACY_RISK_THRESHOLD,
@@ -185,6 +231,17 @@ pub use learner_protection::{
     PREDATORY_COMPLAINT_RATIO_BPS, PREDATORY_RISK_THRESHOLD,
     EMERGENCY_PATTERN_THRESHOLD, EMERGENCY_SUSPENSION_COOLDOWN_SECS,
     LEARNER_PROTECTION_COOLDOWN_SECS,
+};
+pub use assessment_security::{
+    AssessmentRecord, AssessmentSecurity, AssessmentSecurityError, GamingDetectionResult,
+    GamingFlag, ManipulationRecord, ProgressAuthenticityRecord,
+};
+pub use ml_security::{AIPerformanceMetrics, MLSecurity, ModelRobustnessReport};
+pub use cartel_detection::{CoordinationPattern, CartelDetectionResult, TimeSlotFairnessAnalysis};
+pub use transfer_security::{
+    CredentialAuthenticityProof, CredentialFraudType, CredentialTransfer,
+    CreditInflationRecord, CrossPlatformVerification, FraudDetectionResult,
+    TransferIntegrityResult, TransferSecurity, TransferSecurityError,
 };
 
 /// Economic sanity ceiling for a single financial amount (token smallest units).
