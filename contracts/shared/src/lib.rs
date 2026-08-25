@@ -36,6 +36,7 @@ pub mod privacy_protection;
 pub mod justice_protection;
 pub mod outcome_authenticity;
 pub mod scalability_protection;
+pub mod learner_protection;
 
 pub use admin::{
     AdminChangeProposal, AdminTransfer, ADMIN_COOLING_OFF_SECS, MIN_ADMIN_TIMELOCK_SECS,
@@ -170,6 +171,20 @@ pub use scalability_protection::{
     RESOURCE_BURST_WINDOW_SECS, RESOURCE_MIN_DISTINCT_BPS, RESOURCE_COMPETITION_RISK_THRESHOLD,
     LOAD_SUSPICIOUS_RATE_PER_MINUTE, FAIR_ALLOCATION_MAX_SHARE_BPS,
     PERFORMANCE_INTERVENTION_THRESHOLD, PERFORMANCE_RESTORATION_COOLDOWN_SECS,
+};
+pub use learner_protection::{
+    assess_vulnerability, detect_predatory_behavior, enforce_learner_fair_pricing,
+    identify_exploitation_patterns, compute_welfare_status,
+    compute_learner_protection_intervention, compute_emergency_intervention,
+    is_protection_restoration_eligible,
+    VulnerabilityAssessment, PredatoryBehaviorDetection, ExploitationPattern,
+    WelfareStatus, EmergencyIntervention, LearnerProtectionRecord,
+    VULNERABILITY_SESSION_WINDOW, VULNERABILITY_HIGH_RECURRENCE_THRESHOLD,
+    VULNERABILITY_RISK_THRESHOLD, AFFORDABILITY_DEVIATION_BPS,
+    FINANCIAL_PROTECTION_CAP_BPS, PREDATORY_LOW_QUALITY_THRESHOLD,
+    PREDATORY_COMPLAINT_RATIO_BPS, PREDATORY_RISK_THRESHOLD,
+    EMERGENCY_PATTERN_THRESHOLD, EMERGENCY_SUSPENSION_COOLDOWN_SECS,
+    LEARNER_PROTECTION_COOLDOWN_SECS,
 };
 
 /// Economic sanity ceiling for a single financial amount (token smallest units).
