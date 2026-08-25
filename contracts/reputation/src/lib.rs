@@ -16,6 +16,17 @@ use shared::{
     compute_learner_protection_intervention, is_protection_restoration_eligible,
     PredatoryBehaviorDetection, ExploitationPattern, LearnerProtectionRecord,
     VulnerabilityAssessment,
+    // algorithm transparency
+    assess_algorithm_transparency as rep_assess_algo_transparency,
+    detect_reverse_engineering as rep_detect_reverse_engineering,
+    compute_transparency_balance as rep_compute_transparency_balance,
+    monitor_ranking_algorithm as rep_monitor_ranking_algorithm,
+    audit_algorithm_transparency as rep_audit_algo_transparency,
+    compute_algo_protection_intervention as rep_compute_algo_protection,
+    is_algo_restoration_eligible,
+    AlgorithmTransparency, ReverseEngineeringProtection, TransparencyBalance,
+    AlgorithmMonitoringResult, TransparencyAuditRecord, AlgorithmProtectionRecord,
+    ALGO_PROTECTION_COOLDOWN_SECS,
 };
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal,
@@ -119,6 +130,29 @@ pub enum DataKey {
     /// Cached learner-protection intervention record for a mentor (reputation
     /// contract's copy; session_registry keeps a parallel copy).
     LearnerProtectionIntervention(Address),
+    // ── Algorithm transparency (#algo-transparency) ───────────────────────
+    /// Rolling probe timestamps for a caller querying reputation scores.
+    RepAlgoProbeLog(Address),
+    /// Distinct probe input variations for a caller.
+    RepAlgoProbeVariations(Address),
+    /// Cached reverse-engineering protection assessment for a caller.
+    RepAlgoProbeProtection(Address),
+    /// Rolling timestamps of scoring deviations (reputation-score gaming).
+    RepScoreTimestamps,
+    /// Rolling deviation magnitudes (bps) of reputation scores from baseline.
+    RepScoreDeviations,
+    /// Count of coordinated actors gaming reputation scores.
+    RepCoordinatedActors,
+    /// Cached algorithm monitoring result for reputation scoring.
+    RepAlgoMonitoringResult,
+    /// Cached algorithm transparency assessment for reputation scoring.
+    RepAlgoTransparencyRecord,
+    /// Cached algorithm protection intervention for reputation scoring.
+    RepAlgoProtectionRecord,
+    /// Whether reputation algorithm protection is currently active.
+    RepAlgoProtectionActive,
+    /// Cached transparency audit for reputation scoring algorithms.
+    RepAlgoTransparencyAudit,
 }
 
 /// Cooldown before an intervened mentor's community access is eligible for
@@ -1352,6 +1386,378 @@ impl ReputationContract {
         let commitment_bytes: BytesN<32> = commitment.into();
         commitment_bytes == proof.commitment
             && proof.proof_type == Symbol::new(&env, "rating_threshold")
+    }
+
+    // ── Algorithm transparency for reputation scoring ──────────────────────────
+
+    /// Explain the reputation algorithm to a requesting address.
+    ///
+    /// The escrow authority (admin) supplies:
+    /// - `requester`: the address querying for score-explanation transparency.
+    /// - `factor_weights_bps`: disclosed factor weights (review quality,
+    ///   recency, sybil score, community standing, outcome metrics).
+    /// - `total_factors`: total factors in the full reputation formula.
+    /// - `manipulation_signal_count`: active manipulation signals.
+    /// - `requested_disclosure_bps`: fraction the requester wants disclosed.
+    ///
+    /// Returns a [`TransparencyBalance`] indicating how much of the formula
+    /// can safely be disclosed. Also persists the transparency assessment and
+    /// protection record, and emits an event if a probe is detected.
+    /// Only callable by the escrow authority (admin).
+    pub fn explain_reputation_algorithms(
+        env: Env,
+        admin: Address,
+        requester: Address,
+        factor_weights_bps: Vec<u32>,
+        total_factors: u32,
+        manipulation_signal_count: u32,
+        requested_disclosure_bps: u32,
+    ) -> TransparencyBalance {
+        let escrow: Address = env
+            .storage()
+            .instance()
+            .get(&ESCROW)
+            .expect("Not initialized");
+        admin.require_auth();
+        if admin != escrow {
+            panic!("Unauthorized");
+        }
+
+        // Track probe.
+        let probe_key = DataKey::RepAlgoProbeLog(requester.clone());
+        let mut probes: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&probe_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let now = env.ledger().timestamp();
+        // Keep a rolling cap of 20 entries.
+        if probes.len() < 20 {
+            probes.push_back(now);
+        } else {
+            let mut fresh: Vec<u64> = Vec::new(&env);
+            for i in 1..probes.len() {
+                fresh.push_back(probes.get(i).unwrap_or(0));
+            }
+            fresh.push_back(now);
+            probes = fresh;
+        }
+        env.storage().persistent().set(&probe_key, &probes);
+        env.storage()
+            .persistent()
+            .extend_ttl(&probe_key, TTL_THRESHOLD, TTL_BUMP);
+
+        let var_key = DataKey::RepAlgoProbeVariations(requester.clone());
+        let variations: u32 = env
+            .storage()
+            .persistent()
+            .get(&var_key)
+            .unwrap_or(0);
+
+        // Reverse-engineering protection.
+        let re_protection = rep_detect_reverse_engineering(&probes, variations);
+        env.storage().persistent().set(
+            &DataKey::RepAlgoProbeProtection(requester.clone()),
+            &re_protection,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::RepAlgoProbeProtection(requester.clone()),
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        // Transparency assessment.
+        let transparency = rep_assess_algo_transparency(
+            &factor_weights_bps,
+            total_factors,
+            manipulation_signal_count,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::RepAlgoTransparencyRecord, &transparency);
+        env.storage().persistent().extend_ttl(
+            &DataKey::RepAlgoTransparencyRecord,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        // Transparency balance.
+        let balance = rep_compute_transparency_balance(
+            &env,
+            requested_disclosure_bps,
+            re_protection.risk_score,
+        );
+
+        // Algorithm protection record.
+        let monitoring: AlgorithmMonitoringResult = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RepAlgoMonitoringResult)
+            .unwrap_or(AlgorithmMonitoringResult {
+                operating_normally: true,
+                suspicious_deviations: 0,
+                manipulation_risk_score: 0,
+                coordinated_gaming: false,
+            });
+        let algo_protection = rep_compute_algo_protection(
+            &env,
+            &transparency,
+            &re_protection,
+            &monitoring,
+            ALGO_PROTECTION_COOLDOWN_SECS,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::RepAlgoProtectionRecord, &algo_protection);
+        env.storage().persistent().extend_ttl(
+            &DataKey::RepAlgoProtectionRecord,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        if algo_protection.intervention_active {
+            env.storage()
+                .persistent()
+                .set(&DataKey::RepAlgoProtectionActive, &true);
+            env.storage().persistent().extend_ttl(
+                &DataKey::RepAlgoProtectionActive,
+                TTL_THRESHOLD,
+                TTL_BUMP,
+            );
+            env.events().publish(
+                (
+                    Symbol::new(&env, "RepAlgoProtection"),
+                    Symbol::new(&env, "active"),
+                ),
+                (algo_protection.combined_risk_score, re_protection.probe_count),
+            );
+        }
+
+        balance
+    }
+
+    /// Secure reputation scoring systems from gaming and manipulation.
+    ///
+    /// The escrow authority supplies:
+    /// - `score_timestamps` / `score_deviations_bps`: rolling window of
+    ///   reputation score deviations from mentor baseline (parallel arrays,
+    ///   sorted chronologically).
+    /// - `coordinated_actor_count`: count of accounts coordinating to game
+    ///   the reputation system in the current window.
+    ///
+    /// The method:
+    /// 1. Persists the deviation windows.
+    /// 2. Runs algorithm monitoring for the reputation scoring system.
+    /// 3. Produces a comprehensive transparency audit.
+    /// 4. Re-computes the algorithm protection record.
+    /// 5. Returns the [`AlgorithmMonitoringResult`].
+    ///
+    /// Only callable by the escrow authority (admin).
+    pub fn secure_scoring_systems(
+        env: Env,
+        admin: Address,
+        score_timestamps: Vec<u64>,
+        score_deviations_bps: Vec<u32>,
+        coordinated_actor_count: u32,
+    ) -> AlgorithmMonitoringResult {
+        let escrow: Address = env
+            .storage()
+            .instance()
+            .get(&ESCROW)
+            .expect("Not initialized");
+        admin.require_auth();
+        if admin != escrow {
+            panic!("Unauthorized");
+        }
+
+        // Persist rolling windows (cap at 20).
+        let ts_len = score_timestamps.len().min(20);
+        let mut ts_window: Vec<u64> = Vec::new(&env);
+        for i in 0..ts_len {
+            ts_window.push_back(score_timestamps.get(i).unwrap_or(0));
+        }
+        let dev_len = score_deviations_bps.len().min(20);
+        let mut dev_window: Vec<u32> = Vec::new(&env);
+        for i in 0..dev_len {
+            dev_window.push_back(score_deviations_bps.get(i).unwrap_or(0));
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::RepScoreTimestamps, &ts_window);
+        env.storage().persistent().extend_ttl(
+            &DataKey::RepScoreTimestamps,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::RepScoreDeviations, &dev_window);
+        env.storage().persistent().extend_ttl(
+            &DataKey::RepScoreDeviations,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::RepCoordinatedActors, &coordinated_actor_count);
+        env.storage().persistent().extend_ttl(
+            &DataKey::RepCoordinatedActors,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        // Monitoring.
+        let monitoring =
+            rep_monitor_ranking_algorithm(&ts_window, &dev_window, coordinated_actor_count);
+        env.storage()
+            .persistent()
+            .set(&DataKey::RepAlgoMonitoringResult, &monitoring);
+        env.storage().persistent().extend_ttl(
+            &DataKey::RepAlgoMonitoringResult,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        // Transparency audit.
+        let transparency: AlgorithmTransparency = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RepAlgoTransparencyRecord)
+            .unwrap_or(AlgorithmTransparency {
+                fair_operation: true,
+                transparency_score: 80,
+                disclosure_bps: 5_000,
+                factor_count: 0,
+                manipulation_detected: false,
+            });
+        let re_protection = ReverseEngineeringProtection {
+            safe: true,
+            probe_count: 0,
+            risk_score: 0,
+            systematic_variation: false,
+        };
+        let balance = TransparencyBalance {
+            balanced: true,
+            chosen_disclosure_bps: 5_000,
+            capped: false,
+            reason: Symbol::new(&env, "monitoring_context"),
+        };
+        let audit =
+            rep_audit_algo_transparency(&transparency, &re_protection, &balance, &monitoring);
+        env.storage()
+            .persistent()
+            .set(&DataKey::RepAlgoTransparencyAudit, &audit);
+        env.storage().persistent().extend_ttl(
+            &DataKey::RepAlgoTransparencyAudit,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        // Update protection record.
+        let algo_protection = rep_compute_algo_protection(
+            &env,
+            &transparency,
+            &re_protection,
+            &monitoring,
+            ALGO_PROTECTION_COOLDOWN_SECS,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::RepAlgoProtectionRecord, &algo_protection);
+        env.storage().persistent().extend_ttl(
+            &DataKey::RepAlgoProtectionRecord,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        if !monitoring.operating_normally {
+            env.storage()
+                .persistent()
+                .set(&DataKey::RepAlgoProtectionActive, &true);
+            env.storage().persistent().extend_ttl(
+                &DataKey::RepAlgoProtectionActive,
+                TTL_THRESHOLD,
+                TTL_BUMP,
+            );
+            env.events().publish(
+                (
+                    Symbol::new(&env, "RepAlgoGaming"),
+                    Symbol::new(&env, "detected"),
+                ),
+                (
+                    monitoring.suspicious_deviations,
+                    monitoring.manipulation_risk_score,
+                ),
+            );
+        }
+
+        monitoring
+    }
+
+    /// Restore fair reputation algorithm operation after the protection
+    /// cooldown has elapsed. Only callable by the escrow authority (admin).
+    pub fn restore_rep_algo_operation(env: Env, admin: Address) {
+        let escrow: Address = env
+            .storage()
+            .instance()
+            .get(&ESCROW)
+            .expect("Not initialized");
+        admin.require_auth();
+        if admin != escrow {
+            panic!("Unauthorized");
+        }
+
+        let record: AlgorithmProtectionRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RepAlgoProtectionRecord)
+            .expect("NoRepAlgoProtectionRecord");
+
+        if !is_algo_restoration_eligible(&record, env.ledger().timestamp()) {
+            panic!("RepAlgoRestorationNotEligible");
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::RepAlgoProtectionRecord);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::RepAlgoProtectionActive);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "RepAlgoRestored"),
+                Symbol::new(&env, "fair_op"),
+            ),
+            env.ledger().timestamp(),
+        );
+    }
+
+    /// Get the current reputation algorithm protection record.
+    pub fn get_rep_algo_protection(env: Env) -> AlgorithmProtectionRecord {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RepAlgoProtectionRecord)
+            .unwrap_or(AlgorithmProtectionRecord {
+                intervention_active: false,
+                combined_risk_score: 0,
+                reason: Symbol::new(&env, "none"),
+                restoration_eligible_at: 0,
+            })
+    }
+
+    /// Get the current reputation algorithm transparency audit.
+    pub fn get_rep_transparency_audit(env: Env) -> TransparencyAuditRecord {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RepAlgoTransparencyAudit)
+            .unwrap_or(TransparencyAuditRecord {
+                compliant: true,
+                violation_count: 0,
+                fairness_score: 100,
+                security_verified: true,
+            })
     }
 
 }

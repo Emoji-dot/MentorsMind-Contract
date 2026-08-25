@@ -37,6 +37,8 @@ pub mod justice_protection;
 pub mod outcome_authenticity;
 pub mod scalability_protection;
 pub mod learner_protection;
+pub mod market_control_protection;
+pub mod algorithm_transparency;
 
 pub use admin::{
     AdminChangeProposal, AdminTransfer, ADMIN_COOLING_OFF_SECS, MIN_ADMIN_TIMELOCK_SECS,
@@ -185,6 +187,35 @@ pub use learner_protection::{
     PREDATORY_COMPLAINT_RATIO_BPS, PREDATORY_RISK_THRESHOLD,
     EMERGENCY_PATTERN_THRESHOLD, EMERGENCY_SUSPENSION_COOLDOWN_SECS,
     LEARNER_PROTECTION_COOLDOWN_SECS,
+};
+pub use market_control_protection::{
+    detect_network_concentration, prevent_market_control,
+    assess_competition_barriers, support_independent_mentors,
+    detect_pricing_coordination, prevent_oligopoly,
+    analyze_market_networks, audit_market_competition,
+    compute_market_protection_intervention, is_market_restoration_eligible,
+    DecentralizationMonitoring, CompetitionProtection, MarketFairness,
+    NetworkAnalysisResult, MarketProtectionRecord, CompetitionAuditRecord,
+    HHI_HIGH_CONCENTRATION_THRESHOLD, HHI_CRITICAL_THRESHOLD,
+    MAX_SINGLE_NETWORK_SHARE_BPS, MIN_COMPETITIVE_NETWORK_COUNT,
+    MARKET_PRICE_COORDINATION_WINDOW_SECS, MARKET_PRICE_SIMILARITY_BPS,
+    PRICE_COORDINATION_RISK_THRESHOLD, MARKET_CONCENTRATION_RISK_THRESHOLD,
+    INDEPENDENT_MENTOR_MIN_RATIO_BPS, MARKET_INTERVENTION_COOLDOWN_SECS,
+    MARKET_PROTECTION_INTERVENTION_THRESHOLD,
+};
+pub use algorithm_transparency::{
+    assess_algorithm_transparency, detect_reverse_engineering,
+    should_block_transparency_response, compute_transparency_balance,
+    monitor_ranking_algorithm, audit_algorithm_transparency,
+    compute_algo_protection_intervention, is_algo_restoration_eligible,
+    AlgorithmTransparency, ReverseEngineeringProtection, TransparencyBalance,
+    AlgorithmMonitoringResult, TransparencyAuditRecord, AlgorithmProtectionRecord,
+    PROBE_DETECTION_WINDOW_SECS, PROBE_HIGH_FREQUENCY_THRESHOLD,
+    REVERSE_ENGINEERING_RISK_THRESHOLD, MAX_TRANSPARENCY_DISCLOSURE_BPS,
+    MIN_TRANSPARENCY_DISCLOSURE_BPS, RANKING_FACTOR_COUNT,
+    ALGO_MANIPULATION_RISK_THRESHOLD, ALGO_PROTECTION_COOLDOWN_SECS,
+    ALGO_INTERVENTION_THRESHOLD, RANKING_GAMING_WINDOW_SECS,
+    RANKING_SCORE_DEVIATION_BPS,
 };
 
 /// Economic sanity ceiling for a single financial amount (token smallest units).
