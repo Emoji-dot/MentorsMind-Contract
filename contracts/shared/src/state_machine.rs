@@ -20,8 +20,8 @@ pub trait StateMachine {
         env: &Env,
         from: &Self::State,
         to: &Self::State,
-        pre_checks: bool,
-        post_checks: bool,
+        _pre_checks: bool,
+        _post_checks: bool,
     ) -> Result<Self::State, &'static str> {
         // Pre-condition: current state must be valid
         if !Self::is_valid_transition(env, from, to) {
