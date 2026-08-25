@@ -4,6 +4,8 @@ use shared::{
     evaluate_domain_governance, score_practical_assessment, validate_peer_consensus,
     ExpertiseAuthenticationRecord, PracticalAssessment, RecertificationSchedule, SkillFraudFlag,
     SpecializationGovernanceRecord,
+    // Cross-platform identity validation (#904)
+    CrossPlatformIdentity, is_identity_match,
 };
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol, Vec,
@@ -31,6 +33,11 @@ pub enum DataKey {
     SkillFraudFlag(Address, Symbol),
     /// Rolling session-outcome scores (bps) used for expertise/fraud tracking (#891).
     SpecializationOutcomes(Address, Symbol),
+    // ── Cross-platform identity validation (#904) ──────────────────────────
+    /// Cross-platform verification record for a user on a specific platform.
+    CrossPlatformVerification(Address, Symbol),
+    /// Account monitoring log for suspicious activity.
+    AccountMonitoringLog(Address),
 }
 
 /// Maximum rolling outcome scores retained per (mentor, specialization) for
@@ -476,6 +483,65 @@ impl VerificationContract {
             .unwrap_or(0);
         compute_recertification_due(&env, &mentor, &specialization, last_certified_at)
     }
+
+    // ── Cross-platform identity validation (#904) ──────────────────────────
+
+    /// Validate a mentor's identity across platforms by checking verification
+    /// status and cross-platform correlation.
+    pub fn validate_cross_platform_identity(
+        env: Env,
+        mentor: Address,
+        platform_id: Symbol,
+    ) -> bool {
+        let verified = Self::is_verified(env.clone(), mentor.clone());
+        if !verified {
+            return false;
+        }
+
+        let record: Option<shared::CrossPlatformIdentity> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CrossPlatformVerification(mentor, platform_id));
+        match record {
+            Some(r) => r.verified,
+            None => false,
+        }
+    }
+
+    /// Confirm the authenticity of a mentor's credentials on a specific
+    /// platform.
+    pub fn confirm_authenticity(
+        env: Env,
+        mentor: Address,
+        platform_id: Symbol,
+    ) -> bool {
+        let verification = Self::get_verification_status(env.clone(), mentor.clone());
+        if !verification.is_verified {
+            return false;
+        }
+
+        let record: Option<shared::CrossPlatformIdentity> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CrossPlatformVerification(mentor, platform_id));
+        match record {
+            Some(r) => shared::is_identity_match(r.correlation_score),
+            None => false,
+        }
+    }
+
+    /// Monitor an account for suspicious activity patterns.
+    pub fn monitor_accounts(
+        env: Env,
+        mentor: Address,
+    ) -> u32 {
+        let log: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AccountMonitoringLog(mentor))
+            .unwrap_or(Vec::new(&env));
+        log.len()
+    }
 }
 
 #[cfg(test)]
@@ -790,6 +856,40 @@ mod test {
         let scores = soroban_sdk::vec![&f.env, 7000u32];
         let votes = soroban_sdk::vec![&f.env, true, true];
         client.verify_mentor_skills(&not_admin, &f.mentor, &specialization, &scores, &votes);
+    }
+
+    // ── Cross-platform identity validation (#904) ──────────────────────────
+
+    #[test]
+    fn test_validate_cross_platform_identity_unverified() {
+        let f = TestFixture::setup();
+        let client = f.client();
+        let platform = soroban_sdk::symbol_short!("GITHUB");
+
+        // Mentor is not verified, so cross-platform validation should fail.
+        let result = client.validate_cross_platform_identity(&f.mentor, &platform);
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_confirm_authenticity_no_record() {
+        let f = TestFixture::setup();
+        let client = f.client();
+        let platform = soroban_sdk::symbol_short!("GITHUB");
+
+        // No cross-platform record exists, so authenticity check fails.
+        let result = client.confirm_authenticity(&f.mentor, &platform);
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_monitor_accounts_empty_log() {
+        let f = TestFixture::setup();
+        let client = f.client();
+
+        // No monitoring events yet.
+        let count = client.monitor_accounts(&f.mentor);
+        assert_eq!(count, 0);
     }
 }
 

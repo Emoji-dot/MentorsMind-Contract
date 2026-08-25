@@ -68,6 +68,20 @@ pub mod platform_interoperability;
 pub mod identity_verification;
 pub mod availability_pricing_protection;
 
+// Session protection, attack detection, and service continuity (#901)
+pub mod session_protection;
+pub mod attack_detection;
+pub mod service_continuity;
+
+// Quality assurance, standards compliance, and performance tracking (#902)
+pub mod quality_assurance;
+
+// Tokenomics protection and economic monitoring (#903)
+pub mod tokenomics_protection;
+
+// Account security and cross-platform fraud detection (#904)
+pub mod account_security;
+
 pub use admin::{
     AdminChangeProposal, AdminTransfer, ADMIN_COOLING_OFF_SECS, MIN_ADMIN_TIMELOCK_SECS,
 };
@@ -336,6 +350,48 @@ pub use availability_pricing_protection::{
     enforce_fair_pricing, trigger_availability_intervention,
     AvailabilityCommitment, PriceCoordinationFlag, DynamicPricingValidation,
     AvailabilityPattern, BASE_HOURS_PER_WEEK, MAX_PRICE_DEVIATION_BPS,
+};
+
+// Session protection, attack detection, service continuity re-exports (#901)
+pub use session_protection::{
+    compute_disruption_score, should_protect_session, activate_backup,
+    SessionProtectionRecord, ProtectionCheckResult,
+    MAX_PROTECTED_SESSIONS, PROTECTION_CHECK_COOLDOWN_SECS, DISRUPTION_RISK_THRESHOLD_BPS,
+};
+pub use attack_detection::{
+    score_attack_event, evaluate_attack_risk,
+    AttackEvent, AttackType, AttackDetectionResult,
+    DETECTION_LOG_CAP, ATTACK_FLAG_THRESHOLD, ATTACK_DETECTION_WINDOW_SECS,
+};
+pub use service_continuity::{
+    needs_backup, is_backup_valid,
+    ContinuityBackup, ContinuityStatus,
+    MAX_BACKUP_RECORDS, BACKUP_MAX_AGE_SECS,
+};
+
+// Quality assurance re-exports (#902)
+pub use quality_assurance::{
+    compute_average_score, passes_quality_check, build_quality_metrics,
+    QualityAssessment, QualityMetrics, QualityCheckResult, QualityFailReason,
+    MIN_SESSIONS_FOR_QUALITY, QUALITY_RISK_THRESHOLD_BPS, MAX_QUALITY_RECORDS, QUALITY_WINDOW_SECS,
+};
+
+// Tokenomics protection re-exports (#903)
+pub use tokenomics_protection::{
+    exceeds_extraction_rate, sustainability_ratio_ok, detect_coordinated_timing,
+    FairDistributionCheck, ManipulationReason, TokenomicsAuditResult,
+    MAX_EXTRACTION_RATE_BPS, MIN_SUSTAINABILITY_RATIO, MAX_TRADING_VARIANCE_BPS,
+    MIN_POSITION_DELTA_SECS, GOVERNANCE_ACCUMULATION_THRESHOLD_BPS,
+    REWARD_GAMING_WINDOW_SECS, MAX_REWARD_RECORDS,
+};
+
+// Account security re-exports (#904)
+pub use account_security::{
+    is_account_locked, record_failed_attempt, record_successful_login,
+    compute_correlation_score, is_identity_match,
+    AccountSecurityRecord, CrossPlatformIdentity, FraudAlert, FraudType,
+    MAX_FAILED_ATTEMPTS, LOCKOUT_DURATION_SECS, MAX_DEVICE_SIGNATURES,
+    CROSS_PLATFORM_CORRELATION_THRESHOLD_BPS, BEHAVIORAL_WINDOW_SECS,
 };
 
 /// Economic sanity ceiling for a single financial amount (token smallest units).

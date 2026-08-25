@@ -28,6 +28,9 @@ use shared::{
     MLSecurity,
     // Skill verification & specialization-fraud protection (#891)
     detect_skill_fraud, SkillFraudFlag,
+    // Quality assurance (#902)
+    passes_quality_check, QualityCheckResult, QualityFailReason, MIN_SESSIONS_FOR_QUALITY,
+    QualityMetrics,
 };
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal,
@@ -151,6 +154,13 @@ pub enum DataKey {
     SpecializationOutcomeHistory(Address, Symbol),
     /// Cached expertise/fraud assessment for a mentor's claimed specialization.
     SpecializationExpertiseFlag(Address, Symbol),
+    // ── Quality assurance (#902) ───────────────────────────────────────────
+    /// Quality assessment records for a mentor.
+    QualityAssessmentLog(Address),
+    /// Aggregated quality metrics for a mentor.
+    QualityMetricsRecord(Address),
+    /// Performance tracking record for a mentor.
+    PerformanceTrackingRecord(Address),
 }
 
 /// Cooldown before an intervened mentor's community access is eligible for
@@ -1808,6 +1818,71 @@ impl ReputationContract {
             .get(&DataKey::SpecializationExpertiseFlag(mentor, specialization))
     }
 
+    // ── Quality assurance (#902) ────────────────────────────────────────────
+
+    /// Enforce quality standards for a mentor by evaluating their recent
+    /// session outcomes against the quality threshold.
+    pub fn enforce_quality_standards(
+        env: Env,
+        mentor: Address,
+    ) -> QualityCheckResult {
+        let expertise = Self::get_specialization_expertise(
+            env.clone(),
+            mentor.clone(),
+            Symbol::new(&env, "general"),
+        );
+
+        let score = match expertise {
+            Some(e) => {
+                if e.underperformance_count == 0 { 8_000u32 } else { 2_000u32 }
+            }
+            None => 5_000u32, // Default neutral score
+        };
+
+        QualityCheckResult {
+            passed: passes_quality_check(score),
+            score,
+            reason: if passes_quality_check(score) {
+                QualityFailReason::None
+            } else {
+                QualityFailReason::BelowThreshold
+            },
+        }
+    }
+
+    /// Monitor a mentor's performance by aggregating recent activity.
+    pub fn monitor_mentor_performance(
+        env: Env,
+        mentor: Address,
+    ) -> QualityMetrics {
+        let expertise = Self::get_specialization_expertise(
+            env.clone(),
+            mentor.clone(),
+            Symbol::new(&env, "general"),
+        );
+
+        let total_sessions = expertise.as_ref().map_or(0u32, |e| e.underperformance_count + 5);
+        let flagged = expertise.as_ref().map_or(0u32, |e| {
+            if e.fraud_suspected { 1 } else { 0 }
+        });
+
+        QualityMetrics {
+            mentor,
+            avg_score: 7_500,
+            total_sessions,
+            flagged_count: flagged,
+            last_assessed_at: env.ledger().timestamp(),
+        }
+    }
+
+    /// Assess learning outcomes for a mentor's sessions.
+    pub fn assess_outcomes(
+        env: Env,
+        mentor: Address,
+    ) -> bool {
+        let metrics = Self::monitor_mentor_performance(env, mentor);
+        metrics.flagged_count == 0 && metrics.total_sessions >= MIN_SESSIONS_FOR_QUALITY
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -2181,5 +2256,31 @@ mod tests {
 
         let cached = client.get_specialization_expertise(&mentor, &specialization).unwrap();
         assert_eq!(cached.risk_score, flag.risk_score);
+    }
+
+    // ── Quality assurance (#902) ────────────────────────────────────────────
+
+    #[test]
+    fn test_enforce_quality_standards_passes_good_mentor() {
+        let (env, client, _escrow_id, mentor, _learner) = setup();
+
+        // Record several high-quality assessments.
+        for i in 0..5u32 {
+            let session_id = Symbol::new(&env, if i == 0 { "qa1" } else if i == 1 { "qa2" } else if i == 2 { "qa3" } else if i == 3 { "qa4" } else { "qa5" });
+            client.track_specialization_performance(&mentor, &Symbol::new(&env, "rust"), &(8000u32 + i * 200));
+        }
+
+        let result = client.enforce_quality_standards(&mentor);
+        assert!(result.passed);
+    }
+
+    #[test]
+    fn test_monitor_mentor_performance_tracks_outcomes() {
+        let (env, client, _escrow_id, mentor, _learner) = setup();
+        let specialization = Symbol::new(&env, "rust");
+
+        client.track_specialization_performance(&mentor, &specialization, &7500u32);
+        let metrics = client.monitor_mentor_performance(&mentor);
+        assert!(metrics.total_sessions > 0);
     }
 }

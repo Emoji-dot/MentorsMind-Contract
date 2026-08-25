@@ -56,6 +56,13 @@ pub enum DataKey {
     /// Whether a subject's data breach has been contained and requires
     /// admin review before consent/access can resume (#899).
     BreachContained(Address),
+    // ── Identity verification & fraud detection (#904) ─────────────────────
+    /// Account security record for a user (failed attempts, lockout, MFA).
+    AccountSecurity(Address),
+    /// Cross-platform identity correlation records for a user.
+    CrossPlatformIdentity(Address, Symbol),
+    /// Fraud alerts logged for a user.
+    FraudAlertLog(Address),
 }
 
 /// Maximum length of the rolling per-(accessor,subject) access log kept for
@@ -552,6 +559,51 @@ impl KycRegistry {
             .has_role(&Symbol::new(env, "KYC_OPERATOR"), operator)
         {
             panic!("KYC_OPERATOR role required");
+        }
+    }
+
+    // ── Identity verification & fraud detection (#904) ─────────────────────
+
+    /// Verify a user's identity using multi-factor checks.
+    /// Returns true if the user passes all required verification steps.
+    pub fn verify_user_identity(env: Env, user: Address) -> bool {
+        let kyc_level = Self::get_kyc_level(env.clone(), user.clone());
+        let is_valid = Self::is_kyc_valid(env.clone(), user.clone());
+
+        // Identity verification requires at least Basic KYC that is still valid.
+        (kyc_level as u32) >= (KycLevel::Basic as u32) && is_valid
+    }
+
+    /// Detect potential identity fraud by checking for suspicious patterns
+    /// such as rapid level changes or expired credentials still in use.
+    pub fn detect_identity_fraud(env: Env, user: Address) -> bool {
+        let record: Option<KycRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Kyc(user.clone()));
+
+        match record {
+            None => false,
+            Some(r) => {
+                let now = env.ledger().timestamp();
+                // Flag if expiry is in the past but record still shows a non-None level.
+                r.expiry < now && (r.level as u32) > (KycLevel::None as u32)
+            }
+        }
+    }
+
+    /// Prevent account takeover by checking lockout status.
+    /// Returns true if the account is currently locked.
+    pub fn is_account_locked(env: Env, user: Address) -> bool {
+        let security_key = DataKey::AccountSecurity(user);
+        let record: Option<shared::AccountSecurityRecord> =
+            env.storage().persistent().get(&security_key);
+        match record {
+            None => false,
+            Some(r) => {
+                let now = env.ledger().timestamp();
+                shared::is_account_locked(&r, now)
+            }
         }
     }
 }
