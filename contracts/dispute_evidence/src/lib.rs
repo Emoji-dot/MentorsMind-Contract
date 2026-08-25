@@ -43,6 +43,8 @@ use shared::{
     check_access_authorized, apply_redaction, log_access, emergency_privacy_protection,
 };
 
+use shared::{validate_evidence_sufficiency, EvidenceSufficiency};
+
 /// Maximum recent rulings tracked per arbitrator for bias scoring.
 const MAX_ARBITRATOR_HISTORY: u32 = 20;
 
@@ -247,6 +249,9 @@ pub enum Error {
     JusticeRestorationNotEligible = 17,
     /// Requested resource not found (recording evidence).
     NotFound = 18,
+    /// Dispute lacks sufficient evidence or has not cleared the mandatory
+    /// deliberation cooldown (#886 payment-integrity protection).
+    InsufficientEvidence = 19,
 }
 
 #[contract]
@@ -686,6 +691,41 @@ impl DisputeEvidenceContract {
         Self::get_justice_status(env.clone(), escrow_id, arbitrator);
 
         Ok(())
+    }
+
+    // ─── Payment-integrity protection (#886) ───────────────────────────────
+
+    /// Validate that a dispute has both sufficient submitted evidence and
+    /// has respected the minimum cooldown since it was opened, before an
+    /// arbitrator is allowed to rule on it (prevents evidence-free,
+    /// rushed strategic disputes).
+    pub fn validate_dispute_claims(env: Env, escrow_id: u64) -> EvidenceSufficiency {
+        let evidence_count = Self::get_evidence_count(env.clone(), escrow_id);
+        let opened_at: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DisputeOpenedAt(escrow_id))
+            .unwrap_or(0);
+        validate_evidence_sufficiency(&env, evidence_count, opened_at)
+    }
+
+    /// Impartial arbitration entrypoint: gates `submit_resolution` behind
+    /// `validate_dispute_claims`, ensuring a ruling cannot be issued
+    /// without sufficient evidence and the mandatory deliberation cooldown,
+    /// on top of the existing arbitration-bias and dispute-independence
+    /// protections.
+    pub fn arbitrate_dispute(
+        env: Env,
+        escrow_id: u64,
+        arbitrator: Address,
+        release_to_mentor: bool,
+        note: Symbol,
+    ) -> Result<(), Error> {
+        let claims = Self::validate_dispute_claims(env.clone(), escrow_id);
+        if !claims.sufficient {
+            return Err(Error::InsufficientEvidence);
+        }
+        Self::submit_resolution(env, escrow_id, arbitrator, false, release_to_mentor, note)
     }
 
     // ─── Justice protection ────────────────────────────────────────────────
@@ -2081,5 +2121,46 @@ mod tests {
             e.1 == (Symbol::new(&env, "evidence_root_updated"), 1u64, 1u32).into_val(&env)
         });
         assert!(found, "evidence_root_updated event must be emitted");
+    }
+
+    // -----------------------------------------------------------------------
+    // Payment-integrity protection: validate_dispute_claims / arbitrate_dispute (#886)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn arbitrate_dispute_rejects_when_no_evidence_submitted() {
+        let (env, _admin, _mentor, _learner, client) = setup_disputed();
+        let arb = Address::generate(&env);
+
+        client.record_dispute_opened(&1).unwrap();
+        advance_time(&env, MIN_RESOLUTION_DELAY_SECS + 1);
+
+        let claims = client.validate_dispute_claims(&1);
+        assert!(!claims.sufficient);
+
+        let result = client.try_arbitrate_dispute(&1, &arb, &true, &Symbol::new(&env, "mentor_wins"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn arbitrate_dispute_succeeds_with_evidence_and_cooldown() {
+        let (env, _admin, mentor, _learner, client) = setup_disputed();
+        let arb = Address::generate(&env);
+
+        client.record_dispute_opened(&1).unwrap();
+        client
+            .submit_evidence(&1, &mentor, &hash32(&env, 1), &hash32(&env, 2), &None)
+            .unwrap();
+        advance_time(&env, MIN_RESOLUTION_DELAY_SECS + 1);
+
+        let claims = client.validate_dispute_claims(&1);
+        assert!(claims.sufficient);
+
+        client
+            .arbitrate_dispute(&1, &arb, &true, &Symbol::new(&env, "mentor_wins"))
+            .unwrap();
+
+        let resolution = client.get_resolution(&1);
+        assert!(resolution.release_to_mentor);
     }
 }

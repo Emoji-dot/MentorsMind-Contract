@@ -30,9 +30,15 @@ use shared::{
     // Market monitoring (#915)
     MarketMetrics, DemandAuthenticityResult, SupplyDemandBalance, PriceDiscoveryValidation, MarketManipulationAlert, EmergencyStabilization,
     calculate_market_metrics, assess_demand_authenticity, balance_supply_demand, validate_price_discovery, detect_market_manipulation, trigger_emergency_stabilization,
+    // Scheduling integrity / availability-gaming protection (#884)
+    compute_availability_commitment, verify_availability_commitment, validate_conflict_proof,
+    detect_availability_gaming, AvailabilityCommitment, ConflictProof, AvailabilityGamingFlag,
+    // Cross-session data isolation & privacy protection (#899)
+    enforce_session_boundary, detect_cross_session_leak, contain_data_breach,
+    SessionAccessBoundary, CrossSessionLeakResult, DataBreachContainment,
 };
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec, Map, BytesN};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol, Vec, Map};
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
 const BACKEND: Symbol = symbol_short!("BACKEND");
@@ -149,6 +155,26 @@ pub enum DataKey {
     SpecializationMetrics(Symbol),
     MarketManipulationAlert(Symbol),
     EmergencyStabilization(Symbol),
+    // Scheduling integrity / availability-gaming protection (#884)
+    /// Cryptographic availability commitment for a mentor's time slot.
+    AvailabilityCommit(Address, u64),
+    /// Rolling timestamps of availability commit/withdraw changes for a
+    /// mentor, used for gaming-pattern detection.
+    AvailabilityChangeLog(Address),
+    /// Whether a scheduling emergency override is active for a session.
+    EmergencyOverride(Symbol),
+    // Cross-session data isolation & privacy protection (#899)
+    /// Timestamps of out-of-scope session-data access attempts by an
+    /// accessor, used for cross-session leak detection.
+    OutOfScopeAccessLog(Address),
+    /// Distinct out-of-scope session IDs an accessor has attempted to read.
+    OutOfScopeSessionSet(Address),
+    /// Whether an accessor is currently contained after a detected
+    /// cross-session data-leak attempt.
+    AccessorContained(Address),
+    /// Full data-access audit log (accessor, session_id, timestamp,
+    /// allowed) for a given session.
+    SessionAccessAudit(Symbol),
 }
 
 /// Maximum length of the rolling price/pair/request logs kept for scoring.
@@ -164,6 +190,15 @@ const MONITORING_LOG_CAP: u32 = 20;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionConflict {
     pub conflicting_session_id: Symbol,
+}
+
+/// A single data-access audit entry for a session (#899).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionAccessAuditEntry {
+    pub accessor: Address,
+    pub accessed_at: u64,
+    pub allowed: bool,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -1852,6 +1887,293 @@ impl SessionRegistry {
         Vec::new(&env)
     }
 
+    // -----------------------------------------------------------------------
+    // Cryptographic availability commitments & fair scheduling (#884)
+    // -----------------------------------------------------------------------
+
+    /// Commit to availability for a future time slot via a cryptographic
+    /// hash (sha256(mentor || slot_start || salt)); the salt is only
+    /// revealed at booking time via `schedule_session`, so the commitment
+    /// cannot be altered or withdrawn at the last minute without detection.
+    pub fn set_availability(
+        env: Env,
+        mentor: Address,
+        slot_start: u64,
+        commitment_hash: BytesN<32>,
+    ) -> AvailabilityCommitment {
+        mentor.require_auth();
+        let now = env.ledger().timestamp();
+        let commitment = AvailabilityCommitment {
+            mentor: mentor.clone(),
+            slot_start,
+            commitment_hash,
+            committed_at: now,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::AvailabilityCommit(mentor.clone(), slot_start), &commitment);
+
+        // Track commit/withdraw cadence for gaming detection.
+        let log_key = DataKey::AvailabilityChangeLog(mentor);
+        let mut log: Vec<u64> = env.storage().persistent().get(&log_key).unwrap_or(Vec::new(&env));
+        log.push_back(now);
+        while log.len() > MONITORING_LOG_CAP {
+            log.remove(0);
+        }
+        env.storage().persistent().set(&log_key, &log);
+
+        commitment
+    }
+
+    /// Withdraw a previously-made availability commitment for a slot.
+    /// Recorded on the same change log used for gaming detection, so
+    /// frequent commit/withdraw cycling is still visible to
+    /// `get_availability_gaming_flag`.
+    pub fn withdraw_availability(env: Env, mentor: Address, slot_start: u64) {
+        mentor.require_auth();
+        env.storage()
+            .persistent()
+            .remove(&DataKey::AvailabilityCommit(mentor.clone(), slot_start));
+
+        let log_key = DataKey::AvailabilityChangeLog(mentor);
+        let mut log: Vec<u64> = env.storage().persistent().get(&log_key).unwrap_or(Vec::new(&env));
+        log.push_back(env.ledger().timestamp());
+        while log.len() > MONITORING_LOG_CAP {
+            log.remove(0);
+        }
+        env.storage().persistent().set(&log_key, &log);
+    }
+
+    /// Schedule a session against a mentor's committed availability slot.
+    /// Reveals the salt used at commitment time and verifies it against
+    /// the stored commitment hash (and its minimum lead time) before
+    /// delegating to `register_session`. Only the platform backend may
+    /// call this, matching `register_session`'s authorization model.
+    pub fn schedule_session(
+        env: Env,
+        session_id: Symbol,
+        mentor: Address,
+        learner: Address,
+        scheduled_at: u64,
+        duration_mins: u32,
+        amount: i128,
+        token: Address,
+        availability_salt: BytesN<32>,
+    ) -> Symbol {
+        let commitment: AvailabilityCommitment = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AvailabilityCommit(mentor.clone(), scheduled_at))
+            .expect("No availability commitment for requested slot");
+
+        if !verify_availability_commitment(&env, &commitment, &availability_salt) {
+            panic!("Availability commitment verification failed");
+        }
+
+        Self::register_session(
+            env,
+            session_id,
+            mentor,
+            learner,
+            scheduled_at,
+            duration_mins,
+            amount,
+            token,
+        )
+    }
+
+    /// Resolve a scheduling conflict using an externally-attested proof
+    /// (e.g. from `contracts/oracle`'s calendar verification), cancelling
+    /// the conflicting session only when the proof is valid and fresh.
+    /// Only the platform backend may call this.
+    pub fn resolve_scheduling_conflict(
+        env: Env,
+        conflicting_session_id: Symbol,
+        proof_hash: BytesN<32>,
+        expected_hash: BytesN<32>,
+        proof_issued_at: u64,
+    ) -> ConflictProof {
+        let backend = Self::require_backend(&env);
+        backend.require_auth();
+
+        let proof = validate_conflict_proof(&env, &proof_hash, &expected_hash, proof_issued_at);
+        if proof.valid {
+            Self::cancel_session(env, conflicting_session_id);
+        }
+        proof
+    }
+
+    /// Emergency override allowing the platform backend to force-confirm a
+    /// session (bypassing standard conflict checks) for critical learner
+    /// needs or system-maintenance rescheduling.
+    pub fn emergency_scheduling_override(env: Env, session_id: Symbol) {
+        let backend = Self::require_backend(&env);
+        backend.require_auth();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::EmergencyOverride(session_id.clone()), &true);
+        Self::update_status(env.clone(), session_id.clone(), SessionStatus::Confirmed);
+
+        env.events().publish(
+            (symbol_short!("session"), Symbol::new(&env, "emergency_override")),
+            session_id,
+        );
+    }
+
+    /// Detect availability-manipulation gaming from a mentor's commit/
+    /// withdraw change log (rapid-fire changes are a hallmark of
+    /// artificial-scarcity gaming rather than genuine schedule changes).
+    pub fn get_availability_gaming_flag(env: Env, mentor: Address) -> AvailabilityGamingFlag {
+        let log: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AvailabilityChangeLog(mentor))
+            .unwrap_or(Vec::new(&env));
+        detect_availability_gaming(&log)
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-session data isolation & privacy protection (#899)
+    // -----------------------------------------------------------------------
+
+    /// Enforce the session-data access boundary and audit the attempt.
+    /// Only the session's own mentor or learner may read its data; any
+    /// other accessor is denied and logged both on the session's audit
+    /// trail and the accessor's out-of-scope access log for cross-session
+    /// leak detection.
+    pub fn enforce_privacy_boundaries(env: Env, accessor: Address, session_id: Symbol) -> SessionAccessBoundary {
+        accessor.require_auth();
+        let record: SessionRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Session(session_id.clone()))
+            .expect("Session not found");
+
+        let boundary = enforce_session_boundary(&accessor, &record.mentor, &record.learner);
+        Self::audit_data_access(env.clone(), accessor.clone(), session_id, boundary.allowed);
+
+        if !boundary.allowed {
+            Self::_record_out_of_scope_access(&env, &accessor, &record.session_id);
+        }
+
+        boundary
+    }
+
+    /// Append an entry to a session's data-access audit log. Called by
+    /// `enforce_privacy_boundaries` for every access attempt (allowed or
+    /// denied) so the full access history remains auditable.
+    pub fn audit_data_access(env: Env, accessor: Address, session_id: Symbol, allowed: bool) {
+        let key = DataKey::SessionAccessAudit(session_id);
+        let mut log: Vec<SessionAccessAuditEntry> = env.storage().persistent().get(&key).unwrap_or(Vec::new(&env));
+        log.push_back(SessionAccessAuditEntry {
+            accessor,
+            accessed_at: env.ledger().timestamp(),
+            allowed,
+        });
+        while log.len() > MONITORING_LOG_CAP {
+            log.remove(0);
+        }
+        env.storage().persistent().set(&key, &log);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
+    }
+
+    /// Return the data-access audit trail for a session.
+    pub fn get_session_access_audit(env: Env, session_id: Symbol) -> Vec<SessionAccessAuditEntry> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SessionAccessAudit(session_id))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Retrieve a session's data only if `accessor` is a participant,
+    /// enforcing the cross-session isolation boundary at the point of
+    /// data retrieval (rather than leaving it to callers to check).
+    pub fn manage_session_data(env: Env, accessor: Address, session_id: Symbol) -> SessionRecord {
+        let contained: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AccessorContained(accessor.clone()))
+            .unwrap_or(false);
+        if contained {
+            panic!("Accessor contained after detected cross-session leak");
+        }
+
+        let boundary = Self::enforce_privacy_boundaries(env.clone(), accessor, session_id.clone());
+        if !boundary.allowed {
+            panic!("Unauthorized: not a participant in this session");
+        }
+
+        env.storage()
+            .persistent()
+            .get(&DataKey::Session(session_id))
+            .expect("Session not found")
+    }
+
+    /// Re-score an accessor's cross-session leak risk from its rolling
+    /// out-of-scope access log and, when the risk crosses the threshold,
+    /// automatically contain further access (breach-response).
+    pub fn monitor_cross_session_leakage(env: Env, accessor: Address) -> CrossSessionLeakResult {
+        let log: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OutOfScopeAccessLog(accessor.clone()))
+            .unwrap_or(Vec::new(&env));
+        let distinct_sessions: Vec<Symbol> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OutOfScopeSessionSet(accessor.clone()))
+            .unwrap_or(Vec::new(&env));
+
+        let leak = detect_cross_session_leak(&env, &log, distinct_sessions.len());
+        let containment = contain_data_breach(&env, leak, Symbol::new(&env, "cross_session_leak"));
+        if containment.contain {
+            env.storage().persistent().set(&DataKey::AccessorContained(accessor.clone()), &true);
+            env.events().publish(
+                (symbol_short!("privacy"), Symbol::new(&env, "breach_contained")),
+                (accessor, containment.reason),
+            );
+        }
+        leak
+    }
+
+    /// Whether `accessor` is currently contained following a detected
+    /// cross-session data-leak attempt.
+    pub fn is_accessor_contained(env: Env, accessor: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AccessorContained(accessor))
+            .unwrap_or(false)
+    }
+
+    /// Lift containment on an accessor after admin/backend review.
+    pub fn restore_accessor_access(env: Env, accessor: Address) {
+        let backend = Self::require_backend(&env);
+        backend.require_auth();
+        env.storage().persistent().set(&DataKey::AccessorContained(accessor), &false);
+    }
+
+    /// Internal: record an out-of-scope access attempt against the
+    /// accessor's rolling log/set and re-run leak detection.
+    fn _record_out_of_scope_access(env: &Env, accessor: &Address, session_id: &Symbol) {
+        let log_key = DataKey::OutOfScopeAccessLog(accessor.clone());
+        let mut log: Vec<u64> = env.storage().persistent().get(&log_key).unwrap_or(Vec::new(env));
+        log.push_back(env.ledger().timestamp());
+        while log.len() > MONITORING_LOG_CAP {
+            log.remove(0);
+        }
+        env.storage().persistent().set(&log_key, &log);
+
+        let set_key = DataKey::OutOfScopeSessionSet(accessor.clone());
+        let mut sessions: Vec<Symbol> = env.storage().persistent().get(&set_key).unwrap_or(Vec::new(env));
+        if !sessions.contains(session_id.clone()) {
+            sessions.push_back(session_id.clone());
+        }
+        env.storage().persistent().set(&set_key, &sessions);
+
+        Self::monitor_cross_session_leakage(env.clone(), accessor.clone());
+    }
+
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -2307,5 +2629,165 @@ mod tests {
 
         let flag = client.monitor_pricing_coordination();
         assert!(flag.suspicious);
+    }
+
+    // -----------------------------------------------------------------------
+    // Cryptographic availability commitments & fair scheduling (#884)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_schedule_session_requires_matching_commitment() {
+        let (env, client, _backend) = setup();
+        let mentor = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let token = dummy_token(&env);
+        let slot_start = 2_000_000u64;
+        let salt = BytesN::from_array(&env, &[7u8; 32]);
+
+        let commitment_hash = shared::compute_availability_commitment(&env, &mentor, slot_start, &salt);
+        client.set_availability(&mentor, &slot_start, &commitment_hash);
+
+        let session_id = client.schedule_session(
+            &Symbol::new(&env, "sched1"),
+            &mentor,
+            &learner,
+            &slot_start,
+            &45u32,
+            &100i128,
+            &token,
+            &salt,
+        );
+        assert_eq!(client.get_session(&session_id).mentor, mentor);
+    }
+
+    #[test]
+    #[should_panic(expected = "Availability commitment verification failed")]
+    fn test_schedule_session_rejects_wrong_salt() {
+        let (env, client, _backend) = setup();
+        let mentor = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let token = dummy_token(&env);
+        let slot_start = 2_000_000u64;
+        let salt = BytesN::from_array(&env, &[7u8; 32]);
+        let wrong_salt = BytesN::from_array(&env, &[9u8; 32]);
+
+        let commitment_hash = shared::compute_availability_commitment(&env, &mentor, slot_start, &salt);
+        client.set_availability(&mentor, &slot_start, &commitment_hash);
+
+        client.schedule_session(
+            &Symbol::new(&env, "sched2"),
+            &mentor,
+            &learner,
+            &slot_start,
+            &45u32,
+            &100i128,
+            &token,
+            &wrong_salt,
+        );
+    }
+
+    #[test]
+    fn test_availability_gaming_flag_detects_rapid_changes() {
+        let (env, client, _backend) = setup();
+        let mentor = Address::generate(&env);
+
+        for i in 0..5u64 {
+            let slot = 2_000_000u64 + i * 100;
+            let salt = BytesN::from_array(&env, &[i as u8; 32]);
+            let hash = shared::compute_availability_commitment(&env, &mentor, slot, &salt);
+            client.set_availability(&mentor, &slot, &hash);
+            client.withdraw_availability(&mentor, &slot);
+        }
+
+        let flag = client.get_availability_gaming_flag(&mentor);
+        assert!(flag.gaming_suspected);
+    }
+
+    #[test]
+    fn test_emergency_scheduling_override_confirms_session() {
+        let (env, client, _backend) = setup();
+        let mentor = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let token = dummy_token(&env);
+        let session_id = Symbol::new(&env, "emrg1");
+
+        client.register_session(&session_id, &mentor, &learner, &2_000_000u64, &30u32, &100i128, &token);
+        client.emergency_scheduling_override(&session_id);
+
+        assert_eq!(client.get_session(&session_id).status, SessionStatus::Confirmed);
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-session data isolation & privacy protection (#899)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_enforce_privacy_boundaries_allows_participants() {
+        let (env, client, _backend) = setup();
+        let mentor = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let token = dummy_token(&env);
+        let session_id = Symbol::new(&env, "priv1");
+
+        client.register_session(&session_id, &mentor, &learner, &2_000_000u64, &30u32, &100i128, &token);
+
+        let boundary = client.enforce_privacy_boundaries(&mentor, &session_id);
+        assert!(boundary.allowed);
+
+        let boundary = client.enforce_privacy_boundaries(&learner, &session_id);
+        assert!(boundary.allowed);
+    }
+
+    #[test]
+    fn test_enforce_privacy_boundaries_denies_outsiders() {
+        let (env, client, _backend) = setup();
+        let mentor = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let outsider = Address::generate(&env);
+        let token = dummy_token(&env);
+        let session_id = Symbol::new(&env, "priv2");
+
+        client.register_session(&session_id, &mentor, &learner, &2_000_000u64, &30u32, &100i128, &token);
+
+        let boundary = client.enforce_privacy_boundaries(&outsider, &session_id);
+        assert!(!boundary.allowed);
+
+        let audit = client.get_session_access_audit(&session_id);
+        assert_eq!(audit.len(), 1);
+        assert!(!audit.get(0).unwrap().allowed);
+    }
+
+    #[test]
+    #[should_panic(expected = "Unauthorized")]
+    fn test_manage_session_data_rejects_non_participant() {
+        let (env, client, _backend) = setup();
+        let mentor = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let outsider = Address::generate(&env);
+        let token = dummy_token(&env);
+        let session_id = Symbol::new(&env, "priv3");
+
+        client.register_session(&session_id, &mentor, &learner, &2_000_000u64, &30u32, &100i128, &token);
+        client.manage_session_data(&outsider, &session_id);
+    }
+
+    #[test]
+    fn test_repeated_cross_session_access_triggers_containment() {
+        let (env, client, _backend) = setup();
+        let mentor = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let outsider = Address::generate(&env);
+        let token = dummy_token(&env);
+
+        for i in 0..3u32 {
+            let session_id = Symbol::new(&env, if i == 0 { "leaka" } else if i == 1 { "leakb" } else { "leakc" });
+            client.register_session(&session_id, &mentor, &learner, &(2_000_000u64 + i as u64 * 1000), &30u32, &100i128, &token);
+            client.enforce_privacy_boundaries(&outsider, &session_id);
+        }
+
+        assert!(client.is_accessor_contained(&outsider));
+
+        client.restore_accessor_access(&outsider);
+        assert!(!client.is_accessor_contained(&outsider));
     }
 }

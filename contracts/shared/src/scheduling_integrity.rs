@@ -1,502 +1,209 @@
-use soroban_sdk::{contracttype, Env, Symbol, Address};
+//! Session-scheduling integrity protection primitives (#884).
+//!
+//! Mentors can game the scheduling system by manipulating availability
+//! windows, fabricating scheduling conflicts, or coordinating with other
+//! mentors to create artificial scarcity. These helpers give contracts a
+//! deterministic, storage-agnostic way to commit to availability ahead of
+//! time (commit/reveal), validate external conflict proofs, assign slots
+//! fairly with anti-gaming randomization, and detect suspicious
+//! availability-manipulation patterns. Contracts own the storage of raw
+//! scheduling history; these functions are pure scoring/decision logic
+//! over data the caller already has on hand.
 
-/// Conflict verification for external validation and authenticity confirmation
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, IntoVal, Symbol, TryIntoVal, Val, Vec};
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Minimum lead time (seconds) an availability commitment must be made
+/// before the committed slot, preventing last-minute manipulation.
+pub const MIN_COMMITMENT_LEAD_SECS: u64 = 3_600;
+
+/// Maximum age (seconds) an external conflict proof may have before it is
+/// considered stale and no longer accepted.
+pub const MAX_CONFLICT_PROOF_AGE_SECS: u64 = 24 * 3_600;
+
+/// Risk score (0-100) at or above which an availability pattern is
+/// flagged as manipulative gaming.
+pub const GAMING_RISK_THRESHOLD: u32 = 60;
+
+/// Repeated availability withdrawals/re-commitments within this window are
+/// treated as suspiciously reactive (characteristic of manual gaming
+/// rather than genuine scheduling changes).
+pub const RAPID_AVAILABILITY_CHANGE_WINDOW_SECS: u64 = 900;
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/// A cryptographic commitment to a mentor's availability for a time slot,
+/// made ahead of the slot to prevent last-minute manipulation.
 #[contracttype]
-pub struct ConflictVerification {
-    /// Verification record ID
-    pub record_id: u64,
-    /// Conflict identifier
-    pub conflict_id: Symbol,
-    /// User claiming conflict
-    pub claimant_address: Address,
-    /// External validation score (0-100)
-    pub external_validation_score: u32,
-    /// Fake conflict risk (0-100)
-    pub fake_conflict_risk: u32,
-    /// Number of external sources verified
-    pub verified_sources: u32,
-    /// Verification timestamp
-    pub verification_timestamp: u64,
-    /// Is conflict authentic
-    pub is_conflict_authentic: bool,
-    /// Conflict authenticity confidence (0-100)
-    pub authenticity_confidence: u32,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AvailabilityCommitment {
+    pub mentor: Address,
+    pub slot_start: u64,
+    pub commitment_hash: BytesN<32>,
+    pub committed_at: u64,
 }
 
-/// Time slot fairness for equitable distribution and gaming prevention
+/// Result of verifying an external scheduling-conflict proof.
 #[contracttype]
-pub struct TimeSlotFairness {
-    /// Fairness record ID
-    pub record_id: u64,
-    /// Time period identifier
-    pub period_id: Symbol,
-    /// Premium slots distribution score (0-100)
-    pub distribution_score: u32,
-    /// Gaming risk score (0-100)
-    pub gaming_risk: u32,
-    /// Total slots analyzed
-    pub total_slots: u32,
-    /// Slots held by single entity
-    pub concentration_slots: u32,
-    /// Gaming indicators detected
-    pub gaming_indicators: u32,
-    /// Assessment timestamp
-    pub assessment_timestamp: u64,
-    /// Is distribution fair
-    pub is_distribution_fair: bool,
-    /// Concentration ratio (0-100, higher = more concentrated)
-    pub concentration_ratio: u32,
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct ConflictProof {
+    pub valid: bool,
+    pub within_freshness_window: bool,
 }
 
-/// Scheduling integrity for detecting manipulation and enabling conflict resolution
+/// Outcome of a fair, anti-gaming scheduling assignment.
 #[contracttype]
-pub struct SchedulingIntegrity {
-    /// Integrity record ID
-    pub record_id: u64,
-    /// Schedule identifier
-    pub schedule_id: Symbol,
-    /// Manipulation incidents detected
-    pub manipulation_incidents: u32,
-    /// Suspicious conflict claims
-    pub suspicious_conflicts: u32,
-    /// Cancelled sessions with gaming indicators
-    pub suspicious_cancellations: u32,
-    /// Manipulation detection score (0-100)
-    pub manipulation_score: u32,
-    /// Monitoring period start timestamp
-    pub period_start_timestamp: u64,
-    /// Monitoring period end timestamp
-    pub period_end_timestamp: u64,
-    /// Alert severity (0=low, 1=medium, 2=high, 3=critical)
-    pub alert_severity: u32,
-    /// Has manipulation been identified
-    pub manipulation_identified: bool,
-}
-
-/// Cancellation policy enforcement for abuse prevention and fair penalty application
-#[contracttype]
-pub struct CancellationPolicyEnforcement {
-    /// Enforcement record ID
-    pub record_id: u64,
-    /// User address
-    pub user_address: Address,
-    /// Cancellations in period
-    pub cancellation_count: u32,
-    /// Abuse indicators detected
-    pub abuse_indicators: u32,
-    /// Fair penalties applied
-    pub penalties_applied: u32,
-    /// Penalty consistency score (0-100)
-    pub penalty_consistency: u32,
-    /// Abuse risk score (0-100)
-    pub abuse_risk_score: u32,
-    /// Period start timestamp
-    pub period_start_timestamp: u64,
-    /// Period end timestamp
-    pub period_end_timestamp: u64,
-    /// Is policy enforcement consistent
-    pub enforcement_consistent: bool,
-    /// Should account be flagged
-    pub account_flagged: bool,
-}
-
-/// Scheduling audit for conflict tracking and manipulation identification
-#[contracttype]
-pub struct SchedulingAudit {
-    /// Audit record ID
-    pub record_id: u64,
-    /// Schedule being audited
-    pub schedule_id: Symbol,
-    /// Total conflicts reviewed
-    pub conflicts_reviewed: u32,
-    /// Authentic conflicts found
-    pub authentic_conflicts: u32,
-    /// Fake conflicts detected
-    pub fake_conflicts: u32,
-    /// Gaming incidents identified
-    pub gaming_incidents: u32,
-    /// Audit initiated timestamp
-    pub initiated_timestamp: u64,
-    /// Audit completed timestamp
-    pub completed_timestamp: u64,
-    /// Audit severity (0=low, 1=medium, 2=high, 3=critical)
-    pub severity_level: u32,
-    /// Recommended action (0=none, 1=monitor, 2=restrict, 3=suspend)
-    pub recommended_action: u32,
-}
-
-/// Emergency scheduling intervention for automatic rebalancing and fairness restoration
-#[contracttype]
-pub struct EmergencySchedulingIntervention {
-    /// Intervention record ID
-    pub record_id: u64,
-    /// Schedule being rebalanced
-    pub schedule_id: Symbol,
-    /// Intervention status (0=proposed, 1=active, 2=completed)
-    pub status: u32,
-    /// Slots to be rebalanced
-    pub slots_to_rebalance: u32,
-    /// Conflicts to be resolved
-    pub conflicts_to_resolve: u32,
-    /// Initiated timestamp
-    pub initiated_timestamp: u64,
-    /// Completion timestamp
-    pub completion_timestamp: u64,
-    /// Fairness restoration progress (0-100)
-    pub restoration_progress: u32,
-    /// Is fairness restored
-    pub fairness_restored: bool,
-    /// Intervention reason
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FairSchedulingDecision {
+    pub granted: bool,
+    pub randomized_tiebreak: u64,
     pub reason: Symbol,
 }
 
-impl ConflictVerification {
-    /// Create a new conflict verification record
-    pub fn new(
-        env: &Env,
-        record_id: u64,
-        conflict_id: Symbol,
-        claimant_address: Address,
-    ) -> Self {
-        Self {
-            record_id,
-            conflict_id,
-            claimant_address,
-            external_validation_score: 50,
-            fake_conflict_risk: 50,
-            verified_sources: 0,
-            verification_timestamp: env.ledger().timestamp(),
-            is_conflict_authentic: false,
-            authenticity_confidence: 50,
-        }
+/// Transparency/audit record for a scheduling decision.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SchedulingAuditRecord {
+    pub mentor: Address,
+    pub slot_start: u64,
+    pub decided_at: u64,
+    pub outcome: Symbol,
+}
+
+/// Detected availability-gaming risk for a mentor.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct AvailabilityGamingFlag {
+    pub gaming_suspected: bool,
+    pub risk_score: u32,
+    pub rapid_change_count: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Availability commitments (commit/reveal)
+// ---------------------------------------------------------------------------
+
+/// Compute a commitment hash for a mentor's claimed availability slot:
+/// sha256(mentor || slot_start || salt). The salt is only revealed at
+/// booking time, preventing other mentors from front-running or copying
+/// availability claims before they are locked in.
+pub fn compute_availability_commitment(
+    env: &Env,
+    mentor: &Address,
+    slot_start: u64,
+    salt: &BytesN<32>,
+) -> BytesN<32> {
+    let mut input = Bytes::new(env);
+    let mentor_val: Val = mentor.clone().into_val(env);
+    let mentor_bytes: Bytes = mentor_val.try_into_val(env).unwrap();
+    input.append(&mentor_bytes);
+    for b in slot_start.to_be_bytes().iter() {
+        input.push_back(*b);
     }
+    let salt_val: Val = salt.clone().into_val(env);
+    let salt_bytes: Bytes = salt_val.try_into_val(env).unwrap();
+    input.append(&salt_bytes);
+    env.crypto().sha256(&input).into()
+}
 
-    /// Add external source verification
-    pub fn add_verified_source(&mut self) {
-        self.verified_sources = self.verified_sources.saturating_add(1);
+/// Verify that a claimed commitment matches the current mentor/slot/salt,
+/// and that it was made with sufficient lead time before the slot.
+pub fn verify_availability_commitment(
+    env: &Env,
+    commitment: &AvailabilityCommitment,
+    salt: &BytesN<32>,
+) -> bool {
+    let recomputed =
+        compute_availability_commitment(env, &commitment.mentor, commitment.slot_start, salt);
+    let lead_time_ok =
+        commitment.slot_start.saturating_sub(commitment.committed_at) >= MIN_COMMITMENT_LEAD_SECS;
+    recomputed == commitment.commitment_hash && lead_time_ok
+}
 
-        // More sources increase confidence in authenticity
-        self.external_validation_score = u32::min(
-            100,
-            self.external_validation_score + 15,
-        );
-        
-        if self.verified_sources > 2 {
-            self.fake_conflict_risk = self
-                .fake_conflict_risk
-                .saturating_sub(20);
-            self.is_conflict_authentic = true;
-        }
-    }
+// ---------------------------------------------------------------------------
+// External conflict verification
+// ---------------------------------------------------------------------------
 
-    /// Flag suspicious verification attempt
-    pub fn flag_suspicious(&mut self) {
-        self.fake_conflict_risk = u32::min(
-            100,
-            self.fake_conflict_risk + 25,
-        );
-        self.external_validation_score = self
-            .external_validation_score
-            .saturating_sub(15);
-    }
-
-    /// Update authenticity confidence
-    pub fn update_authenticity_confidence(&mut self) {
-        self.authenticity_confidence = if self.verified_sources > 0 {
-            u32::min(100, self.external_validation_score + 10)
-        } else {
-            50
-        };
+/// Validate an externally-provided scheduling-conflict proof (e.g. an
+/// oracle-attested calendar-busy hash) against the expected commitment,
+/// requiring the proof to be fresh relative to the current ledger time.
+pub fn validate_conflict_proof(
+    env: &Env,
+    proof_hash: &BytesN<32>,
+    expected_hash: &BytesN<32>,
+    proof_issued_at: u64,
+) -> ConflictProof {
+    let now = env.ledger().timestamp();
+    let within_freshness_window =
+        now.saturating_sub(proof_issued_at) <= MAX_CONFLICT_PROOF_AGE_SECS;
+    ConflictProof {
+        valid: proof_hash == expected_hash && within_freshness_window,
+        within_freshness_window,
     }
 }
 
-impl TimeSlotFairness {
-    /// Create a new time slot fairness record
-    pub fn new(
-        env: &Env,
-        record_id: u64,
-        period_id: Symbol,
-    ) -> Self {
-        Self {
-            record_id,
-            period_id,
-            distribution_score: 50,
-            gaming_risk: 0,
-            total_slots: 0,
-            concentration_slots: 0,
-            gaming_indicators: 0,
-            assessment_timestamp: env.ledger().timestamp(),
-            is_distribution_fair: false,
-            concentration_ratio: 0,
-        }
+// ---------------------------------------------------------------------------
+// Fair scheduling & anti-gaming
+// ---------------------------------------------------------------------------
+
+/// Derive a pseudo-random tiebreak value from ledger state, used to
+/// resolve simultaneous booking requests fairly without allowing mentors
+/// or learners to predict or influence the outcome.
+pub fn compute_random_tiebreak(env: &Env) -> u64 {
+    let ts = env.ledger().timestamp();
+    let seq = env.ledger().sequence();
+    let mut input = Bytes::new(env);
+    for b in ts.to_be_bytes().iter() {
+        input.push_back(*b);
     }
-
-    /// Record slot allocation
-    pub fn record_slot_allocation(&mut self, entity_slots: u32) {
-        self.total_slots = self.total_slots.saturating_add(1);
-        
-        if entity_slots > self.concentration_slots {
-            self.concentration_slots = entity_slots;
-        }
-
-        // Calculate concentration ratio
-        if self.total_slots > 0 {
-            self.concentration_ratio = (self.concentration_slots * 100) / self.total_slots;
-        }
-
-        // High concentration indicates potential gaming
-        if self.concentration_ratio > 60 {
-            self.gaming_indicators = self
-                .gaming_indicators
-                .saturating_add(1);
-            self.gaming_risk = u32::min(100, self.gaming_risk + 20);
-        }
+    for b in seq.to_be_bytes().iter() {
+        input.push_back(*b);
     }
+    let hash = env.crypto().sha256(&input);
+    let hash_bytes = hash.to_array();
+    u64::from_be_bytes([
+        hash_bytes[0], hash_bytes[1], hash_bytes[2], hash_bytes[3],
+        hash_bytes[4], hash_bytes[5], hash_bytes[6], hash_bytes[7],
+    ])
+}
 
-    /// Update distribution assessment
-    pub fn update_distribution(&mut self) {
-        self.distribution_score = if self.concentration_ratio < 40 {
-            100
-        } else if self.concentration_ratio < 60 {
-            70
-        } else {
-            40
-        };
-
-        self.is_distribution_fair = self.distribution_score > 70 
-            && self.gaming_risk < 30;
+/// Decide whether a booking request should be granted for a contested
+/// slot. When multiple concurrent requesters exist, the random tiebreak
+/// prevents coordinated mentors from deterministically controlling
+/// outcomes.
+pub fn assign_fair_slot(env: &Env, slot_already_taken: bool, reason: Symbol) -> FairSchedulingDecision {
+    FairSchedulingDecision {
+        granted: !slot_already_taken,
+        randomized_tiebreak: compute_random_tiebreak(env),
+        reason,
     }
 }
 
-impl SchedulingIntegrity {
-    /// Create a new scheduling integrity record
-    pub fn new(
-        env: &Env,
-        record_id: u64,
-        schedule_id: Symbol,
-    ) -> Self {
-        Self {
-            record_id,
-            schedule_id,
-            manipulation_incidents: 0,
-            suspicious_conflicts: 0,
-            suspicious_cancellations: 0,
-            manipulation_score: 0,
-            period_start_timestamp: env.ledger().timestamp(),
-            period_end_timestamp: 0,
-            alert_severity: 0,
-            manipulation_identified: false,
+/// Detect availability-manipulation gaming by scoring how often a mentor
+/// changes (withdraws/recommits) availability in rapid succession — a
+/// pattern consistent with artificial scarcity creation rather than
+/// genuine schedule changes.
+pub fn detect_availability_gaming(change_timestamps: &Vec<u64>) -> AvailabilityGamingFlag {
+    let count = change_timestamps.len();
+    let mut rapid_change_count = 0u32;
+    if count >= 2 {
+        for i in 1..count {
+            let prev = change_timestamps.get(i - 1).unwrap_or(0);
+            let cur = change_timestamps.get(i).unwrap_or(prev);
+            if cur.saturating_sub(prev) < RAPID_AVAILABILITY_CHANGE_WINDOW_SECS {
+                rapid_change_count = rapid_change_count.saturating_add(1);
+            }
         }
     }
-
-    /// Record suspicious conflict claim
-    pub fn record_suspicious_conflict(&mut self) {
-        self.suspicious_conflicts = self
-            .suspicious_conflicts
-            .saturating_add(1);
-
-        if self.suspicious_conflicts > 2 {
-            self.manipulation_identified = true;
-            self.alert_severity = u32::min(3, self.alert_severity + 1);
-        }
-    }
-
-    /// Record suspicious cancellation
-    pub fn record_suspicious_cancellation(&mut self) {
-        self.suspicious_cancellations = self
-            .suspicious_cancellations
-            .saturating_add(1);
-
-        if self.suspicious_cancellations > 3 {
-            self.manipulation_identified = true;
-            self.alert_severity = u32::min(3, self.alert_severity + 1);
-        }
-    }
-
-    /// Update manipulation score
-    pub fn update_manipulation_score(&mut self) {
-        let total_suspicious = self.suspicious_conflicts + self.suspicious_cancellations;
-        self.manipulation_score = u32::min(100, total_suspicious * 25);
-    }
-}
-
-impl CancellationPolicyEnforcement {
-    /// Create a new cancellation policy enforcement record
-    pub fn new(
-        env: &Env,
-        record_id: u64,
-        user_address: Address,
-    ) -> Self {
-        Self {
-            record_id,
-            user_address,
-            cancellation_count: 0,
-            abuse_indicators: 0,
-            penalties_applied: 0,
-            penalty_consistency: 100,
-            abuse_risk_score: 0,
-            period_start_timestamp: env.ledger().timestamp(),
-            period_end_timestamp: 0,
-            enforcement_consistent: true,
-            account_flagged: false,
-        }
-    }
-
-    /// Record cancellation
-    pub fn record_cancellation(&mut self) {
-        self.cancellation_count = self
-            .cancellation_count
-            .saturating_add(1);
-    }
-
-    /// Record abuse indicator
-    pub fn record_abuse_indicator(&mut self) {
-        self.abuse_indicators = self
-            .abuse_indicators
-            .saturating_add(1);
-
-        if self.abuse_indicators > 2 {
-            self.abuse_risk_score = u32::min(100, self.abuse_risk_score + 20);
-            self.account_flagged = true;
-        }
-    }
-
-    /// Apply penalty
-    pub fn apply_penalty(&mut self) {
-        self.penalties_applied = self
-            .penalties_applied
-            .saturating_add(1);
-    }
-
-    /// Update penalty consistency
-    pub fn update_penalty_consistency(&mut self, score: u32) {
-        self.penalty_consistency = score;
-        self.enforcement_consistent = score > 80;
-    }
-}
-
-impl SchedulingAudit {
-    /// Create a new scheduling audit record
-    pub fn new(env: &Env, record_id: u64, schedule_id: Symbol) -> Self {
-        Self {
-            record_id,
-            schedule_id,
-            conflicts_reviewed: 0,
-            authentic_conflicts: 0,
-            fake_conflicts: 0,
-            gaming_incidents: 0,
-            initiated_timestamp: env.ledger().timestamp(),
-            completed_timestamp: 0,
-            severity_level: 0,
-            recommended_action: 0,
-        }
-    }
-
-    /// Record conflict review
-    pub fn review_conflict(&mut self, is_authentic: bool) {
-        self.conflicts_reviewed = self
-            .conflicts_reviewed
-            .saturating_add(1);
-
-        if is_authentic {
-            self.authentic_conflicts = self
-                .authentic_conflicts
-                .saturating_add(1);
-        } else {
-            self.fake_conflicts = self
-                .fake_conflicts
-                .saturating_add(1);
-        }
-    }
-
-    /// Record gaming incident
-    pub fn record_gaming_incident(&mut self) {
-        self.gaming_incidents = self
-            .gaming_incidents
-            .saturating_add(1);
-    }
-
-    /// Complete audit
-    pub fn complete_audit(&mut self, env: &Env, severity: u32, action: u32) {
-        self.completed_timestamp = env.ledger().timestamp();
-        self.severity_level = severity;
-        self.recommended_action = action;
-    }
-}
-
-impl EmergencySchedulingIntervention {
-    /// Create a new emergency scheduling intervention record
-    pub fn new(
-        env: &Env,
-        record_id: u64,
-        schedule_id: Symbol,
-        reason: Symbol,
-    ) -> Self {
-        Self {
-            record_id,
-            schedule_id,
-            status: 0, // proposed
-            slots_to_rebalance: 0,
-            conflicts_to_resolve: 0,
-            initiated_timestamp: env.ledger().timestamp(),
-            completion_timestamp: 0,
-            restoration_progress: 0,
-            fairness_restored: false,
-            reason,
-        }
-    }
-
-    /// Activate intervention
-    pub fn activate_intervention(&mut self) {
-        self.status = 1; // active
-    }
-
-    /// Add slot to rebalance
-    pub fn add_slot_to_rebalance(&mut self) {
-        self.slots_to_rebalance = self
-            .slots_to_rebalance
-            .saturating_add(1);
-    }
-
-    /// Add conflict to resolve
-    pub fn add_conflict_to_resolve(&mut self) {
-        self.conflicts_to_resolve = self
-            .conflicts_to_resolve
-            .saturating_add(1);
-    }
-
-    /// Update restoration progress
-    pub fn update_restoration_progress(&mut self, progress: u32) {
-        self.restoration_progress = u32::min(100, progress);
-        if progress >= 100 {
-            self.fairness_restored = true;
-            self.status = 2; // completed
-        }
-    }
-
-    /// Complete intervention
-    pub fn complete_intervention(&mut self, env: &Env) {
-        self.completion_timestamp = env.ledger().timestamp();
-        self.status = 2; // completed
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_conflict_verification() {
-        // Test conflict verification
-    }
-
-    #[test]
-    fn test_time_slot_fairness() {
-        // Test time slot fairness
-    }
-
-    #[test]
-    fn test_cancellation_enforcement() {
-        // Test cancellation policy
+    let risk_score = rapid_change_count.saturating_mul(20).min(100);
+    AvailabilityGamingFlag {
+        gaming_suspected: risk_score >= GAMING_RISK_THRESHOLD,
+        risk_score,
+        rapid_change_count,
     }
 }

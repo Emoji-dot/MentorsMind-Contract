@@ -1,7 +1,9 @@
 #![no_std]
 use shared::{
-    check_access, compute_privacy_intervention, detect_exploitation, minimize_to_need_to_know,
-    AccessDecision, ConsentRecord, PrivacyInterventionRecord, PrivacyMonitoringResult, ALL_FIELDS,
+    check_access, compute_privacy_intervention, contain_data_breach, detect_cross_session_leak,
+    detect_exploitation, minimize_to_need_to_know, AccessDecision, ConsentRecord,
+    CrossSessionLeakResult, DataBreachContainment, PrivacyInterventionRecord,
+    PrivacyMonitoringResult, ALL_FIELDS,
 };
 use soroban_sdk::{
     contract, contractclient, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
@@ -48,6 +50,12 @@ pub enum DataKey {
     AccessLog(Address, Address),
     /// Automatic-isolation flag set when exploitative access is detected.
     PrivacyIsolated(Address),
+    /// Timestamps of out-of-scope data-access attempts against a subject,
+    /// used for cross-session/cross-mentor leak detection (#899).
+    LearnerLeakLog(Address),
+    /// Whether a subject's data breach has been contained and requires
+    /// admin review before consent/access can resume (#899).
+    BreachContained(Address),
 }
 
 /// Maximum length of the rolling per-(accessor,subject) access log kept for
@@ -382,8 +390,133 @@ impl KycRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::PrivacyIsolated(subject.clone()), &false);
+        env.storage()
+            .persistent()
+            .set(&DataKey::BreachContained(subject.clone()), &false);
         env.events()
             .publish((symbol_short!("privacy"), symbol_short!("restore")), subject);
+    }
+
+    // -----------------------------------------------------------------------
+    // Learner privacy, consent management & breach response (#899)
+    // -----------------------------------------------------------------------
+
+    /// Learner-facing consent/privacy management entrypoint: grants or
+    /// revokes consent for a purpose in one call. Only the subject may
+    /// manage their own consent (self-sovereign privacy).
+    pub fn manage_learner_privacy(
+        env: Env,
+        subject: Address,
+        purpose: Symbol,
+        granted_fields: u32,
+        duration_secs: u64,
+        revoke: bool,
+    ) -> Option<ConsentRecord> {
+        if revoke {
+            Self::handle_consent(env, subject, purpose, 0, 0, true);
+            None
+        } else {
+            Some(Self::manage_data_privacy(env, subject, purpose, granted_fields, duration_secs))
+        }
+    }
+
+    /// Unified consent-management entrypoint covering both grant and
+    /// revoke actions for a given purpose. Only the subject may manage
+    /// their own consent.
+    pub fn handle_consent(
+        env: Env,
+        subject: Address,
+        purpose: Symbol,
+        granted_fields: u32,
+        duration_secs: u64,
+        revoke: bool,
+    ) -> Option<ConsentRecord> {
+        subject.require_auth();
+        if revoke {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::Consent(subject.clone(), purpose.clone()));
+            env.events()
+                .publish((symbol_short!("consent"), subject), (purpose, symbol_short!("revoked")));
+            None
+        } else {
+            let now = env.ledger().timestamp();
+            let record = ConsentRecord {
+                subject: subject.clone(),
+                purpose: purpose.clone(),
+                granted_fields: granted_fields & ALL_FIELDS,
+                granted_at: now,
+                expires_at: now.saturating_add(duration_secs),
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::Consent(subject.clone(), purpose.clone()), &record);
+            env.events().publish(
+                (symbol_short!("consent"), subject),
+                (purpose, record.granted_fields),
+            );
+            Some(record)
+        }
+    }
+
+    /// Enforce data-protection compliance for an access attempt: applies
+    /// the standard access-control check via `enforce_access_controls`,
+    /// then re-scores cross-subject leak risk from the accessor's
+    /// out-of-scope access history and automatically contains the breach
+    /// (denying further access) when the risk crosses the threshold.
+    pub fn enforce_data_protection(
+        env: Env,
+        accessor: Address,
+        subject: Address,
+        purpose: Symbol,
+        requested_fields: u32,
+        out_of_scope_attempt: bool,
+    ) -> AccessDecision {
+        let mut access = Self::enforce_access_controls(
+            env.clone(),
+            accessor.clone(),
+            subject.clone(),
+            purpose,
+            requested_fields,
+        );
+
+        if out_of_scope_attempt {
+            let log_key = DataKey::LearnerLeakLog(subject.clone());
+            let mut log: Vec<u64> = env.storage().persistent().get(&log_key).unwrap_or(Vec::new(&env));
+            log.push_back(env.ledger().timestamp());
+            while log.len() > ACCESS_LOG_CAP {
+                log.remove(0);
+            }
+            env.storage().persistent().set(&log_key, &log);
+
+            let leak: CrossSessionLeakResult = detect_cross_session_leak(&env, &log, log.len());
+            let containment: DataBreachContainment =
+                contain_data_breach(&env, leak, Symbol::new(&env, "data_protection_breach"));
+            if containment.contain {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::BreachContained(subject.clone()), &true);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::PrivacyIsolated(subject.clone()), &true);
+                access.allowed = false;
+                env.events().publish(
+                    (symbol_short!("privacy"), symbol_short!("breach")),
+                    (subject, containment.reason),
+                );
+            }
+        }
+
+        access
+    }
+
+    /// Whether a subject's data has been contained following a detected
+    /// privacy breach.
+    pub fn is_breach_contained(env: Env, subject: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::BreachContained(subject))
+            .unwrap_or(false)
     }
 
     /// Internal helper to require admin authorization.
