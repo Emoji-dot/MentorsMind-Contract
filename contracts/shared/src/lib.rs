@@ -59,6 +59,15 @@ pub mod payment_integrity;
 pub mod scheduling_integrity;
 pub mod session_privacy;
 
+// IP Protection and Content Security modules
+pub mod content_authentication;
+pub mod ip_protection;
+pub mod content_licensing;
+pub mod plagiarism_detection;
+pub mod platform_interoperability;
+pub mod identity_verification;
+pub mod availability_pricing_protection;
+
 pub use admin::{
     AdminChangeProposal, AdminTransfer, ADMIN_COOLING_OFF_SECS, MIN_ADMIN_TIMELOCK_SECS,
 };
@@ -279,6 +288,54 @@ pub use session_privacy::{
     SessionAccessBoundary, CrossSessionLeakResult, DataBreachContainment,
     CROSS_SESSION_MONITORING_WINDOW_SECS, LEAK_DISTINCT_SESSION_THRESHOLD,
     BREACH_RISK_THRESHOLD,
+};
+
+// IP Protection and Content Security re-exports
+pub use content_authentication::{
+    create_watermark, verify_watermark, register_ownership, verify_ownership,
+    DigitalWatermark, AuthenticationResult, OwnershipRecord,
+    WATERMARK_VERIFICATION_THRESHOLD_BPS, MAX_WATERMARK_AGE_SECS,
+};
+pub use ip_protection::{
+    detect_unauthorized_distribution, record_usage, initiate_enforcement,
+    verify_usage_authorization, calculate_usage_statistics, determine_protection_level,
+    UnauthorizedDistributionRecord, UsageTrackingEntry, IPEnforcementRecord, UsageReport,
+    ProtectionLevel, MAX_UNAUTHORIZED_BEFORE_ESCALATION, MAX_DISTRIBUTIONS_BEFORE_LOCKDOWN,
+};
+pub use content_licensing::{
+    create_license, has_permission, record_license_usage, calculate_revenue_shares,
+    configure_revenue_share, grant_permission, validate_license, check_usage_limit,
+    License, LicenseType, Permission, RevenueShare, LicenseUsageRecord, PermissionGrant,
+    MIN_REVENUE_SHARE_BPS, MAX_REVENUE_SHARE_BPS, DEFAULT_CREATOR_SHARE_BPS,
+};
+pub use plagiarism_detection::{
+    create_fingerprint, compare_fingerprints, analyze_content_segments,
+    detect_plagiarism, create_plagiarism_report, segment_content, assess_plagiarism_risk,
+    ContentFingerprint, PlagiarismDetectionResult, ContentSegment, PlagiarismReport,
+    PLAGIARISM_CONFIDENCE_THRESHOLD_BPS, DEFAULT_SEGMENT_SIZE,
+};
+pub use platform_interoperability::{
+    create_standardized_export, detect_lock_in, record_dependency, assess_vendor_neutrality,
+    verify_compliance, define_data_portability, request_data_export, restore_competitive_choice,
+    StandardizedDataExport, DependencyRelationship, LockInDetectionResult,
+    VendorNeutralityAssessment, InteroperabilityCompliance, DataPortability,
+    LOCK_IN_THRESHOLD_BPS, VENDOR_NEUTRALITY_THRESHOLD_BPS,
+};
+pub use identity_verification::{
+    register_biometric, create_behavioral_fingerprint, detect_account_correlation,
+    detect_multi_account_abuse, propagate_penalty, verify_unique_identity,
+    generate_device_signature, assess_multi_account_risk,
+    BiometricData, BehavioralFingerprint, AccountCorrelationResult,
+    MultiAccountDetectionResult, PenaltyPropagation, DeviceSignature,
+    BIOMETRIC_CONFIDENCE_THRESHOLD_BPS, ACCOUNT_CORRELATION_THRESHOLD_BPS,
+};
+pub use availability_pricing_protection::{
+    create_availability_commitment, verify_availability_commitment,
+    detect_price_coordination, validate_dynamic_pricing, analyze_availability_pattern,
+    detect_artificial_scarcity, calculate_fair_availability_requirement,
+    enforce_fair_pricing, trigger_availability_intervention,
+    AvailabilityCommitment, PriceCoordinationFlag, DynamicPricingValidation,
+    AvailabilityPattern, BASE_HOURS_PER_WEEK, MAX_PRICE_DEVIATION_BPS,
 };
 
 /// Economic sanity ceiling for a single financial amount (token smallest units).
