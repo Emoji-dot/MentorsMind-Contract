@@ -51,6 +51,14 @@ pub mod transfer_security;
 pub mod ml_security;
 pub mod cartel_detection;
 
+// Fraud/security protection modules covering skill verification (#891),
+// escrow payment integrity (#886), scheduling integrity (#884), and
+// cross-session data isolation (#899).
+pub mod skill_verification;
+pub mod payment_integrity;
+pub mod scheduling_integrity;
+pub mod session_privacy;
+
 pub use admin::{
     AdminChangeProposal, AdminTransfer, ADMIN_COOLING_OFF_SECS, MIN_ADMIN_TIMELOCK_SECS,
 };
@@ -242,6 +250,35 @@ pub use transfer_security::{
     CredentialAuthenticityProof, CredentialFraudType, CredentialTransfer,
     CreditInflationRecord, CrossPlatformVerification, FraudDetectionResult,
     TransferIntegrityResult, TransferSecurity, TransferSecurityError,
+};
+pub use skill_verification::{
+    score_practical_assessment, validate_peer_consensus, authenticate_external_credential,
+    evaluate_domain_governance, detect_skill_fraud, compute_recertification_due,
+    PracticalAssessment, PeerValidationRecord, ExpertiseAuthenticationRecord,
+    SpecializationGovernanceRecord, SkillFraudFlag, RecertificationSchedule,
+    MIN_PEER_VALIDATORS, PASSING_ASSESSMENT_SCORE_BPS, RECERTIFICATION_PERIOD_SECS,
+    SKILL_FRAUD_RISK_THRESHOLD, MIN_SESSIONS_FOR_EXPERTISE_TRACKING,
+    EXPERTISE_UNDERPERFORMANCE_THRESHOLD_BPS,
+};
+pub use payment_integrity::{
+    validate_evidence_sufficiency, verify_completion_criteria,
+    detect_payment_timing_manipulation, check_multisig_threshold, compute_emergency_isolation,
+    EvidenceSufficiency, PaymentTimingCheck, EscrowMultisigApproval, EmergencyFundLock,
+    PaymentAuditEntry, MIN_EVIDENCE_ITEMS, MIN_DISPUTE_COOLDOWN_SECS,
+    ESCROW_MULTISIG_THRESHOLD, PAYMENT_TIMING_RISK_THRESHOLD, RAPID_ACTION_WINDOW_SECS,
+};
+pub use scheduling_integrity::{
+    compute_availability_commitment, verify_availability_commitment, validate_conflict_proof,
+    compute_random_tiebreak, assign_fair_slot, detect_availability_gaming,
+    AvailabilityCommitment, ConflictProof, FairSchedulingDecision, SchedulingAuditRecord,
+    AvailabilityGamingFlag, MIN_COMMITMENT_LEAD_SECS, MAX_CONFLICT_PROOF_AGE_SECS,
+    GAMING_RISK_THRESHOLD, RAPID_AVAILABILITY_CHANGE_WINDOW_SECS,
+};
+pub use session_privacy::{
+    enforce_session_boundary, detect_cross_session_leak, contain_data_breach,
+    SessionAccessBoundary, CrossSessionLeakResult, DataBreachContainment,
+    CROSS_SESSION_MONITORING_WINDOW_SECS, LEAK_DISTINCT_SESSION_THRESHOLD,
+    BREACH_RISK_THRESHOLD,
 };
 
 /// Economic sanity ceiling for a single financial amount (token smallest units).
