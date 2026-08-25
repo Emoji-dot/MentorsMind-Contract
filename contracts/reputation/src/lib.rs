@@ -1,10 +1,21 @@
 #![no_std]
 
 use shared::{
-    analyze_review_pattern, compute_community_intervention, detect_coordination,
-    interaction_commitment, is_restoration_eligible, verify_social_proof, BehavioralAnalysis,
-    CommunityInterventionRecord, CoordinationFlag, EscrowRecord, NetworkEffectScore,
-    ReputationProof, SocialProofRecord,
+    analyze_review_pattern, authenticate_learning_outcomes as shared_authenticate_learning_outcomes,
+    compute_community_intervention, compute_outcome_intervention, detect_coordination,
+    interaction_commitment, is_outcome_restoration_eligible, is_restoration_eligible,
+    protect_success_metrics as shared_protect_success_metrics,
+    validate_assessment_criteria as shared_validate_assessment_criteria, verify_social_proof,
+    AssessmentValidation, BehavioralAnalysis, CommunityInterventionRecord, CoordinationFlag,
+    EscrowRecord, NetworkEffectScore, OutcomeAuthenticity, OutcomeInterventionRecord,
+    ReputationProof, SocialProofRecord, SuccessMetricProtection, OUTCOME_RESTORATION_COOLDOWN_SECS,
+    // learner protection (#917)
+    detect_predatory_behavior as shared_detect_predatory_behavior,
+    identify_exploitation_patterns as shared_identify_exploitation_patterns,
+    compute_welfare_status as shared_compute_welfare_status,
+    compute_learner_protection_intervention, is_protection_restoration_eligible,
+    PredatoryBehaviorDetection, ExploitationPattern, LearnerProtectionRecord,
+    VulnerabilityAssessment,
 };
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal,
@@ -73,6 +84,41 @@ pub enum DataKey {
     CommunityCoordination(Address),
     SocialProofScore(Address),
     CommunityIntervention(Address),
+    /// Cached outcome-authenticity assessment for a mentor's learning
+    /// outcome measurements (#outcome-authenticity).
+    OutcomeAuthenticityRecord(Address),
+    /// Trusted historical baseline (bps, 0-10000) for a mentor's success
+    /// metric, set by the configured escrow authority.
+    MetricBaseline(Address),
+    /// Cached success-metric gaming assessment for a mentor.
+    SuccessMetricRecord(Address),
+    /// Timestamps of recorded assessment-criteria proposals for a mentor.
+    AssessmentProposalLog(Address),
+    /// Whether `proposer` has ever proposed assessment criteria for
+    /// `mentor` before (distinct-proposer tracking).
+    AssessmentHasProposedBefore(Address, Address),
+    AssessmentDistinctProposerCount(Address),
+    /// Cached assessment-validation result for a mentor.
+    AssessmentValidationRecord(Address),
+    /// Cached combined outcome-protection intervention record for a mentor.
+    OutcomeIntervention(Address),
+    // ── Learner protection / conduct tracking (#917) ──────────────────────
+    /// Log of conduct events (timestamps) recorded for a mentor, used for
+    /// predatory-behaviour scoring in `track_mentor_conduct`.
+    MentorConductLog(Address),
+    /// Running count of disputes/complaints filed against a mentor.
+    MentorComplaintCount(Address),
+    /// Count of consecutive low-quality sessions (rating ≤ 2) for a mentor.
+    MentorConsecutiveLowQuality(Address),
+    /// Cached predatory-behaviour detection result for a mentor.
+    MentorPredatoryBehaviorRecord(Address),
+    /// Cached exploitation patterns identified for a mentor/learner pair.
+    MentorExploitationPatterns(Address, Address),
+    /// Cached welfare status for a learner relative to a specific mentor.
+    LearnerWelfareStatus(Address, Address),
+    /// Cached learner-protection intervention record for a mentor (reputation
+    /// contract's copy; session_registry keeps a parallel copy).
+    LearnerProtectionIntervention(Address),
 }
 
 /// Cooldown before an intervened mentor's community access is eligible for
@@ -205,6 +251,10 @@ impl ReputationContract {
         let coordination = Self::validate_community_interactions(env.clone(), mentor.clone(), learner.clone());
         let social_proof = Self::monitor_social_proof_auth(env.clone(), mentor.clone());
 
+        // Outcome-authenticity monitoring: re-score this mentor's learning
+        // outcome measurements from the freshly-recorded review timestamps.
+        Self::authenticate_learning_outcomes(env.clone(), mentor.clone());
+
         // Store review
         let record = ReviewRecord {
             session_id: session_id.clone(),
@@ -223,6 +273,13 @@ impl ReputationContract {
         env.storage()
             .persistent()
             .extend_ttl(&review_key, TTL_THRESHOLD, TTL_BUMP);
+
+        // Learner protection: record conduct signals whenever a review
+        // warrants investigation (low quality, coordinated, or fake social proof).
+        if record.investigation_required {
+            let is_low_quality = rating <= 2;
+            Self::track_mentor_conduct(env.clone(), mentor.clone(), is_low_quality, false, 0);
+        }
 
         // Update running average
         let sum_key = DataKey::MentorRatingSum(mentor.clone());
@@ -442,6 +499,451 @@ impl ReputationContract {
 
         env.events().publish(
             (symbol_short!("commrest"), Symbol::new(&env, "restored")),
+            mentor,
+        );
+    }
+
+    // ─── Outcome authenticity (#outcome-authenticity) ──────────────────────
+
+    /// Authenticate a mentor's recent learning-outcome measurements (session
+    /// reviews acting as completion attestations): a burst of ratings from a
+    /// narrow set of evaluators is treated as manipulated rather than
+    /// genuine. Safe to call by anyone as a read-through audit; also
+    /// invoked internally on every `submit_review`.
+    pub fn authenticate_learning_outcomes(env: Env, mentor: Address) -> OutcomeAuthenticity {
+        let timestamps: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReviewTimestamps(mentor.clone()))
+            .unwrap_or(Vec::new(&env));
+        let distinct: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DistinctReviewerCount(mentor.clone()))
+            .unwrap_or(0);
+        let result = shared_authenticate_learning_outcomes(&timestamps, distinct);
+        env.storage()
+            .persistent()
+            .set(&DataKey::OutcomeAuthenticityRecord(mentor.clone()), &result);
+        if !result.genuine {
+            env.events().publish(
+                (symbol_short!("outcome"), Symbol::new(&env, "flagged")),
+                (mentor, result.manipulation_risk_score),
+            );
+        }
+        result
+    }
+
+    /// Set the trusted historical baseline (basis points, 0-10000) used by
+    /// `protect_success_metrics` for `mentor`. Restricted to the configured
+    /// escrow authority (mirrors `configure_review_security`).
+    pub fn set_outcome_baseline(env: Env, admin: Address, mentor: Address, baseline_bps: u32) {
+        let escrow: Address = env.storage().instance().get(&ESCROW).expect("Not initialized");
+        admin.require_auth();
+        if admin != escrow {
+            panic!("Unauthorized");
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::MetricBaseline(mentor), &baseline_bps.min(10_000));
+    }
+
+    /// Protect a mentor's aggregate rating (expressed as a 0-10000 bps
+    /// success metric) against gaming by comparing it to the configured
+    /// baseline. Falls back to treating the current value as its own
+    /// baseline when none has been configured (no false positive on the
+    /// first measurement).
+    pub fn protect_success_metrics(env: Env, mentor: Address) -> SuccessMetricProtection {
+        let (avg, _count) = Self::get_mentor_rating(env.clone(), mentor.clone());
+        let reported_bps = ((avg as u32).saturating_mul(20)).min(10_000);
+        let baseline_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MetricBaseline(mentor.clone()))
+            .unwrap_or(reported_bps);
+        let result = shared_protect_success_metrics(reported_bps, baseline_bps);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SuccessMetricRecord(mentor.clone()), &result);
+        if result.gaming_detected {
+            env.events().publish(
+                (symbol_short!("metric"), Symbol::new(&env, "gaming")),
+                (mentor, result.gaming_risk_score),
+            );
+        }
+        result
+    }
+
+    /// Record that `proposer` proposed an assessment-criteria change (e.g. a
+    /// rating-tier or dispute-threshold adjustment) affecting `mentor`'s
+    /// evaluation. Used by `validate_assessment_criteria` to detect a
+    /// coordinated bloc setting evaluation standards.
+    pub fn record_assessment_proposal(env: Env, mentor: Address, proposer: Address) {
+        let log_key = DataKey::AssessmentProposalLog(mentor.clone());
+        let mut log: Vec<u64> = env.storage().persistent().get(&log_key).unwrap_or(Vec::new(&env));
+        log.push_back(env.ledger().timestamp());
+        while log.len() > 20 {
+            log.remove(0);
+        }
+        env.storage().persistent().set(&log_key, &log);
+
+        let seen_key = DataKey::AssessmentHasProposedBefore(mentor.clone(), proposer);
+        if !env.storage().persistent().get(&seen_key).unwrap_or(false) {
+            env.storage().persistent().set(&seen_key, &true);
+            let cnt_key = DataKey::AssessmentDistinctProposerCount(mentor);
+            let cnt: u32 = env.storage().persistent().get(&cnt_key).unwrap_or(0);
+            env.storage().persistent().set(&cnt_key, &(cnt + 1));
+        }
+    }
+
+    /// Validate that `mentor`'s recorded assessment-criteria proposals were
+    /// set independently rather than by a coordinated bloc.
+    pub fn validate_assessment_criteria(env: Env, mentor: Address) -> AssessmentValidation {
+        let log: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AssessmentProposalLog(mentor.clone()))
+            .unwrap_or(Vec::new(&env));
+        let distinct: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AssessmentDistinctProposerCount(mentor.clone()))
+            .unwrap_or(0);
+        let result = shared_validate_assessment_criteria(&log, distinct);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AssessmentValidationRecord(mentor.clone()), &result);
+        if !result.objective {
+            env.events().publish(
+                (symbol_short!("assess"), Symbol::new(&env, "flagged")),
+                (mentor, result.coordination_risk_score),
+            );
+        }
+        result
+    }
+
+    /// Combine the cached outcome-authenticity, success-metric, and
+    /// assessment-validation signals for `mentor` into a single
+    /// outcome-protection intervention decision.
+    pub fn get_outcome_status(env: Env, mentor: Address) -> OutcomeInterventionRecord {
+        let outcome: OutcomeAuthenticity = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OutcomeAuthenticityRecord(mentor.clone()))
+            .unwrap_or(OutcomeAuthenticity {
+                genuine: true,
+                manipulation_risk_score: 0,
+                distinct_evaluator_bps: 10_000,
+                burst_count: 0,
+            });
+        let metric: SuccessMetricProtection = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SuccessMetricRecord(mentor.clone()))
+            .unwrap_or(SuccessMetricProtection {
+                gaming_detected: false,
+                gaming_risk_score: 0,
+                deviation_bps: 0,
+            });
+        let assessment: AssessmentValidation = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AssessmentValidationRecord(mentor.clone()))
+            .unwrap_or(AssessmentValidation {
+                objective: true,
+                coordination_risk_score: 0,
+                clustered_timing_count: 0,
+            });
+        let record = compute_outcome_intervention(
+            &env,
+            outcome,
+            metric,
+            assessment,
+            OUTCOME_RESTORATION_COOLDOWN_SECS,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::OutcomeIntervention(mentor.clone()), &record);
+        record
+    }
+
+    // ─── Learner protection / mentor conduct tracking (#917) ───────────────
+
+    /// Record a conduct event for `mentor` and recompute their predatory-
+    /// behaviour score.
+    ///
+    /// `low_quality_session` – whether the session being recorded had a
+    /// learner rating of ≤ 2 (sustained under-delivery indicator).
+    /// `is_complaint` – whether the learner filed a dispute/complaint for
+    /// this session.
+    /// `price_above_market_bps` – how far above the rolling platform-average
+    /// price this session was charged to the learner (basis points).
+    ///
+    /// The conduct log timestamps are used only as an event trail; the scoring
+    /// is driven by the aggregated counts. Safe to call by anyone as a
+    /// read-through audit; review submission calls this internally when
+    /// `investigation_required` is set.
+    pub fn track_mentor_conduct(
+        env: Env,
+        mentor: Address,
+        low_quality_session: bool,
+        is_complaint: bool,
+        price_above_market_bps: u32,
+    ) -> PredatoryBehaviorDetection {
+        // Update complaint count.
+        let complaint_cnt_key = DataKey::MentorComplaintCount(mentor.clone());
+        let complaint_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&complaint_cnt_key)
+            .unwrap_or(0);
+        let new_complaint_count = if is_complaint {
+            complaint_count.saturating_add(1)
+        } else {
+            complaint_count
+        };
+        env.storage()
+            .persistent()
+            .set(&complaint_cnt_key, &new_complaint_count);
+        env.storage().persistent().extend_ttl(&complaint_cnt_key, TTL_THRESHOLD, TTL_BUMP);
+
+        // Update consecutive low-quality counter (resets on a good session).
+        let clq_key = DataKey::MentorConsecutiveLowQuality(mentor.clone());
+        let consec: u32 = env.storage().persistent().get(&clq_key).unwrap_or(0);
+        let new_consec = if low_quality_session {
+            consec.saturating_add(1)
+        } else {
+            0
+        };
+        env.storage().persistent().set(&clq_key, &new_consec);
+        env.storage().persistent().extend_ttl(&clq_key, TTL_THRESHOLD, TTL_BUMP);
+
+        // Append to conduct timestamp log (capped at 50 entries).
+        let log_key = DataKey::MentorConductLog(mentor.clone());
+        let mut log: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&log_key)
+            .unwrap_or(Vec::new(&env));
+        log.push_back(env.ledger().timestamp());
+        while log.len() > 50 {
+            log.remove(0);
+        }
+        env.storage().persistent().set(&log_key, &log);
+        env.storage().persistent().extend_ttl(&log_key, TTL_THRESHOLD, TTL_BUMP);
+
+        // Derive total_sessions from the review count (already tracked).
+        let total_sessions: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MentorReviewCount(mentor.clone()))
+            .unwrap_or(0) as u32;
+
+        let behavior = shared_detect_predatory_behavior(
+            new_consec,
+            new_complaint_count,
+            total_sessions,
+            price_above_market_bps,
+        );
+
+        env.storage().persistent().set(
+            &DataKey::MentorPredatoryBehaviorRecord(mentor.clone()),
+            &behavior,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::MentorPredatoryBehaviorRecord(mentor.clone()),
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        if behavior.predatory {
+            env.events().publish(
+                (symbol_short!("conduct"), Symbol::new(&env, "predatory")),
+                (mentor.clone(), behavior.risk_score),
+            );
+        }
+
+        behavior
+    }
+
+    /// Identify exploitation patterns for a `mentor`/`learner` pair by
+    /// combining the mentor's latest cached predatory-behaviour score with
+    /// a supplied `vulnerability` assessment. Returns the list of active
+    /// exploitation patterns and persists them for off-chain indexing.
+    pub fn identify_exploitation_patterns(
+        env: Env,
+        mentor: Address,
+        learner: Address,
+        vulnerability: VulnerabilityAssessment,
+    ) -> Vec<ExploitationPattern> {
+        let behavior: PredatoryBehaviorDetection = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MentorPredatoryBehaviorRecord(mentor.clone()))
+            .unwrap_or(PredatoryBehaviorDetection {
+                predatory: false,
+                risk_score: 0,
+                low_quality_pattern: false,
+                high_complaint_rate: false,
+                price_exploitation_flag: false,
+                complaint_count: 0,
+                total_sessions: 0,
+            });
+
+        let patterns = shared_identify_exploitation_patterns(&env, vulnerability, behavior);
+
+        env.storage().persistent().set(
+            &DataKey::MentorExploitationPatterns(mentor.clone(), learner.clone()),
+            &patterns,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::MentorExploitationPatterns(mentor.clone(), learner.clone()),
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        if !patterns.is_empty() {
+            env.events().publish(
+                (symbol_short!("exploit"), Symbol::new(&env, "detected")),
+                (mentor.clone(), learner.clone(), patterns.len()),
+            );
+        }
+
+        patterns
+    }
+
+    /// Compute and persist the welfare status for `learner` relative to
+    /// `mentor`, then produce a combined learner-protection intervention
+    /// record.
+    ///
+    /// Uses the cached vulnerability assessment supplied by the caller (or
+    /// a neutral default when none is available) together with the number of
+    /// currently active exploitation patterns stored by
+    /// `identify_exploitation_patterns`.
+    pub fn track_learner_welfare(
+        env: Env,
+        mentor: Address,
+        learner: Address,
+        vulnerability: VulnerabilityAssessment,
+    ) -> LearnerProtectionRecord {
+        // Count active exploitation patterns for this pair.
+        let patterns: Vec<ExploitationPattern> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MentorExploitationPatterns(mentor.clone(), learner.clone()))
+            .unwrap_or(Vec::new(&env));
+        let pattern_count = patterns.len();
+
+        let welfare = shared_compute_welfare_status(vulnerability, pattern_count);
+
+        env.storage().persistent().set(
+            &DataKey::LearnerWelfareStatus(learner.clone(), mentor.clone()),
+            &welfare,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::LearnerWelfareStatus(learner.clone(), mentor.clone()),
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        if welfare.activate_support_services {
+            env.events().publish(
+                (symbol_short!("welfare"), Symbol::new(&env, "support")),
+                (learner.clone(), mentor.clone(), welfare.welfare_risk_score),
+            );
+        }
+
+        // Derive the mentor's behaviour record.
+        let behavior: PredatoryBehaviorDetection = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MentorPredatoryBehaviorRecord(mentor.clone()))
+            .unwrap_or(PredatoryBehaviorDetection {
+                predatory: false,
+                risk_score: 0,
+                low_quality_pattern: false,
+                high_complaint_rate: false,
+                price_exploitation_flag: false,
+                complaint_count: 0,
+                total_sessions: 0,
+            });
+
+        let now = env.ledger().timestamp();
+        let protection =
+            compute_learner_protection_intervention(&env, vulnerability, behavior, welfare, now);
+
+        env.storage().persistent().set(
+            &DataKey::LearnerProtectionIntervention(mentor.clone()),
+            &protection,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::LearnerProtectionIntervention(mentor.clone()),
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        if protection.intervene {
+            env.events().publish(
+                (symbol_short!("lprot"), Symbol::new(&env, "intervene")),
+                (mentor.clone(), protection.combined_risk_score),
+            );
+        }
+
+        protection
+    }
+
+    /// Restore a learner-protection intervention on `mentor` once the
+    /// cooldown has elapsed. Callable by any arbitrator address (mirrors
+    /// `restore_fair_participation`).
+    pub fn restore_learner_protection(env: Env, arbitrator: Address, mentor: Address) {
+        arbitrator.require_auth();
+
+        let protection: LearnerProtectionRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LearnerProtectionIntervention(mentor.clone()))
+            .expect("NoLearnerProtectionInterventionOnRecord");
+
+        if !is_protection_restoration_eligible(&protection, env.ledger().timestamp()) {
+            panic!("LearnerProtectionRestorationNotEligible");
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::LearnerProtectionIntervention(mentor.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::MentorPredatoryBehaviorRecord(mentor.clone()));
+
+        env.events().publish(
+            (symbol_short!("lprest"), Symbol::new(&env, "restored")),
+            mentor,
+        );
+    }
+
+    /// Restore authentic outcome measurement for `mentor` once the
+    /// outcome-protection intervention cooldown has elapsed. Callable by any
+    /// arbitrator address (mirrors `restore_fair_participation`).
+    pub fn restore_authentic_outcomes(env: Env, arbitrator: Address, mentor: Address) {        arbitrator.require_auth();
+        let record: OutcomeInterventionRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OutcomeIntervention(mentor.clone()))
+            .expect("NoOutcomeInterventionOnRecord");
+
+        if !is_outcome_restoration_eligible(&record, env.ledger().timestamp()) {
+            panic!("OutcomeRestorationNotEligible");
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::OutcomeIntervention(mentor.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::OutcomeAuthenticityRecord(mentor.clone()));
+
+        env.events().publish(
+            (symbol_short!("outrest"), Symbol::new(&env, "restored")),
             mentor,
         );
     }
@@ -739,6 +1241,10 @@ impl ReputationContract {
         };
         
         env.storage().persistent().set(&dispute_key, &dispute);
+
+        // Learner protection: filing a dispute is a complaint signal.
+        Self::track_mentor_conduct(env.clone(), mentor.clone(), false, true, 0);
+
         env.events().publish(
             (Symbol::new(&env, "ReviewDisputeFiled"), mentor),
             session_id,

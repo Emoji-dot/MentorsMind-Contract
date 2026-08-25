@@ -33,10 +33,10 @@ pub mod atomic_state;
 pub mod community_protection;
 pub mod pricing_protection;
 pub mod privacy_protection;
-pub mod network_authenticity;
-pub mod competency_validation;
-pub mod benchmark_integrity;
-pub mod emergency_response_protection;
+pub mod justice_protection;
+pub mod outcome_authenticity;
+pub mod scalability_protection;
+pub mod learner_protection;
 
 pub use admin::{
     AdminChangeProposal, AdminTransfer, ADMIN_COOLING_OFF_SECS, MIN_ADMIN_TIMELOCK_SECS,
@@ -144,6 +144,47 @@ pub use privacy_protection::{
     FIELD_IDENTITY, FIELD_CONTACT, FIELD_LEARNING_HISTORY, FIELD_CAREER_DATA, FIELD_PAYMENT,
     MINIMAL_SESSION_FIELDS, ALL_FIELDS, ACCESS_MONITORING_WINDOW_SECS,
     MAX_ACCESSES_PER_WINDOW, PRIVACY_RISK_THRESHOLD,
+};
+pub use justice_protection::{
+    ensure_dispute_independence, validate_evidence_authenticity, protect_arbitration_fairness,
+    compute_justice_intervention, is_justice_restoration_eligible,
+    DisputeIndependenceFlag, EvidenceAuthenticity, ArbitrationBiasFlag, JusticeInterventionRecord,
+    DISPUTE_COORDINATION_WINDOW_SECS, DISPUTE_INDEPENDENCE_RISK_THRESHOLD,
+    EVIDENCE_DUPLICATE_WINDOW_SECS, EVIDENCE_TAMPER_RISK_THRESHOLD,
+    ARBITRATION_MIN_RULINGS_FOR_BIAS, ARBITRATION_BIAS_RATIO_BPS_THRESHOLD,
+    ARBITRATION_BIAS_RISK_THRESHOLD, JUSTICE_INTERVENTION_THRESHOLD,
+    JUSTICE_RESTORATION_COOLDOWN_SECS,
+};
+pub use outcome_authenticity::{
+    authenticate_learning_outcomes, protect_success_metrics, validate_assessment_criteria,
+    compute_outcome_intervention, is_outcome_restoration_eligible,
+    OutcomeAuthenticity, SuccessMetricProtection, AssessmentValidation, OutcomeInterventionRecord,
+    OUTCOME_BURST_WINDOW_SECS, OUTCOME_MIN_DISTINCT_BPS, OUTCOME_RISK_THRESHOLD,
+    METRIC_GAMING_DEVIATION_BPS, ASSESSMENT_COORDINATION_WINDOW_SECS, ASSESSMENT_RISK_THRESHOLD,
+    OUTCOME_INTERVENTION_THRESHOLD, OUTCOME_RESTORATION_COOLDOWN_SECS,
+};
+pub use scalability_protection::{
+    detect_resource_competition, validate_load_pattern, distribute_resources_fairly,
+    compute_scalability_intervention, is_performance_restoration_eligible,
+    ResourceCompetitionFlag, LoadValidationResult, FairResourceAllocation,
+    PerformanceInterventionRecord,
+    RESOURCE_BURST_WINDOW_SECS, RESOURCE_MIN_DISTINCT_BPS, RESOURCE_COMPETITION_RISK_THRESHOLD,
+    LOAD_SUSPICIOUS_RATE_PER_MINUTE, FAIR_ALLOCATION_MAX_SHARE_BPS,
+    PERFORMANCE_INTERVENTION_THRESHOLD, PERFORMANCE_RESTORATION_COOLDOWN_SECS,
+};
+pub use learner_protection::{
+    assess_vulnerability, detect_predatory_behavior, enforce_learner_fair_pricing,
+    identify_exploitation_patterns, compute_welfare_status,
+    compute_learner_protection_intervention, compute_emergency_intervention,
+    is_protection_restoration_eligible,
+    VulnerabilityAssessment, PredatoryBehaviorDetection, ExploitationPattern,
+    WelfareStatus, EmergencyIntervention, LearnerProtectionRecord,
+    VULNERABILITY_SESSION_WINDOW, VULNERABILITY_HIGH_RECURRENCE_THRESHOLD,
+    VULNERABILITY_RISK_THRESHOLD, AFFORDABILITY_DEVIATION_BPS,
+    FINANCIAL_PROTECTION_CAP_BPS, PREDATORY_LOW_QUALITY_THRESHOLD,
+    PREDATORY_COMPLAINT_RATIO_BPS, PREDATORY_RISK_THRESHOLD,
+    EMERGENCY_PATTERN_THRESHOLD, EMERGENCY_SUSPENSION_COOLDOWN_SECS,
+    LEARNER_PROTECTION_COOLDOWN_SECS,
 };
 
 /// Economic sanity ceiling for a single financial amount (token smallest units).

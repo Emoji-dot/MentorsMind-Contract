@@ -20,10 +20,20 @@
 #![no_std]
 #![allow(deprecated)] // Temporarily allow deprecated Events::publish until we migrate to #[contractevent]
 
+use shared::{
+    compute_justice_intervention, ensure_dispute_independence as shared_ensure_dispute_independence,
+    is_justice_restoration_eligible, protect_arbitration_fairness as shared_protect_arbitration_fairness,
+    validate_evidence_authenticity as shared_validate_evidence_authenticity, ArbitrationBiasFlag,
+    DisputeIndependenceFlag, EvidenceAuthenticity as SharedEvidenceAuthenticity,
+    JusticeInterventionRecord, JUSTICE_RESTORATION_COOLDOWN_SECS,
+};
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, Address, BytesN, Env,
     IntoVal, Symbol, Vec,
 };
+
+/// Maximum recent rulings tracked per arbitrator for bias scoring.
+const MAX_ARBITRATOR_HISTORY: u32 = 20;
 
 /// Default window (seconds) within which evidence may be submitted after session end.
 const DEFAULT_WINDOW_SECS: u64 = 48 * 60 * 60;
@@ -149,6 +159,27 @@ pub enum DataKey {
     AppealReasonHash(u64),
     /// Optional health dashboard notified of dispute lifecycle events.
     HealthDashboard,
+    /// Dispute-open timestamps for a given (mentor, learner) pair, used to
+    /// detect coordinated/repeated dispute filing (#justice-protection).
+    PartyDisputeLog(Address, Address),
+    /// Cached dispute-independence assessment for a given escrow.
+    DisputeIndependence(u64),
+    /// First escrow_id a given evidence `content_hash` was submitted for;
+    /// used to detect content reuse across unrelated disputes.
+    EvidenceHashOrigin(BytesN<32>),
+    /// Count of evidence items submitted for an escrow whose content hash
+    /// was already used in a different escrow.
+    DuplicateEvidenceCount(u64),
+    /// Cached evidence-authenticity assessment for a given escrow.
+    EvidenceAuthenticityRecord(u64),
+    /// Rolling favor history (true = ruled for mentor) for a given
+    /// arbitrator, used for arbitration-bias scoring.
+    ArbitratorFavorHistory(Address),
+    /// Cached arbitration-fairness assessment for a given arbitrator.
+    ArbitrationFairness(Address),
+    /// Cached combined justice-protection intervention record for a given
+    /// escrow.
+    JusticeIntervention(u64),
 }
 
 #[contractclient(name = "EscrowContractClient")]
@@ -193,6 +224,10 @@ pub enum Error {
     GovernanceContractNotConfigured = 14,
     /// No alternative arbitrator is available for an appeal.
     NoAlternativeArbitrator = 15,
+    /// No justice-protection intervention is on record for this escrow.
+    NoJusticeInterventionOnRecord = 16,
+    /// The intervened dispute flow's restoration cooldown has not elapsed.
+    JusticeRestorationNotEligible = 17,
 }
 
 #[contract]
@@ -309,6 +344,23 @@ impl DisputeEvidenceContract {
             opened_at,
         );
 
+        // Justice protection: track dispute-open timestamps for this
+        // mentor/learner pair and re-score independence from coordinated
+        // dispute filing (#justice-protection).
+        let escrow = Self::load_escrow(&env, escrow_id);
+        let party_key = DataKey::PartyDisputeLog(escrow.mentor.clone(), escrow.learner.clone());
+        let mut party_log: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&party_key)
+            .unwrap_or(Vec::new(&env));
+        party_log.push_back(opened_at);
+        while party_log.len() > MAX_ARBITRATOR_HISTORY {
+            party_log.remove(0);
+        }
+        env.storage().persistent().set(&party_key, &party_log);
+        Self::ensure_dispute_independence(env.clone(), escrow_id);
+
         if let Some(dashboard) = env
             .storage()
             .instance()
@@ -417,7 +469,7 @@ impl DisputeEvidenceContract {
 
         let item = EvidenceItem {
             submitter: submitter.clone(),
-            content_hash,
+            content_hash: content_hash.clone(),
             evidence_uri_hash,
             submitter_attestation: submitter_attestation
                 .unwrap_or_else(|| BytesN::from_array(&env, &[0u8; 64])),
@@ -425,6 +477,22 @@ impl DisputeEvidenceContract {
         };
         evidence.push_back(item.clone());
         env.storage().persistent().set(&key, &evidence);
+
+        // Justice protection: detect content reuse across unrelated
+        // disputes (a signature of fabricated/rehearsed evidence).
+        let origin_key = DataKey::EvidenceHashOrigin(content_hash.clone());
+        match env.storage().persistent().get::<_, u64>(&origin_key) {
+            Some(origin_escrow) if origin_escrow != escrow_id => {
+                let dup_key = DataKey::DuplicateEvidenceCount(escrow_id);
+                let dup: u32 = env.storage().persistent().get(&dup_key).unwrap_or(0);
+                env.storage().persistent().set(&dup_key, &(dup + 1));
+            }
+            Some(_) => {}
+            None => {
+                env.storage().persistent().set(&origin_key, &escrow_id);
+            }
+        }
+        Self::validate_evidence_authenticity(env.clone(), escrow_id);
 
         // Compute and store Merkle root over the entire evidence set.
         let root = Self::compute_evidence_root(&env, &evidence);
@@ -580,6 +648,181 @@ impl DisputeEvidenceContract {
         env.events().publish(
             (Symbol::new(&env, "dispute_resolved"), escrow_id),
             resolution,
+        );
+
+        // Justice protection: track this arbitrator's ruling favor history
+        // and re-score arbitration fairness.
+        let history_key = DataKey::ArbitratorFavorHistory(arbitrator.clone());
+        let mut history: Vec<bool> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or(Vec::new(&env));
+        history.push_back(release_to_mentor);
+        while history.len() > MAX_ARBITRATOR_HISTORY {
+            history.remove(0);
+        }
+        env.storage().persistent().set(&history_key, &history);
+        Self::protect_arbitration_fairness(env.clone(), arbitrator.clone());
+        Self::get_justice_status(env.clone(), escrow_id, arbitrator);
+
+        Ok(())
+    }
+
+    // ─── Justice protection ────────────────────────────────────────────────
+
+    /// Score dispute independence for `escrow_id`: repeated disputes between
+    /// the same mentor/learner pair, tightly clustered in time, are the
+    /// signature of coordinated dispute filing rather than an independent,
+    /// arm's-length conflict. Safe to call by anyone as a read-through
+    /// audit; also invoked internally on every `record_dispute_opened`.
+    pub fn ensure_dispute_independence(env: Env, escrow_id: u64) -> DisputeIndependenceFlag {
+        let escrow = Self::load_escrow(&env, escrow_id);
+        let log: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PartyDisputeLog(escrow.mentor, escrow.learner))
+            .unwrap_or(Vec::new(&env));
+        let shared_actor_count = log.len();
+        let flag = shared_ensure_dispute_independence(&log, shared_actor_count);
+        env.storage()
+            .persistent()
+            .set(&DataKey::DisputeIndependence(escrow_id), &flag);
+        if !flag.independent {
+            env.events().publish(
+                (Symbol::new(&env, "dispute_coordination_flagged"), escrow_id),
+                flag.risk_score,
+            );
+        }
+        flag
+    }
+
+    /// Validate the authenticity of `escrow_id`'s evidence submissions:
+    /// content reuse across unrelated disputes and clustered submission
+    /// timing are treated as tampering signals. Safe to call by anyone as a
+    /// read-through audit; also invoked internally on every
+    /// `submit_evidence`.
+    pub fn validate_evidence_authenticity(env: Env, escrow_id: u64) -> SharedEvidenceAuthenticity {
+        let evidence = Self::get_evidence(env.clone(), escrow_id);
+        let mut timestamps: Vec<u64> = Vec::new(&env);
+        for item in evidence.iter() {
+            timestamps.push_back(item.submitted_at);
+        }
+        let duplicate_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DuplicateEvidenceCount(escrow_id))
+            .unwrap_or(0);
+        let result = shared_validate_evidence_authenticity(&timestamps, duplicate_count);
+        env.storage()
+            .persistent()
+            .set(&DataKey::EvidenceAuthenticityRecord(escrow_id), &result);
+        if !result.authentic {
+            env.events().publish(
+                (Symbol::new(&env, "evidence_authenticity_flagged"), escrow_id),
+                result.tampering_risk_score,
+            );
+        }
+        result
+    }
+
+    /// Assess an arbitrator's recent ruling history for systematic bias
+    /// toward one party. Safe to call by anyone as a read-through audit;
+    /// also invoked internally on every `submit_resolution`.
+    pub fn protect_arbitration_fairness(env: Env, arbitrator: Address) -> ArbitrationBiasFlag {
+        let history: Vec<bool> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArbitratorFavorHistory(arbitrator.clone()))
+            .unwrap_or(Vec::new(&env));
+        let flag = shared_protect_arbitration_fairness(&history);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ArbitrationFairness(arbitrator.clone()), &flag);
+        if !flag.fair {
+            env.events().publish(
+                (Symbol::new(&env, "arbitration_bias_flagged"), arbitrator),
+                flag.bias_risk_score,
+            );
+        }
+        flag
+    }
+
+    /// Combine the cached dispute-independence, evidence-authenticity, and
+    /// arbitration-fairness signals for `escrow_id`/`arbitrator` into a
+    /// single justice-protection intervention decision, persisting the
+    /// result for `restore_fair_resolution` to consume.
+    pub fn get_justice_status(env: Env, escrow_id: u64, arbitrator: Address) -> JusticeInterventionRecord {
+        let independence: DisputeIndependenceFlag = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DisputeIndependence(escrow_id))
+            .unwrap_or(DisputeIndependenceFlag {
+                independent: true,
+                risk_score: 0,
+                shared_actor_count: 0,
+                clustered_timing_count: 0,
+            });
+        let evidence: SharedEvidenceAuthenticity = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EvidenceAuthenticityRecord(escrow_id))
+            .unwrap_or(SharedEvidenceAuthenticity {
+                authentic: true,
+                tampering_risk_score: 0,
+                duplicate_submission_count: 0,
+                suspicious_timing_count: 0,
+            });
+        let bias: ArbitrationBiasFlag = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArbitrationFairness(arbitrator))
+            .unwrap_or(ArbitrationBiasFlag {
+                fair: true,
+                bias_risk_score: 0,
+                one_sided_ratio_bps: 0,
+                ruling_count: 0,
+            });
+        let record = compute_justice_intervention(
+            &env,
+            independence,
+            evidence,
+            bias,
+            JUSTICE_RESTORATION_COOLDOWN_SECS,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::JusticeIntervention(escrow_id), &record);
+        record
+    }
+
+    /// Restore fair dispute resolution for `escrow_id` once the
+    /// justice-protection intervention cooldown has elapsed. Admin only.
+    pub fn restore_fair_resolution(env: Env, admin: Address, escrow_id: u64) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        let record: JusticeInterventionRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::JusticeIntervention(escrow_id))
+            .ok_or(Error::NoJusticeInterventionOnRecord)?;
+
+        if !is_justice_restoration_eligible(&record, env.ledger().timestamp()) {
+            return Err(Error::JusticeRestorationNotEligible);
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::JusticeIntervention(escrow_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::DisputeIndependence(escrow_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::EvidenceAuthenticityRecord(escrow_id));
+
+        env.events().publish(
+            (Symbol::new(&env, "justice_restored"), escrow_id),
+            (),
         );
         Ok(())
     }
