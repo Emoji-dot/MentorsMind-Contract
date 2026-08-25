@@ -2,6 +2,12 @@
 use shared::{
     check_access, compute_privacy_intervention, detect_exploitation, minimize_to_need_to_know,
     AccessDecision, ConsentRecord, PrivacyInterventionRecord, PrivacyMonitoringResult, ALL_FIELDS,
+    // onboarding protection & barrier gaming
+    evaluate_onboarding_fairness, verify_requirement_authenticity, assess_admission_equity,
+    monitor_onboarding_access_patterns, audit_onboarding_process, compute_onboarding_protection,
+    restore_fair_onboarding_access, is_onboarding_restoration_eligible, OnboardingFairness,
+    VerificationAuthenticity, AdmissionEquity, AccessMonitoringRecord, OnboardingAuditRecord,
+    OnboardingProtectionRecord, ONBOARDING_RESTORATION_COOLDOWN_SECS,
 };
 use soroban_sdk::{
     contract, contractclient, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
@@ -48,6 +54,13 @@ pub enum DataKey {
     AccessLog(Address, Address),
     /// Automatic-isolation flag set when exploitative access is detected.
     PrivacyIsolated(Address),
+    // ── Onboarding Fairness and Barrier Gaming (#learner-onboarding) ───
+    OnboardingFairnessRecord(Address),
+    VerificationAuthenticityRecord(Address),
+    AdmissionEquityRecord(Address),
+    AccessMonitoring(Address),
+    OnboardingAudit(Address),
+    OnboardingProtection(Address),
 }
 
 /// Maximum length of the rolling per-(accessor,subject) access log kept for
@@ -420,6 +433,169 @@ impl KycRegistry {
         {
             panic!("KYC_OPERATOR role required");
         }
+    }
+
+    // ─── Onboarding Fairness & Barrier Gaming Protection ───────────────
+
+    /// Implement onboarding fairness with equal access and barrier manipulation prevention systems.
+    pub fn ensure_onboarding_fairness(
+        env: Env,
+        user: Address,
+        barrier_count: u32,
+        artificial_delays: u32,
+        requirement_multiplier: u32,
+    ) -> OnboardingFairness {
+        let fairness = evaluate_onboarding_fairness(
+            barrier_count,
+            artificial_delays,
+            requirement_multiplier,
+            env.ledger().timestamp(),
+        );
+
+        let key = DataKey::OnboardingFairnessRecord(user.clone());
+        env.storage().persistent().set(&key, &fairness);
+
+        if !fairness.is_fair {
+            env.events().publish(
+                (symbol_short!("onb_fair"), Symbol::new(&env, "barrier_risk"), user),
+                fairness.barrier_risk_score,
+            );
+        }
+
+        fairness
+    }
+
+    /// Add verification authenticity with requirement validation and exploitation prevention mechanisms.
+    pub fn authenticate_verification_requirements(
+        env: Env,
+        user: Address,
+        verified_reqs: u32,
+        total_reqs: u32,
+        exploitation_signals: u32,
+    ) -> VerificationAuthenticity {
+        let authenticity = verify_requirement_authenticity(
+            verified_reqs,
+            total_reqs,
+            exploitation_signals,
+        );
+
+        let key = DataKey::VerificationAuthenticityRecord(user.clone());
+        env.storage().persistent().set(&key, &authenticity);
+
+        if authenticity.exploitation_flag {
+            env.events().publish(
+                (symbol_short!("v_auth"), Symbol::new(&env, "exploitative"), user),
+                authenticity.exploitation_risk_score,
+            );
+        }
+
+        authenticity
+    }
+
+    /// Create admission equity with fair criteria and coordination detection capabilities.
+    pub fn maintain_admission_equity(
+        env: Env,
+        operator: Address,
+        user: Address,
+        approved: u32,
+        total_applicants: u32,
+        coordination_signals: u32,
+    ) -> AdmissionEquity {
+        Self::require_operator(&env, &operator);
+
+        let equity = assess_admission_equity(approved, total_applicants, coordination_signals);
+
+        let key = DataKey::AdmissionEquityRecord(user.clone());
+        env.storage().persistent().set(&key, &equity);
+
+        if equity.coordination_detected {
+            env.events().publish(
+                (symbol_short!("adm_eq"), Symbol::new(&env, "coordination"), user),
+                equity.coordination_risk_score,
+            );
+        }
+
+        equity
+    }
+
+    /// Access monitoring for identifying manipulation and preventing barrier gaming.
+    pub fn monitor_onboarding_access(
+        env: Env,
+        user: Address,
+        attempt_count: u32,
+        rejected_count: u32,
+        freq_per_hour: u32,
+    ) -> AccessMonitoringRecord {
+        let monitoring = monitor_onboarding_access_patterns(attempt_count, rejected_count, freq_per_hour);
+
+        let key = DataKey::AccessMonitoring(user.clone());
+        env.storage().persistent().set(&key, &monitoring);
+
+        if monitoring.barrier_gaming_detected {
+            env.events().publish(
+                (symbol_short!("onb_mon"), Symbol::new(&env, "gaming"), user),
+                monitoring.manipulation_level,
+            );
+        }
+
+        monitoring
+    }
+
+    /// Audit onboarding process for fairness verification and manipulation detection.
+    pub fn audit_onboarding_fairness(
+        env: Env,
+        user: Address,
+        total_applicants: u32,
+        approved_applicants: u32,
+        manipulation_signals: u32,
+    ) -> OnboardingAuditRecord {
+        let audit = audit_onboarding_process(total_applicants, approved_applicants, manipulation_signals);
+
+        let key = DataKey::OnboardingAudit(user.clone());
+        env.storage().persistent().set(&key, &audit);
+
+        if !audit.fairness_verified {
+            env.events().publish(
+                (symbol_short!("onb_aud"), Symbol::new(&env, "unverified"), user),
+                audit.manipulation_score,
+            );
+        }
+
+        audit
+    }
+
+    /// Restore fair onboarding access for a user after intervention cooldown. Admin only.
+    pub fn restore_onboarding_fair_access(
+        env: Env,
+        admin: Address,
+        user: Address,
+    ) -> OnboardingProtectionRecord {
+        Self::require_admin(&env, &admin);
+
+        let audit: OnboardingAuditRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OnboardingAudit(user.clone()))
+            .unwrap_or(OnboardingAuditRecord {
+                audited: true,
+                fairness_verified: true,
+                manipulation_score: 0,
+                tracking_id: 1,
+                total_applicants: 0,
+                approved_applicants: 0,
+            });
+
+        let restored = restore_fair_onboarding_access(&env, &audit);
+
+        let key = DataKey::OnboardingProtection(user.clone());
+        env.storage().persistent().set(&key, &restored);
+
+        env.events().publish(
+            (symbol_short!("onb_rest"), Symbol::new(&env, "restored"), user),
+            restored.restoration_timestamp,
+        );
+
+        restored
     }
 }
 

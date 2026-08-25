@@ -16,6 +16,10 @@ use shared::{
     compute_learner_protection_intervention, is_protection_restoration_eligible,
     PredatoryBehaviorDetection, ExploitationPattern, LearnerProtectionRecord,
     VulnerabilityAssessment,
+    // metadata validation and information warfare
+    verify_information_integrity as shared_verify_information_integrity,
+    audit_information_accuracy, monitor_metadata_manipulation, restore_truth_and_correct,
+    InformationIntegrity, InformationAuditRecord, MetadataMonitoringRecord, TruthRestorationRecord,
 };
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal,
@@ -119,6 +123,12 @@ pub enum DataKey {
     /// Cached learner-protection intervention record for a mentor (reputation
     /// contract's copy; session_registry keeps a parallel copy).
     LearnerProtectionIntervention(Address),
+    // ── Session information verification and accuracy tracking ─────────
+    SessionInfoVerification(Symbol),
+    InformationAccuracyTrack(Address),
+    ReputationInfoAudit(Address),
+    MisinformationDetection(Address),
+    ReputationTruthRestoration(Address),
 }
 
 /// Cooldown before an intervened mentor's community access is eligible for
@@ -1352,6 +1362,125 @@ impl ReputationContract {
         let commitment_bytes: BytesN<32> = commitment.into();
         commitment_bytes == proof.commitment
             && proof.proof_type == Symbol::new(&env, "rating_threshold")
+    }
+
+    // ─── Session Information Verification & Accuracy Tracking ─────────
+
+    /// Verify session information authenticity and disinformation risk for a session.
+    /// Performs information integrity check using claim accuracy and source authenticity scores,
+    /// persists the resulting `InformationIntegrity` record, and emits an event if disinformation is flagged.
+    pub fn verify_session_information(
+        env: Env,
+        session_id: Symbol,
+        mentor: Address,
+        claim_accuracy_bps: u32,
+        source_authenticity_bps: u32,
+    ) -> InformationIntegrity {
+        let verified_claims = (claim_accuracy_bps / 100).min(100);
+        let total_claims = 100u32;
+        let disinfo_signals = if source_authenticity_bps < 5_000 {
+            3u32
+        } else if source_authenticity_bps < 8_000 {
+            1u32
+        } else {
+            0u32
+        };
+
+        let integrity = shared_verify_information_integrity(
+            verified_claims,
+            total_claims,
+            disinfo_signals,
+        );
+
+        let key = DataKey::SessionInfoVerification(session_id.clone());
+        env.storage().persistent().set(&key, &integrity);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
+
+        if integrity.disinformation_flag {
+            env.events().publish(
+                (symbol_short!("verify"), Symbol::new(&env, "disinfo"), (session_id, mentor, integrity.disinformation_risk_score)),
+                integrity.disinformation_risk_score,
+            );
+        }
+
+        integrity
+    }
+
+    /// Track information accuracy for a mentor across sessions and audit for misinformation.
+    /// Performs accuracy audit and metadata monitoring, persists records,
+    /// and emits events when misinformation or unverified accuracy is detected.
+    pub fn track_information_accuracy(
+        env: Env,
+        mentor: Address,
+        accurate_claims: u32,
+        total_claims: u32,
+        misinformation_signals: u32,
+    ) -> InformationAuditRecord {
+        let audit = audit_information_accuracy(total_claims, accurate_claims, misinformation_signals);
+
+        let audit_key = DataKey::ReputationInfoAudit(mentor.clone());
+        let track_key = DataKey::InformationAccuracyTrack(mentor.clone());
+        env.storage().persistent().set(&audit_key, &audit);
+        env.storage().persistent().set(&track_key, &audit);
+        env.storage().persistent().extend_ttl(&audit_key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage().persistent().extend_ttl(&track_key, TTL_THRESHOLD, TTL_BUMP);
+
+        let monitoring = monitor_metadata_manipulation(
+            misinformation_signals,
+            total_claims.saturating_sub(accurate_claims),
+        );
+        let mon_key = DataKey::MisinformationDetection(mentor.clone());
+        env.storage().persistent().set(&mon_key, &monitoring);
+        env.storage().persistent().extend_ttl(&mon_key, TTL_THRESHOLD, TTL_BUMP);
+
+        if !audit.accuracy_verified {
+            env.events().publish(
+                (symbol_short!("track"), Symbol::new(&env, "misinfo"), (mentor, audit.disinformation_score)),
+                audit.disinformation_score,
+            );
+        }
+
+        audit
+    }
+
+    /// Restore truth and accuracy for a mentor's information records after arbitration.
+    /// Requires arbitrator authorization.
+    pub fn restore_reputation_truth(
+        env: Env,
+        arbitrator: Address,
+        mentor: Address,
+    ) -> TruthRestorationRecord {
+        arbitrator.require_auth();
+
+        let audit: InformationAuditRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReputationInfoAudit(mentor.clone()))
+            .unwrap_or(InformationAuditRecord {
+                audited: true,
+                accuracy_verified: true,
+                disinformation_score: 0,
+                tracking_id: 1,
+                total_claims: 0,
+                verified_claims: 0,
+            });
+
+        let restoration = restore_truth_and_correct(&env, &audit, 9_000);
+
+        env.storage().persistent().remove(&DataKey::ReputationInfoAudit(mentor.clone()));
+        env.storage().persistent().remove(&DataKey::InformationAccuracyTrack(mentor.clone()));
+        env.storage().persistent().remove(&DataKey::MisinformationDetection(mentor.clone()));
+
+        let rest_key = DataKey::ReputationTruthRestoration(mentor.clone());
+        env.storage().persistent().set(&rest_key, &restoration);
+        env.storage().persistent().extend_ttl(&rest_key, TTL_THRESHOLD, TTL_BUMP);
+
+        env.events().publish(
+            (symbol_short!("resttruth"), Symbol::new(&env, "restored"), mentor),
+            restoration.restored_accuracy_bps,
+        );
+
+        restoration
     }
 
 }
