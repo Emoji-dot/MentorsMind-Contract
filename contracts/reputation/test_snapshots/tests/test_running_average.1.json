@@ -73,37 +73,6 @@
       ]
     ],
     [],
-    [
-      [
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
-        {
-          "function": {
-            "contract_fn": {
-              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
-              "function_name": "submit_review",
-              "args": [
-                {
-                  "symbol": "s3"
-                },
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                },
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                },
-                {
-                  "u32": 5
-                },
-                {
-                  "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
-                }
-              ]
-            }
-          },
-          "sub_invocations": []
-        }
-      ]
-    ],
     []
   ],
   "ledger": {
@@ -224,7 +193,7 @@
                       "symbol": "clustered_timing_count"
                     },
                     "val": {
-                      "u32": 2
+                      "u32": 1
                     }
                   },
                   {
@@ -232,7 +201,7 @@
                       "symbol": "repeated_pair_count"
                     },
                     "val": {
-                      "u32": 3
+                      "u32": 2
                     }
                   },
                   {
@@ -240,7 +209,7 @@
                       "symbol": "risk_score"
                     },
                     "val": {
-                      "u32": 70
+                      "u32": 0
                     }
                   },
                   {
@@ -248,7 +217,7 @@
                       "symbol": "suspicious"
                     },
                     "val": {
-                      "bool": true
+                      "bool": false
                     }
                   }
                 ]
@@ -335,7 +304,7 @@
               },
               "durability": "persistent",
               "val": {
-                "u64": "11"
+                "u64": "6"
               }
             }
           },
@@ -362,13 +331,73 @@
               },
               "durability": "persistent",
               "val": {
-                "u64": "3"
+                "u64": "2"
               }
             }
           },
           "ext": "v0"
         },
         "live_until": 1000000
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "OutcomeAuthenticityRecord"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "map": [
+                  {
+                    "key": {
+                      "symbol": "burst_count"
+                    },
+                    "val": {
+                      "u32": 1
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "distinct_evaluator_bps"
+                    },
+                    "val": {
+                      "u32": 5000
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "genuine"
+                    },
+                    "val": {
+                      "bool": true
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "manipulation_risk_score"
+                    },
+                    "val": {
+                      "u32": 15
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 4095
       },
       {
         "entry": {
@@ -393,9 +422,6 @@
               "durability": "persistent",
               "val": {
                 "vec": [
-                  {
-                    "u64": "1000000"
-                  },
                   {
                     "u64": "1000000"
                   },
@@ -702,147 +728,6 @@
               "key": {
                 "vec": [
                   {
-                    "symbol": "Review"
-                  },
-                  {
-                    "symbol": "s3"
-                  }
-                ]
-              },
-              "durability": "persistent",
-              "val": {
-                "map": [
-                  {
-                    "key": {
-                      "symbol": "authenticity_proof"
-                    },
-                    "val": {
-                      "map": [
-                        {
-                          "key": {
-                            "symbol": "commitment"
-                          },
-                          "val": {
-                            "bytes": "aa7a2d9a2178ac3afea5591839f481b528f42e9f94c5d54401124989510101e7"
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "completed_at"
-                          },
-                          "val": {
-                            "u64": "1000000"
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "learner"
-                          },
-                          "val": {
-                            "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "mentor"
-                          },
-                          "val": {
-                            "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "session_id"
-                          },
-                          "val": {
-                            "symbol": "s3"
-                          }
-                        }
-                      ]
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "comment_hash"
-                    },
-                    "val": {
-                      "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "investigation_required"
-                    },
-                    "val": {
-                      "bool": true
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "learner"
-                    },
-                    "val": {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "mentor"
-                    },
-                    "val": {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "rating"
-                    },
-                    "val": {
-                      "u32": 5
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "session_id"
-                    },
-                    "val": {
-                      "symbol": "s3"
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "stake_amount"
-                    },
-                    "val": {
-                      "i128": "0"
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "timestamp"
-                    },
-                    "val": {
-                      "u64": "1000000"
-                    }
-                  }
-                ]
-              }
-            }
-          },
-          "ext": "v0"
-        },
-        "live_until": 1000000
-      },
-      {
-        "entry": {
-          "last_modified_ledger_seq": 0,
-          "data": {
-            "contract_data": {
-              "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
-              "key": {
-                "vec": [
-                  {
                     "symbol": "ReviewRatings"
                   },
                   {
@@ -858,9 +743,6 @@
                   },
                   {
                     "u32": 4
-                  },
-                  {
-                    "u32": 5
                   }
                 ]
               }
@@ -889,7 +771,7 @@
               },
               "durability": "persistent",
               "val": {
-                "u32": 35
+                "u32": 0
               }
             }
           },
@@ -917,9 +799,6 @@
               "durability": "persistent",
               "val": {
                 "vec": [
-                  {
-                    "u64": "1000000"
-                  },
                   {
                     "u64": "1000000"
                   },
@@ -959,7 +838,7 @@
                       "symbol": "burst_count"
                     },
                     "val": {
-                      "u32": 2
+                      "u32": 1
                     }
                   },
                   {
@@ -967,7 +846,7 @@
                       "symbol": "distinct_endorser_bps"
                     },
                     "val": {
-                      "u32": 3333
+                      "u32": 5000
                     }
                   },
                   {
@@ -975,7 +854,7 @@
                       "symbol": "gaming_risk_score"
                     },
                     "val": {
-                      "u32": 65
+                      "u32": 15
                     }
                   },
                   {
@@ -983,7 +862,7 @@
                       "symbol": "genuine"
                     },
                     "val": {
-                      "bool": false
+                      "bool": true
                     }
                   }
                 ]
@@ -1055,26 +934,6 @@
               "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
               "key": {
                 "ledger_key_nonce": {
-                  "nonce": "1033654523790656264"
-                }
-              },
-              "durability": "temporary",
-              "val": "void"
-            }
-          },
-          "ext": "v0"
-        },
-        "live_until": 6311999
-      },
-      {
-        "entry": {
-          "last_modified_ledger_seq": 0,
-          "data": {
-            "contract_data": {
-              "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
-              "key": {
-                "ledger_key_nonce": {
                   "nonce": "5541220902715666415"
                 }
               },
@@ -1102,5 +961,66 @@
       }
     ]
   },
-  "events": []
+  "events": [
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "coord"
+              },
+              {
+                "symbol": "flagged"
+              }
+            ],
+            "data": {
+              "vec": [
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                },
+                {
+                  "u32": 70
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": true
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "sproof"
+              },
+              {
+                "symbol": "flagged"
+              }
+            ],
+            "data": {
+              "vec": [
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                },
+                {
+                  "u32": 65
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": true
+    }
+  ]
 }

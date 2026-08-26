@@ -28,6 +28,11 @@ use soroban_sdk::{
 use shared::{
     AdminTransfer, AdminChangeProposal, MIN_ADMIN_TIMELOCK_SECS, ADMIN_COOLING_OFF_SECS,
 };
+use shared::{
+    validate_evidence_sufficiency, detect_payment_timing_manipulation, check_multisig_threshold,
+    EvidenceSufficiency, PaymentTimingCheck, EscrowMultisigApproval,
+    EmergencyFundLock, PaymentAuditEntry,
+};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -202,6 +207,18 @@ pub struct EmergencyActionAuditEventData {
     pub success: bool,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowInvariantReport {
+    pub escrow_id: u64,
+    pub funds_conserved: bool,
+    pub transition_consistent: bool,
+    pub terminal_state_immutable: bool,
+    pub treasury_consistent: bool,
+    pub violation_count: u32,
+    pub checked_at: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Admin Events
 // ---------------------------------------------------------------------------
@@ -347,6 +364,8 @@ pub enum DataKey {
     EmergencyProposalCount,
     /// Immutable audit record for emergency action `n`.
     EmergencyAudit(u32),
+    /// Latest runtime invariant report for an escrow.
+    EscrowInvariantReport(u64),
     /// Params-hash → permanently failed (blocks retry with same parameters).
     EmergencyFailedParams(BytesN<32>),
     /// Time-bound emergency admin role.
@@ -379,6 +398,24 @@ pub enum DataKey {
     PendingAdminTransfer,
     /// Last admin change timestamp for cooling-off enforcement.
     LastAdminChange,
+    // -----------------------------------------------------------------------
+    // Payment integrity / escrow-gaming protection (#886)
+    // -----------------------------------------------------------------------
+    /// Timestamps of dispute-related actions (open, resolution attempts)
+    /// for a given escrow, used for payment-timing manipulation detection.
+    DisputeActionLog(u64),
+    /// Number of evidence items on record for a given escrow, mirrored
+    /// from the dispute-evidence contract when a secure resolution is
+    /// requested.
+    DisputeEvidenceCount(u64),
+    /// Distinct multisig approvers recorded for a pending secure
+    /// resolution of a given escrow.
+    ResolutionApprovals(u64),
+    /// Whether an escrow's funds are currently isolated due to a detected
+    /// payment-manipulation attack.
+    IsolatedEscrow(u64),
+    /// Payment audit trail for a given escrow.
+    PaymentAudit(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -1141,6 +1178,10 @@ impl EscrowContract {
             panic!("Escrow not active");
         }
 
+        if Self::is_isolated(env.clone(), escrow_id) {
+            panic!("Escrow isolated pending manual review");
+        }
+
         let admin: Address = env
             .storage()
             .persistent()
@@ -1676,6 +1717,10 @@ impl EscrowContract {
 
         if mentor_pct > 100 {
             panic!("mentor_pct must be 0–100");
+        }
+
+        if Self::is_isolated(env.clone(), escrow_id) {
+            panic!("Escrow isolated pending manual review");
         }
 
         // --- Load escrow ---
@@ -2772,6 +2817,61 @@ impl EscrowContract {
             .persistent()
             .get(&key)
             .expect("Escrow not found")
+    }
+
+    pub fn monitor_escrow_invariants(env: Env, escrow_id: u64) -> EscrowInvariantReport {
+        let escrow = Self::get_escrow(env.clone(), escrow_id);
+        let released_amount = escrow.platform_fee.saturating_add(escrow.net_amount);
+        let funds_conserved = escrow.amount >= 0
+            && escrow.platform_fee >= 0
+            && escrow.net_amount >= 0
+            && released_amount <= escrow.amount;
+        let transition_consistent = escrow.sessions_completed <= escrow.total_sessions
+            && matches!(
+                escrow.status,
+                EscrowStatus::Pending
+                    | EscrowStatus::Active
+                    | EscrowStatus::Released
+                    | EscrowStatus::Disputed
+                    | EscrowStatus::Refunded
+                    | EscrowStatus::Resolved
+            );
+        let terminal_state_immutable = match escrow.status {
+            EscrowStatus::Released | EscrowStatus::Refunded | EscrowStatus::Resolved => {
+                !env.storage().persistent().has(&DataKey::StateTransitionLock(escrow_id))
+            }
+            _ => true,
+        };
+        let treasury_consistent = if escrow.status == EscrowStatus::Released {
+            released_amount > 0 || escrow.amount == 0
+        } else {
+            escrow.platform_fee <= escrow.amount
+        };
+        let mut violation_count = 0u32;
+        for ok in [funds_conserved, transition_consistent, terminal_state_immutable, treasury_consistent] {
+            if !ok {
+                violation_count = violation_count.saturating_add(1);
+            }
+        }
+        let report = EscrowInvariantReport {
+            escrow_id,
+            funds_conserved,
+            transition_consistent,
+            terminal_state_immutable,
+            treasury_consistent,
+            violation_count,
+            checked_at: env.ledger().timestamp(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::EscrowInvariantReport(escrow_id), &report);
+        if violation_count > 0 {
+            env.events().publish(
+                (Symbol::new(&env, "Escrow"), Symbol::new(&env, "InvariantViolation")),
+                (escrow_id, violation_count),
+            );
+        }
+        report
     }
 
     /// Heuristic instruction/IO estimate for releasing `escrow_id` (the
@@ -4487,6 +4587,201 @@ impl EscrowContract {
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env))
     }
+
+    // -----------------------------------------------------------------------
+    // Payment-integrity & escrow-gaming protection (#886)
+    // -----------------------------------------------------------------------
+
+    /// Open a dispute with an explicit evidence commitment, recording the
+    /// action for payment-timing manipulation analysis. This is the
+    /// evidence-aware counterpart to `dispute` — callers that want the
+    /// stronger `resolve_dispute_secure` path should open disputes here so
+    /// the timing log is populated from the start.
+    pub fn dispute_payment(env: Env, caller: Address, escrow_id: u64, reason: Symbol) {
+        Self::dispute(env.clone(), caller, escrow_id, reason);
+        Self::_log_dispute_action(&env, escrow_id);
+    }
+
+    /// Record an approval toward the multi-signature threshold required to
+    /// resolve a disputed escrow via `resolve_dispute_secure`. Any address
+    /// may submit an approval; only distinct approvers count toward the
+    /// threshold.
+    pub fn approve_dispute_resolution(env: Env, approver: Address, escrow_id: u64) -> EscrowMultisigApproval {
+        approver.require_auth();
+        let key = DataKey::ResolutionApprovals(escrow_id);
+        let mut approvers: Vec<Address> = env.storage().persistent().get(&key).unwrap_or(Vec::new(&env));
+        if !approvers.contains(approver.clone()) {
+            approvers.push_back(approver);
+        }
+        env.storage().persistent().set(&key, &approvers);
+        env.storage().persistent().extend_ttl(&key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        check_multisig_threshold(&env, &approvers)
+    }
+
+    /// Record the number of evidence items on file for a disputed escrow
+    /// (mirrored from the dispute-evidence contract by the admin) so that
+    /// `resolve_dispute_secure` can validate evidence sufficiency on-chain.
+    pub fn record_evidence_count(env: Env, admin: Address, escrow_id: u64, evidence_count: u32) {
+        let stored_admin: Address = env.storage().persistent().get(&DataKey::Admin).expect("Not initialized");
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("Unauthorized");
+        }
+        env.storage().persistent().set(&DataKey::DisputeEvidenceCount(escrow_id), &evidence_count);
+    }
+
+    /// Resolve a disputed escrow with the enhanced anti-gaming safeguards:
+    /// requires sufficient evidence and an elapsed cooldown since the
+    /// dispute was opened (payment-timing manipulation prevention), plus a
+    /// multi-signature threshold of distinct approvals (escrow security).
+    ///
+    /// Falls back to the same split logic as `resolve_dispute`.
+    pub fn resolve_dispute_secure(env: Env, admin: Address, escrow_id: u64, mentor_pct: u32) {
+        let stored_admin: Address = env.storage().persistent().get(&DataKey::Admin).expect("Not initialized");
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("Unauthorized");
+        }
+
+        if Self::is_isolated(env.clone(), escrow_id) {
+            panic!("Escrow isolated pending manual review");
+        }
+
+        let opened_at: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DisputeActionLog(escrow_id))
+            .map(|log: Vec<u64>| log.get(0).unwrap_or(0))
+            .unwrap_or(0);
+        let evidence_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DisputeEvidenceCount(escrow_id))
+            .unwrap_or(0);
+        let evidence: EvidenceSufficiency = validate_evidence_sufficiency(&env, evidence_count, opened_at);
+        if !evidence.sufficient {
+            panic!("Insufficient evidence or cooldown not elapsed");
+        }
+
+        let approvers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ResolutionApprovals(escrow_id))
+            .unwrap_or(Vec::new(&env));
+        let approval = check_multisig_threshold(&env, &approvers);
+        if !approval.threshold_met {
+            panic!("Multi-signature approval threshold not met");
+        }
+
+        Self::_log_dispute_action(&env, escrow_id);
+        Self::resolve_dispute(env.clone(), escrow_id, mentor_pct);
+
+        let mut audit = Self::get_payment_audit(env.clone(), escrow_id);
+        audit.resolved_at = env.ledger().timestamp();
+        audit.evidence_count = evidence_count;
+        env.storage().persistent().set(&DataKey::PaymentAudit(escrow_id), &audit);
+    }
+
+    /// Isolate an escrow's funds when a payment-manipulation attack is
+    /// detected (e.g. rapid dispute/approval cycling). Isolated escrows
+    /// cannot be released or resolved until an admin calls
+    /// `recover_isolated_escrow`. Callable by the admin directly for a
+    /// known incident, or by automation after `assess_payment_manipulation_risk`
+    /// reports a suspected attack.
+    pub fn emergency_isolate_escrow(env: Env, admin: Address, escrow_id: u64, reason: Symbol) -> EmergencyFundLock {
+        let stored_admin: Address = env.storage().persistent().get(&DataKey::Admin).expect("Not initialized");
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("Unauthorized");
+        }
+
+        let lock = EmergencyFundLock {
+            isolate: true,
+            reason: reason.clone(),
+            locked_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&DataKey::IsolatedEscrow(escrow_id), &true);
+
+        env.events().publish(
+            (Symbol::new(&env, "Escrow"), Symbol::new(&env, "Isolated"), escrow_id),
+            (reason, lock.locked_at),
+        );
+
+        let mut audit = Self::get_payment_audit(env.clone(), escrow_id);
+        audit.isolated = true;
+        env.storage().persistent().set(&DataKey::PaymentAudit(escrow_id), &audit);
+
+        lock
+    }
+
+    /// Assess whether an escrow's dispute-action history shows signs of
+    /// payment-timing manipulation (e.g. rapid-fire dispute/approval
+    /// cycling), without mutating isolation state. Automation can use this
+    /// read-only check to decide whether to call `emergency_isolate_escrow`.
+    pub fn assess_payment_manipulation_risk(env: Env, escrow_id: u64) -> PaymentTimingCheck {
+        let log: Vec<u64> = env.storage().persistent().get(&DataKey::DisputeActionLog(escrow_id)).unwrap_or(Vec::new(&env));
+        detect_payment_timing_manipulation(&log)
+    }
+
+    /// Lift emergency isolation on an escrow after manual admin review,
+    /// allowing normal release/resolution flows to resume.
+    pub fn recover_isolated_escrow(env: Env, admin: Address, escrow_id: u64) {
+        let stored_admin: Address = env.storage().persistent().get(&DataKey::Admin).expect("Not initialized");
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("Unauthorized");
+        }
+        env.storage().persistent().set(&DataKey::IsolatedEscrow(escrow_id), &false);
+        env.events().publish(
+            (Symbol::new(&env, "Escrow"), Symbol::new(&env, "Recovered"), escrow_id),
+            env.ledger().timestamp(),
+        );
+    }
+
+    /// Whether an escrow's funds are currently isolated.
+    pub fn is_isolated(env: Env, escrow_id: u64) -> bool {
+        env.storage().persistent().get(&DataKey::IsolatedEscrow(escrow_id)).unwrap_or(false)
+    }
+
+    /// Return the payment-audit trail for a given escrow.
+    pub fn get_payment_audit(env: Env, escrow_id: u64) -> PaymentAuditEntry {
+        env.storage().persistent().get(&DataKey::PaymentAudit(escrow_id)).unwrap_or(PaymentAuditEntry {
+            escrow_id,
+            dispute_opened_at: 0,
+            evidence_count: 0,
+            resolved_at: 0,
+            isolated: false,
+        })
+    }
+
+    /// Internal: append the current ledger timestamp to an escrow's
+    /// dispute-action log (capped at 20 entries) for timing-manipulation
+    /// analysis, initializing the payment-audit record on first use.
+    fn _log_dispute_action(env: &Env, escrow_id: u64) {
+        let key = DataKey::DisputeActionLog(escrow_id);
+        let mut log: Vec<u64> = env.storage().persistent().get(&key).unwrap_or(Vec::new(env));
+        let now = env.ledger().timestamp();
+        let first_action = log.is_empty();
+        log.push_back(now);
+        while log.len() > 20 {
+            log.remove(0);
+        }
+        env.storage().persistent().set(&key, &log);
+        env.storage().persistent().extend_ttl(&key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+
+        if first_action {
+            env.storage().persistent().set(
+                &DataKey::PaymentAudit(escrow_id),
+                &PaymentAuditEntry {
+                    escrow_id,
+                    dispute_opened_at: now,
+                    evidence_count: 0,
+                    resolved_at: 0,
+                    isolated: false,
+                },
+            );
+        }
+    }
 }
 
 fn transition_status(
@@ -5732,6 +6027,67 @@ mod test {
         let id = f.create_escrow_at(1_000, 0);
         f.client().refund(&id);
         assert_eq!(count_standard_escrow_events(&f, "refunded"), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Payment-integrity & escrow-gaming protection (#886)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_dispute_secure_requires_evidence_and_cooldown() {
+        let f = TestFixture::setup();
+        let id = f.create_escrow_at(1_000, 0);
+        f.client().dispute_payment(&f.learner, &id, &symbol_short!("NO_SHOW"));
+
+        let approver1 = Address::generate(&f.env);
+        let approver2 = Address::generate(&f.env);
+        f.client().approve_dispute_resolution(&approver1, &id);
+        f.client().approve_dispute_resolution(&approver2, &id);
+
+        // No evidence recorded yet and cooldown hasn't elapsed -> must panic.
+        let result = f.client().try_resolve_dispute_secure(&f.admin, &id, &50u32);
+        assert!(result.is_err());
+
+        f.client().record_evidence_count(&f.admin, &id, &1u32);
+        advance_time(&f.env, 24 * 3_600 + 1);
+
+        f.client().resolve_dispute_secure(&f.admin, &id, &50u32);
+        let audit = f.client().get_payment_audit(&id);
+        assert_eq!(audit.evidence_count, 1);
+        assert!(audit.resolved_at > 0);
+    }
+
+    #[test]
+    fn test_resolve_dispute_secure_requires_multisig_threshold() {
+        let f = TestFixture::setup();
+        let id = f.create_escrow_at(1_000, 0);
+        f.client().dispute_payment(&f.learner, &id, &symbol_short!("NO_SHOW"));
+        f.client().record_evidence_count(&f.admin, &id, &1u32);
+        advance_time(&f.env, 24 * 3_600 + 1);
+
+        // Only one approver — threshold (2) not met.
+        let approver1 = Address::generate(&f.env);
+        f.client().approve_dispute_resolution(&approver1, &id);
+
+        let result = f.client().try_resolve_dispute_secure(&f.admin, &id, &50u32);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_emergency_isolate_blocks_release_and_can_be_recovered() {
+        let f = TestFixture::setup();
+        let id = f.create_escrow_at(1_000, 0);
+
+        f.client().emergency_isolate_escrow(&f.admin, &id, &Symbol::new(&f.env, "attack"));
+        assert!(f.client().is_isolated(&id));
+
+        let result = f.client().try_release_funds(&f.learner, &id);
+        assert!(result.is_err());
+
+        f.client().recover_isolated_escrow(&f.admin, &id);
+        assert!(!f.client().is_isolated(&id));
+
+        f.client().release_funds(&f.learner, &id);
     }
 }
 

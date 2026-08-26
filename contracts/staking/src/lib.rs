@@ -3184,6 +3184,108 @@ impl StakingContract {
 
         Ok(false)
     }
+
+    // ── Fair distribution & reward security (#903) ─────────────────────────
+
+    /// Calculate rewards for a staker with manipulation-resistant validation.
+    /// Rejects rewards that would exceed extraction-rate caps.
+    pub fn calculate_rewards_securely(
+        env: Env,
+        staker: Address,
+        epoch: u64,
+    ) -> Result<i128, Error> {
+        let stake = Self::get_stake(env.clone(), staker.clone())
+            .ok_or(Error::NoStakeFound)?;
+
+        let epoch_reward: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EpochReward(epoch))
+            .unwrap_or(0);
+
+        let total_staked: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalStaked)
+            .unwrap_or(0);
+
+        if total_staked <= 0 || epoch_reward <= 0 {
+            return Ok(0);
+        }
+
+        // Check extraction rate
+        if exceeds_extraction_rate(epoch_reward, total_staked) {
+            return Err(Error::InvalidAmount);
+        }
+
+        // Pro-rata share
+        let share = (stake.amount as i128)
+            .checked_mul(epoch_reward)
+            .ok_or(Error::Overflow)?
+            .checked_div(total_staked)
+            .ok_or(Error::Overflow)?;
+
+        Ok(share)
+    }
+
+    /// Detect coordinated staking patterns that suggest manipulation.
+    pub fn detect_staking_coordination(
+        env: Env,
+        staker: Address,
+    ) -> bool {
+        let action_log: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakerActionLog(staker))
+            .unwrap_or(Vec::new(&env));
+
+        let mut timestamps: std::vec::Vec<u64> = std::vec::Vec::new();
+        for i in 0..action_log.len() {
+            if let Some(ts) = action_log.get(i) {
+                timestamps.push(ts);
+            }
+        }
+
+        detect_coordinated_timing(&timestamps, MIN_POSITION_DELTA_SECS)
+    }
+
+    /// Audit tokenomics fairness for a given epoch.
+    pub fn audit_epoch_fairness(
+        env: Env,
+        epoch: u64,
+    ) -> TokenomicsAuditResult {
+        let epoch_reward: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EpochReward(epoch))
+            .unwrap_or(0);
+
+        let total_staked: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalStaked)
+            .unwrap_or(0);
+
+        let extraction_rate = if total_staked > 0 {
+            ((epoch_reward as u64 * 10_000) / total_staked as u64) as u32
+        } else {
+            0
+        };
+
+        let sustainability = if total_staked > 0 {
+            ((epoch_reward as u64 * 100) / total_staked as u64) as u32
+        } else {
+            0
+        };
+
+        TokenomicsAuditResult {
+            fair: extraction_rate <= MAX_EXTRACTION_RATE_BPS
+                && sustainability >= MIN_SUSTAINABILITY_RATIO,
+            extraction_rate_bps: extraction_rate,
+            sustainability_ratio: sustainability,
+            flagged_stakers: 0,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

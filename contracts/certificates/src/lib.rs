@@ -2,7 +2,17 @@
 use shared::{authenticate_learning_outcomes, OutcomeAuthenticity};
 use soroban_sdk::{
     contract, contractclient, contractimpl, contracttype, symbol_short, vec, Address, Env, Symbol,
-    Vec,
+    Vec, Map, BytesN,
+    xdr::ToXdr,
+    IntoVal,
+};
+
+use shared::{
+    verify_assessment_authenticity, ValidationResult, AuthenticityVerification,
+    calculate_grade_distribution, detect_grade_inflation, GradeDistributionStats,
+    verify_recording_integrity, IntegrityVerificationResult,
+    record_grade_correction, GradeCorrectionRecord,
+    ValidationSource,
 };
 
 use shared::{
@@ -40,6 +50,14 @@ pub struct CertificateRecord {
     pub revoked: bool,
     pub session_id: Symbol,
     pub rating_at_time: u64,
+    // Assessment validation (#911, #914)
+    pub assessment_id: Option<Symbol>,
+    pub assessment_verified: bool,
+    pub assessment_authenticity_score: u32,
+    pub peer_review_consensus: bool,
+    // Credential integrity
+    pub integrity_hash: BytesN<32>,
+    pub correction_history: Vec<Symbol>, // GradeCorrection IDs
     pub authenticity_verified: bool,
     pub gaming_detection_score: u32,
 }
@@ -94,6 +112,10 @@ pub enum DataKey {
     EscrowContract,
     ReputationContract,
     SessionRegistry,
+    // Assessment validation (#911)
+    AssessmentValidation(Symbol),
+    CertificateIntegrity(u64),
+    GradeCorrectionRef(Symbol),
     /// Issuance timestamps for a given (mentor, skill) combination, used to
     /// score learning-outcome authenticity (#outcome-authenticity).
     MentorSkillCertLog(Address, Symbol),
@@ -103,6 +125,10 @@ pub enum DataKey {
     MentorSkillDistinctLearners(Address, Symbol),
     /// Cached outcome-authenticity assessment for a (mentor, skill) pair.
     OutcomeAuthenticityRecord(Address, Symbol),
+    /// Session-completion log per learner (learning-fraud prevention).
+    SessionCompletionLog(Address),
+    /// Cached learning-authenticity report per learner.
+    AuthenticityReport(Address),
 }
 
 #[contractclient(name = "EscrowClient")]
@@ -113,6 +139,9 @@ pub trait EscrowTrait {
 #[contractclient(name = "ReputationClient")]
 pub trait ReputationTrait {
     fn get_mentor_rating(env: Env, mentor: Address) -> (u64, u64);
+    fn get_inflation_detection(env: Env, mentor: Address) -> Option<shared::InflationDetectionResult>;
+    fn get_grade_distribution(env: Env, mentor: Address) -> shared::GradeDistributionStats;
+    fn get_burnout_assessment(env: Env, mentor: Address) -> Option<shared::BurnoutRiskAssessment>;
 }
 
 #[contractclient(name = "SessionRegistryClient")]
@@ -235,6 +264,12 @@ impl Certificates {
             revoked: false,
             session_id: session_id.clone(),
             rating_at_time: rating,
+            assessment_id: None,
+            assessment_verified: false,
+            assessment_authenticity_score: 0,
+            peer_review_consensus: false,
+            integrity_hash: BytesN::from_array(&env, &[0u8; 32]),
+            correction_history: Vec::new(&env),
             authenticity_verified: authenticity.is_authentic,
             gaming_detection_score: gaming_detection.confidence_score,
         };
@@ -256,6 +291,36 @@ impl Certificates {
         );
 
         id
+    }
+
+    /// Detect gaming patterns for a learner at issuance time. Delegates to
+    /// the shared `AssessmentSecurity` validator using the learner's
+    /// recorded assessment history (empty when no history is tracked yet,
+    /// which yields a conservative non-gaming result).
+    fn detect_assessment_gaming(
+        env: &Env,
+        learner: &Address,
+        issued_at: u64,
+    ) -> shared::GamingDetectionResult {
+        let historical_data: Vec<shared::AssessmentRecord> = Vec::new(env);
+        AssessmentSecurity::detect_gaming_patterns(
+            env,
+            learner,
+            symbol_short!("cert"),
+            issued_at,
+            0,
+            &historical_data,
+        )
+    }
+
+    /// Verify authentic progression for a learner. Delegates to the shared
+    /// `AssessmentSecurity` progression validator.
+    fn verify_authentic_progression(
+        env: &Env,
+        learner: &Address,
+    ) -> shared::ProgressAuthenticityRecord {
+        let assessment_history: Vec<shared::AssessmentRecord> = Vec::new(env);
+        AssessmentSecurity::validate_authentic_progression(env, learner, &assessment_history)
     }
 
     fn record_achievement_measurement(
@@ -362,6 +427,283 @@ impl Certificates {
         load_certs(&env, &DataKey::SkillCerts(skill))
     }
 
+    // ── Assessment Validation (#911) ───────────────────────────────────────────
+
+    /// Submit assessment validation results for a certificate
+    pub fn submit_assessment_validation(
+        env: Env,
+        admin: Address,
+        assessment_id: Symbol,
+        learner: Address,
+        mentor: Address,
+        skill: Symbol,
+        validation_results: Vec<ValidationResult>,
+    ) -> AuthenticityVerification {
+        admin.require_auth();
+        
+        let verification = verify_assessment_authenticity(&env, &assessment_id, &validation_results, 3);
+        
+        env.storage().persistent().set(&DataKey::AssessmentValidation(assessment_id.clone()), &verification);
+        
+        env.events().publish(
+            (symbol_short!("cert"), Symbol::new(&env, "assessment_validated")),
+            (assessment_id, learner, mentor, verification.consensus_achieved, verification.consensus_confidence_bps),
+        );
+        
+        verification
+    }
+
+    /// Issue certificate with assessment validation
+    pub fn issue_cert_with_assessment(
+        env: Env,
+        learner: Address,
+        mentor: Address,
+        skill: Symbol,
+        session_id: Symbol,
+        issued_at: u64,
+        assessment_id: Symbol,
+    ) -> u64 {
+        let backend: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Backend)
+            .expect("not initialized");
+        backend.require_auth();
+
+        // 1. Verify escrow is Released
+        let escrow_addr: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowContract)
+            .expect("escrow contract not set");
+        let escrow_client = EscrowClient::new(&env, &escrow_addr);
+        let escrow = escrow_client.get_escrow_by_session(&session_id);
+        if escrow.status != shared::EscrowStatus::Released {
+            panic!("escrow not released");
+        }
+
+        // 2. Verify mentor rating >= MIN_CERT_RATING
+        let reputation_addr: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ReputationContract)
+            .expect("reputation contract not set");
+        let reputation_client = ReputationClient::new(&env, &reputation_addr);
+        let (rating, _count) = reputation_client.get_mentor_rating(&mentor);
+        if rating < MIN_CERT_RATING {
+            panic!("mentor rating too low");
+        }
+
+        // 3. Check for grade inflation
+        let inflation: Option<shared::InflationDetectionResult> = reputation_client.get_inflation_detection(&mentor);
+        if let Some(inf) = inflation {
+            if inf.inflation_detected && inf.confidence_level > 7000 {
+                panic!("grade inflation detected for mentor");
+            }
+        }
+
+        // 4. Verify learner completed >= MIN_SESSIONS_COMPLETED sessions
+        let session_registry_addr: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SessionRegistry)
+            .expect("session registry not set");
+        let session_client = SessionRegistryClient::new(&env, &session_registry_addr);
+        let sessions = session_client.get_sessions_by_learner(&learner);
+        if sessions.len() < MIN_SESSIONS_COMPLETED {
+            panic!("insufficient sessions completed");
+        }
+
+        // 5. Verify assessment authenticity
+        let assessment_verification: Option<AuthenticityVerification> = env.storage().persistent().get(&DataKey::AssessmentValidation(assessment_id.clone()));
+        let verification = assessment_verification.expect("assessment validation not found");
+        if !verification.consensus_achieved || verification.consensus_confidence_bps < 7000 {
+            panic!("assessment not validated");
+        }
+
+        let id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Counter)
+            .unwrap_or(0)
+            + 1;
+        env.storage().persistent().set(&DataKey::Counter, &id);
+
+        // Compute integrity hash
+        let mut integrity_bytes = soroban_sdk::Bytes::new(&env);
+        integrity_bytes.append(&id.to_be_bytes().into_val(&env));
+        integrity_bytes.append(&learner.clone().to_xdr(&env));
+        integrity_bytes.append(&mentor.clone().to_xdr(&env));
+        integrity_bytes.append(&skill.clone().to_xdr(&env));
+        integrity_bytes.append(&session_id.clone().to_xdr(&env));
+        integrity_bytes.append(&soroban_sdk::Bytes::from_array(&env, &issued_at.to_be_bytes()));
+        integrity_bytes.append(&soroban_sdk::Bytes::from_array(&env, &rating.to_be_bytes()));
+        let integrity_hash: BytesN<32> = env.crypto().sha256(&integrity_bytes).into();
+
+        let cert = CertificateRecord {
+            id,
+            learner: learner.clone(),
+            mentor: mentor.clone(),
+            skill: skill.clone(),
+            sessions_completed: sessions.len(),
+            issued_at,
+            revoked: false,
+            session_id: session_id.clone(),
+            rating_at_time: rating,
+            assessment_id: Some(assessment_id.clone()),
+            assessment_verified: true,
+            assessment_authenticity_score: verification.consensus_confidence_bps,
+            peer_review_consensus: verification.consensus_achieved,
+            integrity_hash: integrity_hash.clone(),
+            correction_history: Vec::new(&env),
+            authenticity_verified: verification.consensus_achieved,
+            gaming_detection_score: 0,
+        };
+
+        env.storage().persistent().set(&DataKey::Cert(id), &cert);
+        env.storage().persistent().set(&DataKey::CertificateIntegrity(id), &integrity_hash);
+        push_id(&env, &DataKey::LearnerCerts(learner.clone()), id);
+        push_id(&env, &DataKey::SkillCerts(skill.clone()), id);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "CertificateEarned"),
+                learner,
+            ),
+            (mentor, session_id, skill, rating, assessment_id),
+        );
+
+        id
+    }
+
+    // ── Credential Integrity & Grade Correction (#911) ──────────────────────────
+
+    /// Apply grade correction to certificate (retroactive adjustment)
+    pub fn apply_grade_correction(
+        env: Env,
+        admin: Address,
+        cert_id: u64,
+        mentor: Address,
+        learner: Address,
+        session_id: Symbol,
+        original_grade: u32,
+        corrected_grade: u32,
+        reason: Symbol,
+    ) -> GradeCorrectionRecord {
+        admin.require_auth();
+
+        let mut cert: CertificateRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Cert(cert_id))
+            .expect("cert not found");
+
+        if cert.mentor != mentor || cert.learner != learner {
+            panic!("certificate mismatch");
+        }
+
+        let correction = record_grade_correction(&env, &mentor, &learner, &session_id, original_grade, corrected_grade, reason, &admin);
+        
+        cert.correction_history.push_back(correction.correction_id.clone());
+        cert.integrity_hash = {
+            let mut bytes = soroban_sdk::Bytes::new(&env);
+            bytes.append(&cert.integrity_hash.clone().into());
+            bytes.append(&correction.correction_id.clone().to_xdr(&env));
+            env.crypto().sha256(&bytes).into()
+        };
+        cert.rating_at_time = corrected_grade as u64;
+
+        env.storage().persistent().set(&DataKey::Cert(cert_id), &cert);
+        env.storage().persistent().set(&DataKey::CertificateIntegrity(cert_id), &cert.integrity_hash);
+        env.storage().persistent().set(&DataKey::GradeCorrectionRef(correction.correction_id.clone()), &correction);
+
+        env.events().publish(
+            (symbol_short!("cert"), Symbol::new(&env, "grade_corrected")),
+            (cert_id, mentor, learner, original_grade, corrected_grade),
+        );
+
+        correction
+    }
+
+    /// Verify certificate integrity (check for tampering)
+    pub fn verify_certificate_integrity(env: Env, cert_id: u64) -> (bool, Option<IntegrityVerificationResult>) {
+        let cert: CertificateRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Cert(cert_id))
+            .expect("cert not found");
+        
+        let stored_hash: BytesN<32> = env.storage().persistent().get(&DataKey::CertificateIntegrity(cert_id)).unwrap_or(cert.integrity_hash.clone());
+        
+        // Recompute expected hash
+        let mut expected_bytes = soroban_sdk::Bytes::new(&env);
+        expected_bytes.append(&cert_id.to_be_bytes().into_val(&env));
+        expected_bytes.append(&cert.learner.to_xdr(&env));
+        expected_bytes.append(&cert.mentor.to_xdr(&env));
+        expected_bytes.append(&cert.skill.to_xdr(&env));
+        expected_bytes.append(&cert.session_id.to_xdr(&env));
+        expected_bytes.append(&soroban_sdk::Bytes::from_array(&env, &cert.issued_at.to_be_bytes()));
+        expected_bytes.append(&soroban_sdk::Bytes::from_array(&env, &cert.rating_at_time.to_be_bytes()));
+        let expected_hash: BytesN<32> = env.crypto().sha256(&expected_bytes).into();
+        
+        let is_valid = stored_hash == expected_hash && stored_hash == cert.integrity_hash && !cert.revoked;
+        
+        // Also verify assessment if present
+        let mut assessment_valid = true;
+        if let Some(assessment_id) = cert.assessment_id {
+            let verification: Option<AuthenticityVerification> = env.storage().persistent().get(&DataKey::AssessmentValidation(assessment_id));
+            if let Some(v) = verification {
+                assessment_valid = v.consensus_achieved && v.consensus_confidence_bps >= 7000;
+            } else {
+                assessment_valid = false;
+            }
+        }
+        
+        (is_valid && assessment_valid, None)
+    }
+
+    /// Get certificate correction history
+    pub fn get_correction_history(env: Env, cert_id: u64) -> Vec<GradeCorrectionRecord> {
+        let cert: CertificateRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Cert(cert_id))
+            .expect("cert not found");
+        
+        let mut corrections = Vec::new(&env);
+        for corr_id in cert.correction_history.iter() {
+            if let Some(corr) = env.storage().persistent().get(&DataKey::GradeCorrectionRef(corr_id)) {
+                corrections.push_back(corr);
+            }
+        }
+        corrections
+    }
+
+    /// Revoke certificate with integrity protection
+    pub fn revoke_cert_with_integrity(env: Env, admin: Address, cert_id: u64, reason: Symbol) {
+        admin.require_auth();
+        
+        let mut cert: CertificateRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Cert(cert_id))
+            .expect("cert not found");
+        
+        // Verify integrity before revoking
+        let (is_valid, _) = Self::verify_certificate_integrity(env.clone(), cert_id);
+        if !is_valid {
+            panic!("certificate integrity compromised");
+        }
+        
+        cert.revoked = true;
+        env.storage().persistent().set(&DataKey::Cert(cert_id), &cert);
+        
+        env.events().publish(
+            (symbol_short!("cert_rev"), cert.learner),
+            (cert_id, reason),
+        );
+    }
+
     // =========================================================================
     // LEARNING FRAUD PREVENTION FUNCTIONS
     // =========================================================================
@@ -381,7 +723,6 @@ impl Certificates {
             .get(&DataKey::Backend)
             .expect("not initialized");
         backend.require_auth();
-
         let record = SessionCompletionRecord {
             learner: learner.clone(),
             session_id: session_id.clone(),
@@ -395,12 +736,12 @@ impl Certificates {
         let mut completion_log: Vec<SessionCompletionRecord> = env
             .storage()
             .persistent()
-            .get(&DataKey::SessionCompletionLog(&learner))
+            .get(&DataKey::SessionCompletionLog(learner.clone()))
             .unwrap_or_else(|| vec![&env]);
         completion_log.push_back(record);
         env.storage()
             .persistent()
-            .set(&DataKey::SessionCompletionLog(&learner), &completion_log);
+            .set(&DataKey::SessionCompletionLog(learner.clone()), &completion_log);
     }
 
     /// Detect cross-session fraud (answer sharing, coordination, knowledge transfer gaming)
@@ -420,7 +761,7 @@ impl Certificates {
         let completion_log: Vec<SessionCompletionRecord> = env
             .storage()
             .persistent()
-            .get(&DataKey::SessionCompletionLog(&learner))
+            .get(&DataKey::SessionCompletionLog(learner.clone()))
             .unwrap_or_else(|| vec![&env]);
 
         if completion_log.len() < 2 {
@@ -443,7 +784,7 @@ impl Certificates {
                 if let Some(current_session_mentor) = env
                     .storage()
                     .persistent()
-                    .get::<_, Address>(&DataKey::SessionCompletionLog(&learner))
+                    .get::<_, Address>(&DataKey::SessionCompletionLog(learner.clone()))
                 {
                     if comp_record.mentor == current_session_mentor {
                         same_mentor_sessions += 1;
@@ -484,7 +825,7 @@ impl Certificates {
         let completion_log: Vec<SessionCompletionRecord> = env
             .storage()
             .persistent()
-            .get(&DataKey::SessionCompletionLog(&learner))
+            .get(&DataKey::SessionCompletionLog(learner.clone()))
             .unwrap_or_else(|| vec![&env]);
 
         let total_sessions = completion_log.len() as u32;
@@ -536,7 +877,7 @@ impl Certificates {
         // Store authenticity report
         env.storage()
             .persistent()
-            .set(&DataKey::AuthenticityReport(&learner), &report);
+            .set(&DataKey::AuthenticityReport(learner.clone()), &report);
 
         Ok(report)
     }
@@ -557,13 +898,13 @@ impl Certificates {
         let log1: Vec<SessionCompletionRecord> = env
             .storage()
             .persistent()
-            .get(&DataKey::SessionCompletionLog(&learner1))
+            .get(&DataKey::SessionCompletionLog(learner1.clone()))
             .unwrap_or_else(|| vec![&env]);
 
         let log2: Vec<SessionCompletionRecord> = env
             .storage()
             .persistent()
-            .get(&DataKey::SessionCompletionLog(&learner2))
+            .get(&DataKey::SessionCompletionLog(learner2.clone()))
             .unwrap_or_else(|| vec![&env]);
 
         // Check for overlapping sessions with same mentor and skill
@@ -574,8 +915,7 @@ impl Certificates {
                 {
                     let time_diff = session1
                         .completion_time
-                        .saturating_sub(session2.completion_time)
-                        .abs() as u64;
+                        .saturating_sub(session2.completion_time);
 
                     // Sessions with identical mentor/skill completed within 1 hour
                     // is suspicious
@@ -605,7 +945,7 @@ impl Certificates {
         let report: Option<LearningAuthenticityReport> = env
             .storage()
             .persistent()
-            .get(&DataKey::AuthenticityReport(&learner));
+            .get(&DataKey::AuthenticityReport(learner.clone()));
 
         if let Some(auth_report) = report {
             // Assessment is valid if authenticity score is above threshold
@@ -645,7 +985,7 @@ impl Certificates {
         let history: Vec<SessionCompletionRecord> = env
             .storage()
             .persistent()
-            .get(&DataKey::SessionCompletionLog(&learner))
+            .get(&DataKey::SessionCompletionLog(learner.clone()))
             .unwrap_or_else(|| vec![&env]);
         history
     }
@@ -658,7 +998,7 @@ impl Certificates {
         if let Some(report) = env
             .storage()
             .persistent()
-            .get::<_, LearningAuthenticityReport>(&DataKey::AuthenticityReport(&learner))
+            .get::<_, LearningAuthenticityReport>(&DataKey::AuthenticityReport(learner.clone()))
         {
             report.authenticity_score_bps
         } else {

@@ -175,8 +175,9 @@ pub use storage::{
 };
 pub use storage::{EternalStorage, InstanceKey, PersistentKey, StorageType, TempKey};
 pub use storage_compatibility::{
-    CompatibilityError, CompatibilityReport, CompatibilityValidator, GradualMigrationStatus,
-    MigrationScript, StorageField, StorageFieldType, StorageLayoutSchema, StorageVersion,
+    detect_layout_tampering, CompatibilityError, CompatibilityReport, CompatibilityValidator,
+    GradualMigrationStatus, MigrationScript, StorageField, StorageFieldType, StorageLayoutSchema,
+    StorageVersion,
 };
 pub use threat_intelligence::{
     assess_delegation_concentration, assess_review_quality, assess_token_velocity,

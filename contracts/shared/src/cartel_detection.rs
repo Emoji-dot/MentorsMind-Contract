@@ -180,7 +180,7 @@ impl CartelDetection {
             if slot.price >= premium_threshold_price {
                 let mut found = false;
                 for (idx, (mentor, count)) in mentor_slot_count.iter().enumerate() {
-                    if mentor == &slot.mentor {
+                    if mentor == slot.mentor {
                         // Update count (simplified)
                         found = true;
                         break;
