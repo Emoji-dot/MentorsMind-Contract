@@ -68,6 +68,13 @@ pub mod platform_interoperability;
 pub mod identity_verification;
 pub mod availability_pricing_protection;
 
+// First-increment building blocks for #872 (privacy-preserving audit
+// commitments), #873 (proof-of-personhood attestations), and #874
+// (cryptographic algorithm agility) — see each module's doc comment for
+// what is and isn't in scope for this increment.
+pub mod zk_audit;
+pub mod proof_of_personhood;
+pub mod post_quantum;
 // Session protection, attack detection, and service continuity (#901)
 pub mod session_protection;
 pub mod attack_detection;
@@ -137,9 +144,13 @@ pub use storage::{
     StorageIntegrityRecord, StorageNamespace, StorageSecurityError, STORAGE_DERIVE_CTX,
 };
 pub use storage_compatibility::{
-    CompatibilityError, CompatibilityReport, CompatibilityValidator, GradualMigrationStatus,
-    MigrationScript, StorageField, StorageFieldType, StorageLayoutSchema, StorageVersion,
+    detect_layout_tampering, CompatibilityError, CompatibilityReport, CompatibilityValidator,
+    GradualMigrationStatus, MigrationScript, StorageField, StorageFieldType, StorageLayoutSchema,
+    StorageVersion,
 };
+pub use zk_audit::{commit_audit_entry, verify_audit_commitment, AuditCommitment};
+pub use proof_of_personhood::{create_attestation, is_attestation_valid, PersonhoodAttestation};
+pub use post_quantum::{is_algorithm_supported, SignatureAlgorithm};
 pub use ttl_utils::{
     next_bump_interval, should_bump_ttl, AlertLevel, DataBackupRecord, DataDependencyTracker,
     DependencyItem, ExpirationMonitor, TTLAlert, TTLManager, TTLRecoveryManager,
