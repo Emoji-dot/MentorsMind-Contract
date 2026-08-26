@@ -45,6 +45,8 @@ pub mod scalability_protection;
 pub mod learner_protection;
 pub mod metadata_validation;
 pub mod onboarding_protection;
+pub mod market_control_protection;
+pub mod algorithm_transparency;
 
 // Security integrity system modules (added on main; module declarations
 // restored here — main shipped the files without registering them).
@@ -52,6 +54,44 @@ pub mod assessment_security;
 pub mod transfer_security;
 pub mod ml_security;
 pub mod cartel_detection;
+
+// Fraud/security protection modules covering skill verification (#891),
+// escrow payment integrity (#886), scheduling integrity (#884), and
+// cross-session data isolation (#899).
+pub mod skill_verification;
+pub mod payment_integrity;
+pub mod scheduling_integrity;
+pub mod session_privacy;
+
+// IP Protection and Content Security modules
+pub mod content_authentication;
+pub mod ip_protection;
+pub mod content_licensing;
+pub mod plagiarism_detection;
+pub mod platform_interoperability;
+pub mod identity_verification;
+pub mod availability_pricing_protection;
+
+// First-increment building blocks for #872 (privacy-preserving audit
+// commitments), #873 (proof-of-personhood attestations), and #874
+// (cryptographic algorithm agility) — see each module's doc comment for
+// what is and isn't in scope for this increment.
+pub mod zk_audit;
+pub mod proof_of_personhood;
+pub mod post_quantum;
+// Session protection, attack detection, and service continuity (#901)
+pub mod session_protection;
+pub mod attack_detection;
+pub mod service_continuity;
+
+// Quality assurance, standards compliance, and performance tracking (#902)
+pub mod quality_assurance;
+
+// Tokenomics protection and economic monitoring (#903)
+pub mod tokenomics_protection;
+
+// Account security and cross-platform fraud detection (#904)
+pub mod account_security;
 
 pub use admin::{
     AdminChangeProposal, AdminTransfer, ADMIN_COOLING_OFF_SECS, MIN_ADMIN_TIMELOCK_SECS,
@@ -108,9 +148,13 @@ pub use storage::{
     StorageIntegrityRecord, StorageNamespace, StorageSecurityError, STORAGE_DERIVE_CTX,
 };
 pub use storage_compatibility::{
-    CompatibilityError, CompatibilityReport, CompatibilityValidator, GradualMigrationStatus,
-    MigrationScript, StorageField, StorageFieldType, StorageLayoutSchema, StorageVersion,
+    detect_layout_tampering, CompatibilityError, CompatibilityReport, CompatibilityValidator,
+    GradualMigrationStatus, MigrationScript, StorageField, StorageFieldType, StorageLayoutSchema,
+    StorageVersion,
 };
+pub use zk_audit::{commit_audit_entry, verify_audit_commitment, AuditCommitment};
+pub use proof_of_personhood::{create_attestation, is_attestation_valid, PersonhoodAttestation};
+pub use post_quantum::{is_algorithm_supported, SignatureAlgorithm};
 pub use ttl_utils::{
     next_bump_interval, should_bump_ttl, AlertLevel, DataBackupRecord, DataDependencyTracker,
     DependencyItem, ExpirationMonitor, TTLAlert, TTLManager, TTLRecoveryManager,
@@ -259,6 +303,125 @@ pub use transfer_security::{
     CredentialAuthenticityProof, CredentialFraudType, CredentialTransfer,
     CreditInflationRecord, CrossPlatformVerification, FraudDetectionResult,
     TransferIntegrityResult, TransferSecurity, TransferSecurityError,
+};
+pub use skill_verification::{
+    score_practical_assessment, validate_peer_consensus, authenticate_external_credential,
+    evaluate_domain_governance, detect_skill_fraud, compute_recertification_due,
+    PracticalAssessment, PeerValidationRecord, ExpertiseAuthenticationRecord,
+    SpecializationGovernanceRecord, SkillFraudFlag, RecertificationSchedule,
+    MIN_PEER_VALIDATORS, PASSING_ASSESSMENT_SCORE_BPS, RECERTIFICATION_PERIOD_SECS,
+    SKILL_FRAUD_RISK_THRESHOLD, MIN_SESSIONS_FOR_EXPERTISE_TRACKING,
+    EXPERTISE_UNDERPERFORMANCE_THRESHOLD_BPS,
+};
+pub use payment_integrity::{
+    validate_evidence_sufficiency, verify_completion_criteria,
+    detect_payment_timing_manipulation, check_multisig_threshold, compute_emergency_isolation,
+    EvidenceSufficiency, PaymentTimingCheck, EscrowMultisigApproval, EmergencyFundLock,
+    PaymentAuditEntry, MIN_EVIDENCE_ITEMS, MIN_DISPUTE_COOLDOWN_SECS,
+    ESCROW_MULTISIG_THRESHOLD, PAYMENT_TIMING_RISK_THRESHOLD, RAPID_ACTION_WINDOW_SECS,
+};
+pub use scheduling_integrity::{
+    compute_availability_commitment, verify_availability_commitment, validate_conflict_proof,
+    compute_random_tiebreak, assign_fair_slot, detect_availability_gaming,
+    AvailabilityCommitment, ConflictProof, FairSchedulingDecision, SchedulingAuditRecord,
+    AvailabilityGamingFlag, MIN_COMMITMENT_LEAD_SECS, MAX_CONFLICT_PROOF_AGE_SECS,
+    GAMING_RISK_THRESHOLD, RAPID_AVAILABILITY_CHANGE_WINDOW_SECS,
+};
+pub use session_privacy::{
+    enforce_session_boundary, detect_cross_session_leak, contain_data_breach,
+    SessionAccessBoundary, CrossSessionLeakResult, DataBreachContainment,
+    CROSS_SESSION_MONITORING_WINDOW_SECS, LEAK_DISTINCT_SESSION_THRESHOLD,
+    BREACH_RISK_THRESHOLD,
+};
+
+// IP Protection and Content Security re-exports
+pub use content_authentication::{
+    create_watermark, verify_watermark, register_ownership, verify_ownership,
+    DigitalWatermark, AuthenticationResult, OwnershipRecord,
+    WATERMARK_VERIFICATION_THRESHOLD_BPS, MAX_WATERMARK_AGE_SECS,
+};
+pub use ip_protection::{
+    detect_unauthorized_distribution, record_usage, initiate_enforcement,
+    verify_usage_authorization, calculate_usage_statistics, determine_protection_level,
+    UnauthorizedDistributionRecord, UsageTrackingEntry, IPEnforcementRecord, UsageReport,
+    ProtectionLevel, MAX_UNAUTHORIZED_BEFORE_ESCALATION, MAX_DISTRIBUTIONS_BEFORE_LOCKDOWN,
+};
+pub use content_licensing::{
+    create_license, has_permission, record_license_usage, calculate_revenue_shares,
+    configure_revenue_share, grant_permission, validate_license, check_usage_limit,
+    License, LicenseType, Permission, RevenueShare, LicenseUsageRecord, PermissionGrant,
+    MIN_REVENUE_SHARE_BPS, MAX_REVENUE_SHARE_BPS, DEFAULT_CREATOR_SHARE_BPS,
+};
+pub use plagiarism_detection::{
+    create_fingerprint, compare_fingerprints, analyze_content_segments,
+    detect_plagiarism, create_plagiarism_report, segment_content, assess_plagiarism_risk,
+    ContentFingerprint, PlagiarismDetectionResult, ContentSegment, PlagiarismReport,
+    PLAGIARISM_CONFIDENCE_THRESHOLD_BPS, DEFAULT_SEGMENT_SIZE,
+};
+pub use platform_interoperability::{
+    create_standardized_export, detect_lock_in, record_dependency, assess_vendor_neutrality,
+    verify_compliance, define_data_portability, request_data_export, restore_competitive_choice,
+    StandardizedDataExport, DependencyRelationship, LockInDetectionResult,
+    VendorNeutralityAssessment, InteroperabilityCompliance, DataPortability,
+    LOCK_IN_THRESHOLD_BPS, VENDOR_NEUTRALITY_THRESHOLD_BPS,
+};
+pub use identity_verification::{
+    register_biometric, create_behavioral_fingerprint, detect_account_correlation,
+    detect_multi_account_abuse, propagate_penalty, verify_unique_identity,
+    generate_device_signature, assess_multi_account_risk,
+    BiometricData, BehavioralFingerprint, AccountCorrelationResult,
+    MultiAccountDetectionResult, PenaltyPropagation, DeviceSignature,
+    BIOMETRIC_CONFIDENCE_THRESHOLD_BPS, ACCOUNT_CORRELATION_THRESHOLD_BPS,
+};
+pub use availability_pricing_protection::{
+    create_availability_commitment, verify_availability_commitment,
+    detect_price_coordination, validate_dynamic_pricing, analyze_availability_pattern,
+    detect_artificial_scarcity, calculate_fair_availability_requirement,
+    enforce_fair_pricing, trigger_availability_intervention,
+    AvailabilityCommitment, PriceCoordinationFlag, DynamicPricingValidation,
+    AvailabilityPattern, BASE_HOURS_PER_WEEK, MAX_PRICE_DEVIATION_BPS,
+};
+
+// Session protection, attack detection, service continuity re-exports (#901)
+pub use session_protection::{
+    compute_disruption_score, should_protect_session, activate_backup,
+    SessionProtectionRecord, ProtectionCheckResult,
+    MAX_PROTECTED_SESSIONS, PROTECTION_CHECK_COOLDOWN_SECS, DISRUPTION_RISK_THRESHOLD_BPS,
+};
+pub use attack_detection::{
+    score_attack_event, evaluate_attack_risk,
+    AttackEvent, AttackType, AttackDetectionResult,
+    DETECTION_LOG_CAP, ATTACK_FLAG_THRESHOLD, ATTACK_DETECTION_WINDOW_SECS,
+};
+pub use service_continuity::{
+    needs_backup, is_backup_valid,
+    ContinuityBackup, ContinuityStatus,
+    MAX_BACKUP_RECORDS, BACKUP_MAX_AGE_SECS,
+};
+
+// Quality assurance re-exports (#902)
+pub use quality_assurance::{
+    compute_average_score, passes_quality_check, build_quality_metrics,
+    QualityAssessment, QualityMetrics, QualityCheckResult, QualityFailReason,
+    MIN_SESSIONS_FOR_QUALITY, QUALITY_RISK_THRESHOLD_BPS, MAX_QUALITY_RECORDS, QUALITY_WINDOW_SECS,
+};
+
+// Tokenomics protection re-exports (#903)
+pub use tokenomics_protection::{
+    exceeds_extraction_rate, sustainability_ratio_ok, detect_coordinated_timing,
+    FairDistributionCheck, ManipulationReason, TokenomicsAuditResult,
+    MAX_EXTRACTION_RATE_BPS, MIN_SUSTAINABILITY_RATIO, MAX_TRADING_VARIANCE_BPS,
+    MIN_POSITION_DELTA_SECS, GOVERNANCE_ACCUMULATION_THRESHOLD_BPS,
+    REWARD_GAMING_WINDOW_SECS, MAX_REWARD_RECORDS,
+};
+
+// Account security re-exports (#904)
+pub use account_security::{
+    is_account_locked, record_failed_attempt, record_successful_login,
+    compute_correlation_score, is_identity_match,
+    AccountSecurityRecord, CrossPlatformIdentity, FraudAlert, FraudType,
+    MAX_FAILED_ATTEMPTS, LOCKOUT_DURATION_SECS, MAX_DEVICE_SIGNATURES,
+    CROSS_PLATFORM_CORRELATION_THRESHOLD_BPS, BEHAVIORAL_WINDOW_SECS,
 };
 
 /// Economic sanity ceiling for a single financial amount (token smallest units).

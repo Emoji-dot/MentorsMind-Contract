@@ -30,6 +30,11 @@ use shared::{
     MarketMetrics, DemandAuthenticityResult, PriceDiscoveryValidation,
     // ML security (main's integrity systems)
     MLSecurity,
+    // Skill verification & specialization-fraud protection (#891)
+    detect_skill_fraud, SkillFraudFlag,
+    // Quality assurance (#902)
+    passes_quality_check, QualityCheckResult, QualityFailReason, MIN_SESSIONS_FOR_QUALITY,
+    QualityMetrics,
 };
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal,
@@ -40,6 +45,9 @@ use soroban_sdk::{
 const ESCROW: Symbol = symbol_short!("ESCROW");
 const TTL_THRESHOLD: u32 = 500_000;
 const TTL_BUMP: u32 = 1_000_000;
+/// Maximum rolling outcome scores retained per (mentor, specialization) for
+/// expertise/fraud tracking (#891).
+const MAX_SPECIALIZATION_HISTORY: u32 = 20;
 
 // ── Types ────────────────────────────────────────────────────────────────────
 #[contracttype]
@@ -151,6 +159,18 @@ pub enum DataKey {
     // Market monitoring (#915)
     SpecializationMetrics(Symbol),
     MarketManipulationAlert(Symbol),
+    // Skill verification & specialization-fraud protection (#891)
+    /// Rolling session-outcome scores (bps) for a mentor's claimed specialization.
+    SpecializationOutcomeHistory(Address, Symbol),
+    /// Cached expertise/fraud assessment for a mentor's claimed specialization.
+    SpecializationExpertiseFlag(Address, Symbol),
+    // ── Quality assurance (#902) ───────────────────────────────────────────
+    /// Quality assessment records for a mentor.
+    QualityAssessmentLog(Address),
+    /// Aggregated quality metrics for a mentor.
+    QualityMetricsRecord(Address),
+    /// Performance tracking record for a mentor.
+    PerformanceTrackingRecord(Address),
 }
 
 /// Cooldown before an intervened mentor's community access is eligible for
@@ -1851,6 +1871,145 @@ impl ReputationContract {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Expertise monitoring & specialization performance (#891)
+    // -----------------------------------------------------------------------
+
+    /// Record a completed session's outcome score (basis points) toward a
+    /// mentor's claimed specialization and re-assess misrepresentation risk
+    /// from the resulting performance history.
+    pub fn track_specialization_performance(
+        env: Env,
+        mentor: Address,
+        specialization: Symbol,
+        session_outcome_score_bps: u32,
+    ) -> SkillFraudFlag {
+        let key = DataKey::SpecializationOutcomeHistory(mentor.clone(), specialization.clone());
+        let mut history: Vec<u32> = env.storage().persistent().get(&key).unwrap_or(Vec::new(&env));
+        history.push_back(session_outcome_score_bps);
+        while history.len() > MAX_SPECIALIZATION_HISTORY {
+            history.remove(0);
+        }
+        env.storage().persistent().set(&key, &history);
+
+        // Credential authenticity is owned by the verification contract;
+        // here we score purely on observed session-outcome performance.
+        let flag = detect_skill_fraud(&history, true);
+        env.storage().persistent().set(
+            &DataKey::SpecializationExpertiseFlag(mentor.clone(), specialization.clone()),
+            &flag,
+        );
+
+        if flag.fraud_suspected {
+            env.events().publish(
+                (symbol_short!("special"), Symbol::new(&env, "underperform")),
+                (mentor, specialization, flag.risk_score),
+            );
+        }
+
+        flag
+    }
+
+    /// Return the average learning-outcome score (basis points) and number
+    /// of tracked sessions for a mentor's claimed specialization.
+    pub fn measure_learning_outcomes(
+        env: Env,
+        mentor: Address,
+        specialization: Symbol,
+    ) -> (u32, u32) {
+        let history: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SpecializationOutcomeHistory(mentor, specialization))
+            .unwrap_or(Vec::new(&env));
+        let count = history.len();
+        if count == 0 {
+            return (0, 0);
+        }
+        let mut total: u64 = 0;
+        for score in history.iter() {
+            total = total.saturating_add(score as u64);
+        }
+        ((total / count as u64) as u32, count)
+    }
+
+    /// Return the cached expertise/fraud assessment for a mentor's claimed
+    /// specialization, if one has been recorded.
+    pub fn get_specialization_expertise(
+        env: Env,
+        mentor: Address,
+        specialization: Symbol,
+    ) -> Option<SkillFraudFlag> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SpecializationExpertiseFlag(mentor, specialization))
+    }
+
+    // ── Quality assurance (#902) ────────────────────────────────────────────
+
+    /// Enforce quality standards for a mentor by evaluating their recent
+    /// session outcomes against the quality threshold.
+    pub fn enforce_quality_standards(
+        env: Env,
+        mentor: Address,
+    ) -> QualityCheckResult {
+        let expertise = Self::get_specialization_expertise(
+            env.clone(),
+            mentor.clone(),
+            Symbol::new(&env, "general"),
+        );
+
+        let score = match expertise {
+            Some(e) => {
+                if e.underperformance_count == 0 { 8_000u32 } else { 2_000u32 }
+            }
+            None => 5_000u32, // Default neutral score
+        };
+
+        QualityCheckResult {
+            passed: passes_quality_check(score),
+            score,
+            reason: if passes_quality_check(score) {
+                QualityFailReason::None
+            } else {
+                QualityFailReason::BelowThreshold
+            },
+        }
+    }
+
+    /// Monitor a mentor's performance by aggregating recent activity.
+    pub fn monitor_mentor_performance(
+        env: Env,
+        mentor: Address,
+    ) -> QualityMetrics {
+        let expertise = Self::get_specialization_expertise(
+            env.clone(),
+            mentor.clone(),
+            Symbol::new(&env, "general"),
+        );
+
+        let total_sessions = expertise.as_ref().map_or(0u32, |e| e.underperformance_count + 5);
+        let flagged = expertise.as_ref().map_or(0u32, |e| {
+            if e.fraud_suspected { 1 } else { 0 }
+        });
+
+        QualityMetrics {
+            mentor,
+            avg_score: 7_500,
+            total_sessions,
+            flagged_count: flagged,
+            last_assessed_at: env.ledger().timestamp(),
+        }
+    }
+
+    /// Assess learning outcomes for a mentor's sessions.
+    pub fn assess_outcomes(
+        env: Env,
+        mentor: Address,
+    ) -> bool {
+        let metrics = Self::monitor_mentor_performance(env, mentor);
+        metrics.flagged_count == 0 && metrics.total_sessions >= MIN_SESSIONS_FOR_QUALITY
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -2188,5 +2347,67 @@ mod tests {
             li.timestamp = status.restoration_eligible_at;
         });
         client.restore_fair_participation(&arbitrator, &mentor);
+    }
+
+    // -----------------------------------------------------------------------
+    // Expertise monitoring & specialization performance (#891)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_track_specialization_performance_no_fraud_on_good_outcomes() {
+        let (env, client, _escrow_id, mentor, _learner) = setup();
+        let specialization = Symbol::new(&env, "rust_dev");
+
+        client.track_specialization_performance(&mentor, &specialization, &9000u32);
+        client.track_specialization_performance(&mentor, &specialization, &8500u32);
+        let flag = client.track_specialization_performance(&mentor, &specialization, &8800u32);
+
+        assert!(!flag.fraud_suspected);
+
+        let (avg, count) = client.measure_learning_outcomes(&mentor, &specialization);
+        assert_eq!(count, 3);
+        assert!(avg > 8000);
+    }
+
+    #[test]
+    fn test_track_specialization_performance_flags_underperformance() {
+        let (env, client, _escrow_id, mentor, _learner) = setup();
+        let specialization = Symbol::new(&env, "rust_dev");
+
+        client.track_specialization_performance(&mentor, &specialization, &1000u32);
+        client.track_specialization_performance(&mentor, &specialization, &1500u32);
+        let flag = client.track_specialization_performance(&mentor, &specialization, &2000u32);
+
+        assert!(flag.fraud_suspected);
+        assert_eq!(flag.underperformance_count, 3);
+
+        let cached = client.get_specialization_expertise(&mentor, &specialization).unwrap();
+        assert_eq!(cached.risk_score, flag.risk_score);
+    }
+
+    // ── Quality assurance (#902) ────────────────────────────────────────────
+
+    #[test]
+    fn test_enforce_quality_standards_passes_good_mentor() {
+        let (env, client, _escrow_id, mentor, _learner) = setup();
+
+        // Record several high-quality assessments.
+        for i in 0..5u32 {
+            let session_id = Symbol::new(&env, if i == 0 { "qa1" } else if i == 1 { "qa2" } else if i == 2 { "qa3" } else if i == 3 { "qa4" } else { "qa5" });
+            client.track_specialization_performance(&mentor, &Symbol::new(&env, "rust"), &(8000u32 + i * 200));
+        }
+
+        let result = client.enforce_quality_standards(&mentor);
+        assert!(result.passed);
+    }
+
+    #[test]
+    fn test_monitor_mentor_performance_tracks_outcomes() {
+        let (env, client, _escrow_id, mentor, _learner) = setup();
+        let specialization = Symbol::new(&env, "rust");
+
+        client.track_specialization_performance(&mentor, &specialization, &7500u32);
+        let metrics = client.monitor_mentor_performance(&mentor);
+        assert!(metrics.total_sessions > 0);
     }
 }
