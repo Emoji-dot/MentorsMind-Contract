@@ -43,6 +43,8 @@ pub mod justice_protection;
 pub mod outcome_authenticity;
 pub mod scalability_protection;
 pub mod learner_protection;
+pub mod metadata_validation;
+pub mod onboarding_protection;
 pub mod market_control_protection;
 pub mod algorithm_transparency;
 
@@ -276,6 +278,21 @@ pub use learner_protection::{
     EMERGENCY_PATTERN_THRESHOLD, EMERGENCY_SUSPENSION_COOLDOWN_SECS,
     LEARNER_PROTECTION_COOLDOWN_SECS,
 };
+pub use metadata_validation::{
+    validate_metadata_authenticity, verify_information_integrity, protect_transparency,
+    monitor_metadata_manipulation, audit_information_accuracy, restore_truth_and_correct,
+    is_transparency_restoration_eligible, MetadataValidation, InformationIntegrity,
+    TransparencyProtection, MetadataMonitoringRecord, InformationAuditRecord, TruthRestorationRecord,
+    METADATA_AUTHENTICITY_THRESHOLD, DISINFORMATION_RISK_THRESHOLD,
+    TRANSPARENCY_RISK_THRESHOLD, MIN_SOURCE_CREDIBILITY_BPS, TRANSPARENCY_RESTORATION_COOLDOWN_SECS,
+};
+pub use onboarding_protection::{
+    evaluate_onboarding_fairness, verify_requirement_authenticity, assess_admission_equity,
+    monitor_onboarding_access_patterns, audit_onboarding_process, compute_onboarding_protection,
+    restore_fair_onboarding_access, is_onboarding_restoration_eligible, OnboardingFairness,
+    VerificationAuthenticity, AdmissionEquity, AccessMonitoringRecord, OnboardingAuditRecord,
+    OnboardingProtectionRecord, ONBOARDING_FAIRNESS_THRESHOLD, BARRIER_GAMING_RISK_THRESHOLD,
+    ADMISSION_COORDINATION_THRESHOLD, ONBOARDING_RESTORATION_COOLDOWN_SECS,
 pub use assessment_security::{
     AssessmentRecord, AssessmentSecurity, AssessmentSecurityError, GamingDetectionResult,
     GamingFlag, ManipulationRecord, ProgressAuthenticityRecord,

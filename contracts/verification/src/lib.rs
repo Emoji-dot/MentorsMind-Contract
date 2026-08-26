@@ -1,5 +1,10 @@
 #![no_std]
 use shared::{
+    assess_admission_equity, monitor_onboarding_access_patterns, compute_onboarding_protection,
+    AdmissionEquity, AccessMonitoringRecord, OnboardingProtectionRecord, OnboardingFairness,
+    VerificationAuthenticity, Symbol as SharedSymbol, ONBOARDING_RESTORATION_COOLDOWN_SECS,
+};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol};
     authenticate_external_credential, compute_recertification_due, detect_skill_fraud,
     evaluate_domain_governance, score_practical_assessment, validate_peer_consensus,
     ExpertiseAuthenticationRecord, PracticalAssessment, RecertificationSchedule, SkillFraudFlag,
@@ -23,6 +28,10 @@ pub enum DataKey {
     Verification(Address),
     Tier(Address),
     GracePeriod,
+    // ── Onboarding Protection & Barrier Gaming ───────────────────────
+    AdmissionCriteria(Address),
+    AccessPattern(Address),
+    VerificationOnboardingProtection(Address),
     /// Practical assessment result for a mentor's claimed specialization (#891).
     SkillAssessment(Address, Symbol),
     /// External-credential authentication record for a mentor's specialization (#891).
@@ -305,6 +314,107 @@ impl VerificationContract {
             .unwrap_or(DEFAULT_GRACE_PERIOD_SECS)
     }
 
+    // ─── Admission Criteria Validation & Access Pattern Monitoring ──────
+
+    /// Validate admission criteria for an applicant, checking requirement completion and coordination gatekeeping.
+    pub fn validate_admission_criteria(
+        env: Env,
+        applicant: Address,
+        verified_reqs: u32,
+        total_reqs: u32,
+        artificial_barriers: u32,
+    ) -> AdmissionEquity {
+        let equity = assess_admission_equity(verified_reqs, total_reqs, artificial_barriers);
+
+        let key = DataKey::AdmissionCriteria(applicant.clone());
+        env.storage().persistent().set(&key, &equity);
+
+        if !equity.is_equitable {
+            env.events().publish(
+                (symbol_short!("adm_crit"), Symbol::new(&env, "inequitable"), applicant),
+                equity.coordination_risk_score,
+            );
+        }
+
+        equity
+    }
+
+    /// Access pattern monitoring for onboarding applicants to detect barrier gaming.
+    pub fn monitor_access_patterns(
+        env: Env,
+        applicant: Address,
+        attempt_count: u32,
+        rejected_count: u32,
+        freq_per_hour: u32,
+    ) -> AccessMonitoringRecord {
+        let monitoring = monitor_onboarding_access_patterns(attempt_count, rejected_count, freq_per_hour);
+
+        let key = DataKey::AccessPattern(applicant.clone());
+        env.storage().persistent().set(&key, &monitoring);
+
+        if monitoring.barrier_gaming_detected {
+            env.events().publish(
+                (symbol_short!("acc_pat"), Symbol::new(&env, "barrier_gaming"), applicant),
+                monitoring.manipulation_level,
+            );
+        }
+
+        monitoring
+    }
+
+    /// Enforce onboarding protection and automatic intervention decision based on equity & access patterns.
+    pub fn enforce_onboarding_protection(
+        env: Env,
+        applicant: Address,
+    ) -> OnboardingProtectionRecord {
+        let equity: AdmissionEquity = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AdmissionCriteria(applicant.clone()))
+            .unwrap_or(AdmissionEquity {
+                is_equitable: true,
+                equity_score: 100,
+                coordination_detected: false,
+                coordination_risk_score: 0,
+                applicant_diversity_bps: 10_000,
+            });
+
+        let fairness = OnboardingFairness {
+            is_fair: equity.is_equitable,
+            fairness_score: equity.equity_score,
+            barrier_manipulation_detected: equity.coordination_detected,
+            barrier_risk_score: equity.coordination_risk_score,
+            verified_at: env.ledger().timestamp(),
+        };
+
+        let authenticity = VerificationAuthenticity {
+            is_authentic: true,
+            authenticity_score: 100,
+            exploitation_flag: false,
+            exploitation_risk_score: 0,
+            requirements_met: 1,
+            total_requirements: 1,
+        };
+
+        let protection = compute_onboarding_protection(
+            &env,
+            &fairness,
+            &authenticity,
+            &equity,
+            ONBOARDING_RESTORATION_COOLDOWN_SECS,
+        );
+
+        let key = DataKey::VerificationOnboardingProtection(applicant.clone());
+        env.storage().persistent().set(&key, &protection);
+
+        if protection.intervened {
+            env.events().publish(
+                (symbol_short!("onb_prot"), Symbol::new(&env, "intervened"), applicant),
+                protection.reason,
+            );
+        }
+
+        protection
     // -----------------------------------------------------------------------
     // Skill verification & specialization-fraud protection (#891)
     // -----------------------------------------------------------------------

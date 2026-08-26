@@ -18,6 +18,14 @@ use shared::{
     identify_exploitation_patterns as shared_identify_exploitation_patterns,
     compute_welfare_status as shared_compute_welfare_status,
     VulnerabilityAssessment, EmergencyIntervention, LearnerProtectionRecord,
+    // metadata validation and information warfare
+    validate_metadata_authenticity,
+    verify_information_integrity as shared_verify_information_integrity,
+    protect_transparency as shared_protect_transparency,
+    monitor_metadata_manipulation, audit_information_accuracy, restore_truth_and_correct,
+    is_transparency_restoration_eligible, MetadataValidation, InformationIntegrity,
+    TransparencyProtection, MetadataMonitoringRecord, InformationAuditRecord, TruthRestorationRecord,
+    TRANSPARENCY_RESTORATION_COOLDOWN_SECS,
     // Mentor wellness (#910)
     MentorWorkload, BurnoutRiskAssessment, SessionDifficulty, SessionDistributionRequest, FairDistributionResult,
     WellnessIntervention, EmergencyProtection,
@@ -162,6 +170,13 @@ pub enum DataKey {
     MentorEmergencyIntervention(Address),
     /// Whether a mentor is currently under an active emergency suspension.
     MentorSuspended(Address),
+    // ── Session metadata validation and information warfare ───────────────
+    SessionMetadataValidation(Symbol),
+    SessionInformationIntegrity(Symbol),
+    SessionTransparencyProtection(Symbol),
+    SessionMetadataMonitoring(Symbol),
+    SessionInformationAudit(Symbol),
+    SessionTruthRestoration(Symbol),
     // Mentor wellness (#910)
     MentorWorkload(Address),
     MentorBurnoutAssessment(Address),
@@ -1346,6 +1361,220 @@ impl SessionRegistry {
         result
     }
 
+    // ─── Session Metadata Validation & Information Warfare Protection ────
+
+    /// Validate session metadata with authenticity verification and manipulation detection systems.
+    /// Performs scoring on source count, unverified changes, and timestamp delta,
+    /// persists the resulting `MetadataValidation` record, and emits events when manipulation is detected.
+    pub fn validate_session_metadata(
+        env: Env,
+        session_id: Symbol,
+        source_count: u32,
+        unverified_changes: u32,
+        timestamp_delta: u64,
+    ) -> MetadataValidation {
+        let _session = Self::get_session(env.clone(), session_id.clone());
+
+        let validation = validate_metadata_authenticity(
+            source_count,
+            unverified_changes,
+            timestamp_delta,
+            env.ledger().timestamp(),
+        );
+
+        let key = DataKey::SessionMetadataValidation(session_id.clone());
+        env.storage().persistent().set(&key, &validation);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
+
+        if validation.manipulation_detected {
+            env.events().publish(
+                (symbol_short!("meta"), Symbol::new(&env, "manipulated"), session_id),
+                validation.manipulation_risk_score,
+            );
+        }
+
+        validation
+    }
+
+    /// Add information integrity with disinformation prevention and accuracy verification mechanisms.
+    /// Evaluates claim verification ratios and disinformation signals, persists the result,
+    /// and emits an event if a disinformation flag is triggered.
+    pub fn ensure_information_integrity(
+        env: Env,
+        session_id: Symbol,
+        verified_claims: u32,
+        total_claims: u32,
+        disinformation_signals: u32,
+    ) -> InformationIntegrity {
+        let _session = Self::get_session(env.clone(), session_id.clone());
+
+        let integrity = shared_verify_information_integrity(
+            verified_claims,
+            total_claims,
+            disinformation_signals,
+        );
+
+        let key = DataKey::SessionInformationIntegrity(session_id.clone());
+        env.storage().persistent().set(&key, &integrity);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
+
+        if integrity.disinformation_flag {
+            env.events().publish(
+                (symbol_short!("info"), Symbol::new(&env, "disinfo_flag"), session_id),
+                integrity.disinformation_risk_score,
+            );
+        }
+
+        integrity
+    }
+
+    /// Create transparency protection with information warfare resistance and truth validation capabilities.
+    /// Combines cached metadata validation and information integrity signals for a session,
+    /// persistence of transparency intervention decision, and restoration eligibility tracking.
+    pub fn protect_transparency(env: Env, session_id: Symbol) -> TransparencyProtection {
+        let _session = Self::get_session(env.clone(), session_id.clone());
+
+        let validation: MetadataValidation = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SessionMetadataValidation(session_id.clone()))
+            .unwrap_or(MetadataValidation {
+                authentic: true,
+                authenticity_score: 100,
+                manipulation_detected: false,
+                manipulation_risk_score: 0,
+                anomaly_count: 0,
+                verified_at: env.ledger().timestamp(),
+            });
+
+        let integrity: InformationIntegrity = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SessionInformationIntegrity(session_id.clone()))
+            .unwrap_or(InformationIntegrity {
+                integrity_verified: true,
+                accuracy_score: 100,
+                disinformation_flag: false,
+                disinformation_risk_score: 0,
+                verification_ratio_bps: 10_000,
+                audit_count: 0,
+            });
+
+        let protection = shared_protect_transparency(
+            &env,
+            validation,
+            integrity,
+            TRANSPARENCY_RESTORATION_COOLDOWN_SECS,
+        );
+
+        let key = DataKey::SessionTransparencyProtection(session_id.clone());
+        env.storage().persistent().set(&key, &protection);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
+
+        if protection.protected {
+            env.events().publish(
+                (symbol_short!("transp"), Symbol::new(&env, "protected"), session_id),
+                protection.combined_risk_score,
+            );
+        }
+
+        protection
+    }
+
+    /// Implement metadata monitoring with manipulation identification and misinformation detection systems.
+    pub fn monitor_metadata_changes(
+        env: Env,
+        session_id: Symbol,
+        update_frequency: u32,
+        unverified_changes: u32,
+    ) -> MetadataMonitoringRecord {
+        let _session = Self::get_session(env.clone(), session_id.clone());
+
+        let record = monitor_metadata_manipulation(update_frequency, unverified_changes);
+        let key = DataKey::SessionMetadataMonitoring(session_id.clone());
+        env.storage().persistent().set(&key, &record);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
+
+        if record.misinformation_detected {
+            env.events().publish(
+                (symbol_short!("metamon"), Symbol::new(&env, "misinfo"), session_id),
+                record.manipulation_level,
+            );
+        }
+
+        record
+    }
+
+    /// Add comprehensive information audit with accuracy verification and disinformation tracking measures.
+    pub fn audit_session_information(
+        env: Env,
+        session_id: Symbol,
+        total_claims: u32,
+        verified_claims: u32,
+        disinformation_flags: u32,
+    ) -> InformationAuditRecord {
+        let _session = Self::get_session(env.clone(), session_id.clone());
+
+        let audit = audit_information_accuracy(total_claims, verified_claims, disinformation_flags);
+        let key = DataKey::SessionInformationAudit(session_id.clone());
+        env.storage().persistent().set(&key, &audit);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
+
+        if !audit.accuracy_verified {
+            env.events().publish(
+                (symbol_short!("infoaud"), Symbol::new(&env, "unverified"), session_id),
+                audit.disinformation_score,
+            );
+        }
+
+        audit
+    }
+
+    /// Create information protection with automatic correction and truth restoration procedures.
+    /// Callable by the platform backend to restore truth for an intervened session after cooldown.
+    pub fn restore_session_truth(env: Env, session_id: Symbol) -> TruthRestorationRecord {
+        let backend = Self::require_backend(&env);
+        backend.require_auth();
+
+        let protection: TransparencyProtection = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SessionTransparencyProtection(session_id.clone()))
+            .expect("NoTransparencyProtectionRecord");
+
+        if !is_transparency_restoration_eligible(&protection, env.ledger().timestamp()) {
+            panic!("TransparencyRestorationNotEligible");
+        }
+
+        let audit: InformationAuditRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SessionInformationAudit(session_id.clone()))
+            .unwrap_or(InformationAuditRecord {
+                audited: true,
+                accuracy_verified: true,
+                disinformation_score: 0,
+                tracking_id: 1,
+                total_claims: 0,
+                verified_claims: 0,
+            });
+
+        let restoration = restore_truth_and_correct(&env, &audit, 10_000);
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::SessionTransparencyProtection(session_id.clone()));
+
+        let key = DataKey::SessionTruthRestoration(session_id.clone());
+        env.storage().persistent().set(&key, &restoration);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
+
+        env.events().publish(
+            (symbol_short!("truth"), Symbol::new(&env, "restored"), session_id),
+            restoration.restored_accuracy_bps,
+        );
+
+        restoration
     // ── Mentor Wellness & Workload Monitoring (#910) ───────────────────────────
 
     /// Update mentor workload after session registration
