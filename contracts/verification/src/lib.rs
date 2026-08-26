@@ -28,25 +28,8 @@ pub enum DataKey {
     Verification(Address),
     Tier(Address),
     GracePeriod,
-    // ── Onboarding Protection & Barrier Gaming ───────────────────────
-    AdmissionCriteria(Address),
-    AccessPattern(Address),
-    VerificationOnboardingProtection(Address),
-    /// Practical assessment result for a mentor's claimed specialization (#891).
-    SkillAssessment(Address, Symbol),
-    /// External-credential authentication record for a mentor's specialization (#891).
-    SkillCredential(Address, Symbol),
-    /// Last recertification timestamp for a mentor's claimed specialization (#891).
-    LastCertifiedAt(Address, Symbol),
-    /// Cached fraud-detection flag for a mentor's claimed specialization (#891).
-    SkillFraudFlag(Address, Symbol),
-    /// Rolling session-outcome scores (bps) used for expertise/fraud tracking (#891).
-    SpecializationOutcomes(Address, Symbol),
-    // ── Cross-platform identity validation (#904) ──────────────────────────
-    /// Cross-platform verification record for a user on a specific platform.
-    CrossPlatformVerification(Address, Symbol),
-    /// Account monitoring log for suspicious activity.
-    AccountMonitoringLog(Address),
+    CertificationAuthority(Address),
+    RevokedCredential(BytesN<32>),
 }
 
 /// Maximum rolling outcome scores retained per (mentor, specialization) for
@@ -95,6 +78,15 @@ pub struct VerificationRenewedEventData {
     pub renewed_at: u64,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CertificationAuthorityRecord {
+    pub authority: Address,
+    pub registered_at: u64,
+    pub reputation_bps: u32,
+    pub active: bool,
+}
+
 #[contract]
 pub struct VerificationContract;
 
@@ -130,6 +122,9 @@ impl VerificationContract {
             .get(&DataKey::Admin)
             .expect("Not initialized");
         admin.require_auth();
+        if env.storage().persistent().get(&DataKey::RevokedCredential(credential_hash.clone())).unwrap_or(false) {
+            panic!("Credential revoked");
+        }
         let now = env.ledger().timestamp();
         
         let grace_period = env
@@ -195,6 +190,71 @@ impl VerificationContract {
             ),
             VerificationRevokedEventData { revoked: true },
         );
+    }
+
+    pub fn register_certification_authority(
+        env: Env,
+        authority: Address,
+        reputation_bps: u32,
+    ) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+        let record = CertificationAuthorityRecord {
+            authority: authority.clone(),
+            registered_at: env.ledger().timestamp(),
+            reputation_bps: reputation_bps.min(10_000),
+            active: true,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::CertificationAuthority(authority.clone()), &record);
+        env.events().publish(
+            (symbol_short!("Verify"), symbol_short!("AuthReg"), authority),
+            record.reputation_bps,
+        );
+    }
+
+    pub fn validate_certification_authority(env: Env, authority: Address) -> bool {
+        let record: Option<CertificationAuthorityRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CertificationAuthority(authority));
+        record.map(|r| r.active && r.reputation_bps >= 7_000).unwrap_or(false)
+    }
+
+    pub fn revoke_credential(env: Env, credential_hash: BytesN<32>) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+        env.storage()
+            .persistent()
+            .set(&DataKey::RevokedCredential(credential_hash.clone()), &true);
+        env.events().publish(
+            (symbol_short!("Verify"), symbol_short!("CredRev")),
+            credential_hash,
+        );
+    }
+
+    pub fn authenticate_credentials(
+        env: Env,
+        mentor: Address,
+        credential_hash: BytesN<32>,
+    ) -> bool {
+        if env.storage().persistent().get(&DataKey::RevokedCredential(credential_hash.clone())).unwrap_or(false) {
+            return false;
+        }
+        let rec: Option<VerificationRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Verification(mentor));
+        rec.map(|r| r.is_active && r.credential_hash == credential_hash).unwrap_or(false)
     }
 
     pub fn is_verified(env: Env, mentor: Address) -> bool {

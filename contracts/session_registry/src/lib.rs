@@ -170,57 +170,9 @@ pub enum DataKey {
     MentorEmergencyIntervention(Address),
     /// Whether a mentor is currently under an active emergency suspension.
     MentorSuspended(Address),
-    // ── Session metadata validation and information warfare ───────────────
-    SessionMetadataValidation(Symbol),
-    SessionInformationIntegrity(Symbol),
-    SessionTransparencyProtection(Symbol),
-    SessionMetadataMonitoring(Symbol),
-    SessionInformationAudit(Symbol),
-    SessionTruthRestoration(Symbol),
-    // Mentor wellness (#910)
-    MentorWorkload(Address),
-    MentorBurnoutAssessment(Address),
-    WellnessIntervention(Address),
-    // Session recording (#914)
-    SessionRecording(Symbol),
-    RecordingConsent(Symbol),
-    RecordingRedaction(Symbol),
-    RecordingAccessLog(Symbol),
-    // Market monitoring (#915)
-    SpecializationMetrics(Symbol),
-    MarketManipulationAlert(Symbol),
-    EmergencyStabilization(Symbol),
-    // Scheduling integrity / availability-gaming protection (#884)
-    /// Cryptographic availability commitment for a mentor's time slot.
-    AvailabilityCommit(Address, u64),
-    /// Rolling timestamps of availability commit/withdraw changes for a
-    /// mentor, used for gaming-pattern detection.
-    AvailabilityChangeLog(Address),
-    /// Whether a scheduling emergency override is active for a session.
-    EmergencyOverride(Symbol),
-    // Cross-session data isolation & privacy protection (#899)
-    /// Timestamps of out-of-scope session-data access attempts by an
-    /// accessor, used for cross-session leak detection.
-    OutOfScopeAccessLog(Address),
-    /// Distinct out-of-scope session IDs an accessor has attempted to read.
-    OutOfScopeSessionSet(Address),
-    /// Whether an accessor is currently contained after a detected
-    /// cross-session data-leak attempt.
-    AccessorContained(Address),
-    /// Full data-access audit log (accessor, session_id, timestamp,
-    /// allowed) for a given session.
-    SessionAccessAudit(Symbol),
-    // ── Session protection & attack detection (#901) ────────────────────────
-    /// Protection record for an active session.
-    SessionProtection(Symbol),
-    /// Rolling attack events for a session.
-    AttackEventLog(Symbol),
-    /// Continuity backup for a session.
-    ContinuityBackup(Symbol),
-    /// Quality assessment record for a session.
-    SessionQuality(Symbol),
-    /// Learning outcome record for a session.
-    LearningOutcome(Symbol),
+    /// Minimum sessions a mentor must keep available in a window before
+    /// hoarding/artificial scarcity audits flag the account.
+    MentorMinAvailabilityQuota(Address),
 }
 
 /// Maximum length of the rolling price/pair/request logs kept for scoring.
@@ -454,6 +406,47 @@ impl SessionRegistry {
             bucket = bucket.saturating_add(1);
         }
         result
+    }
+
+    pub fn set_mentor_availability_quota(env: Env, mentor: Address, min_sessions: u32) {
+        let backend = Self::require_backend(&env);
+        backend.require_auth();
+        env.storage()
+            .persistent()
+            .set(&DataKey::MentorMinAvailabilityQuota(mentor), &min_sessions);
+    }
+
+    pub fn audit_mentor_availability_quota(
+        env: Env,
+        mentor: Address,
+        from: u64,
+        to: u64,
+    ) -> (bool, u32, u32) {
+        let quota: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MentorMinAvailabilityQuota(mentor.clone()))
+            .unwrap_or(0);
+        let sessions = Self::get_sessions_by_mentor(env.clone(), mentor.clone());
+        let mut scheduled = 0u32;
+        for sid in sessions.iter() {
+            if let Some(record) = env.storage().persistent().get::<_, SessionRecord>(&DataKey::Session(sid)) {
+                if record.scheduled_at >= from
+                    && record.scheduled_at < to
+                    && record.status != SessionStatus::Cancelled
+                {
+                    scheduled = scheduled.saturating_add(1);
+                }
+            }
+        }
+        let compliant = scheduled >= quota;
+        if !compliant {
+            env.events().publish(
+                (symbol_short!("quota"), Symbol::new(&env, "shortfall")),
+                (mentor, scheduled, quota),
+            );
+        }
+        (compliant, scheduled, quota)
     }
 
     pub fn set_session_oracle(env: Env, oracle: Address) {
