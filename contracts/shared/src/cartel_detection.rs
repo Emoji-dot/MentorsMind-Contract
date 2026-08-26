@@ -209,7 +209,7 @@ impl CartelDetection {
 
         for mentor in all_mentors.iter() {
             let mentor_premium_slots = available_slots.iter().fold(0u32, |acc, slot| {
-                if &slot.mentor == mentor && slot.price >= premium_threshold_price {
+                if slot.mentor == mentor.clone() && slot.price >= premium_threshold_price {
                     acc + 1
                 } else {
                     acc

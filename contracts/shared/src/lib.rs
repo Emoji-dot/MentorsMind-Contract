@@ -40,6 +40,8 @@ pub mod threat_intelligence;
 pub mod ttl_utils;
 pub mod validation;
 
+use soroban_sdk::{contracttype, symbol_short, xdr::ToXdr, Address, Bytes, BytesN, Env, Symbol, Vec};
+
 pub use admin::{
     AdminChangeProposal, AdminTransfer, ADMIN_COOLING_OFF_SECS, MIN_ADMIN_TIMELOCK_SECS,
 };
@@ -195,6 +197,167 @@ pub use ttl_utils::{
     WARNING_THRESHOLD_LEDGERS,
 };
 pub use validation::{require_auth_and_validate, ValidationError, Validator};
+
+/// Layer-2 and state-channel integration metadata tracked by contracts that
+/// need to defer L1 commitment until the applicable challenge window ends.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct L2Integration {
+    pub network_id: u32,
+    pub finality_delay_secs: u64,
+    pub challenge_period_secs: u64,
+    pub last_l2_block: u64,
+    pub last_l1_commitment: u64,
+    pub emergency_shutdown: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StateChannelRecord {
+    pub channel_id: BytesN<32>,
+    pub party_a: Address,
+    pub party_b: Address,
+    pub opened_at: u64,
+    pub dispute_deadline: u64,
+    pub force_closed: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossLayerAtomicityRecord {
+    pub operation_id: BytesN<32>,
+    pub l1_started: bool,
+    pub l2_started: bool,
+    pub committed: bool,
+    pub rolled_back: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FraudProof {
+    pub l2_network_id: u32,
+    pub state_root: BytesN<32>,
+    pub invalid_transition_hash: BytesN<32>,
+    pub challenger: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossLayerAuditLog {
+    pub operation_id: BytesN<32>,
+    pub contract_id: Address,
+    pub source_layer: Symbol,
+    pub target_layer: Symbol,
+    pub synchronized: bool,
+    pub observed_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GameTheoryState {
+    pub collusion_score_bps: u32,
+    pub audit_sample_rate_bps: u32,
+    pub penalty_multiplier_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IncentiveCompatibilityResult {
+    pub strategy_proof: bool,
+    pub honest_nash_equilibrium: bool,
+    pub confidence_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollusionDetection {
+    pub suspicious: bool,
+    pub coordination_score_bps: u32,
+    pub evidence_count: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ZKProof {
+    pub scheme: Symbol,
+    pub circuit_hash: BytesN<32>,
+    pub proof_hash: BytesN<32>,
+    pub nullifier: BytesN<32>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrivacyAudit {
+    pub linkability_risk_bps: u32,
+    pub anonymity_breach: bool,
+    pub audited_at: u64,
+}
+
+pub fn l2_finality_reached(env: &Env, integration: &L2Integration, l2_block_age_secs: u64) -> bool {
+    !integration.emergency_shutdown
+        && l2_block_age_secs >= integration.finality_delay_secs + integration.challenge_period_secs
+        && env.ledger().timestamp() >= integration.last_l1_commitment
+}
+
+pub fn verify_l2_fraud_proof(proof: &FraudProof, expected_state_root: &BytesN<32>) -> bool {
+    &proof.state_root == expected_state_root
+}
+
+pub fn record_cross_layer_audit(
+    env: &Env,
+    contract_id: &Address,
+    operation_id: &BytesN<32>,
+    source_layer: Symbol,
+    target_layer: Symbol,
+    synchronized: bool,
+) -> CrossLayerAuditLog {
+    let log = CrossLayerAuditLog {
+        operation_id: operation_id.clone(),
+        contract_id: contract_id.clone(),
+        source_layer,
+        target_layer,
+        synchronized,
+        observed_at: env.ledger().timestamp(),
+    };
+    env.events().publish(
+        (symbol_short!("xl"), symbol_short!("audit")),
+        (
+            log.operation_id.clone(),
+            log.contract_id.clone(),
+            log.source_layer.clone(),
+            log.target_layer.clone(),
+            log.synchronized,
+            log.observed_at,
+        ),
+    );
+    log
+}
+
+pub fn compute_nullifier(
+    env: &Env,
+    address: &Address,
+    namespace: &str,
+    secret: &Bytes,
+    blinding: &BytesN<32>,
+) -> BytesN<32> {
+    let mut payload = Bytes::new(env);
+    payload.append(&address.to_xdr(env));
+    payload.append(&Bytes::from_slice(env, namespace.as_bytes()));
+    payload.append(secret);
+    let blind = Bytes::from_slice(env, &blinding.to_array());
+    payload.append(&blind);
+    env.crypto().sha256(&payload).into()
+}
+
+pub fn audit_privacy(proof: &ZKProof, signal_strength_bps: u32, audited_at: u64) -> PrivacyAudit {
+    let _ = proof;
+    let linkability_risk_bps = u32::min(10_000, signal_strength_bps.saturating_add(750));
+    PrivacyAudit {
+        linkability_risk_bps,
+        anonymity_breach: linkability_risk_bps > 7_500,
+        audited_at,
+    }
+}
 
 /// Economic sanity ceiling for a single financial amount (token smallest units).
 pub const MAX_FINANCIAL_AMOUNT: i128 = 1_000_000_000_000_000;
