@@ -10,6 +10,19 @@ use shared::events::{
     evt_gov_vote_cast,
 };
 use shared::{GasEstimate, StateMachine, ROLLBACK_GOVERNANCE_QUORUM_BPS, SecureStorageAccess};
+use shared::{
+    // market control protection
+    detect_network_concentration as gov_detect_network_concentration,
+    assess_competition_barriers as gov_assess_competition_barriers,
+    detect_pricing_coordination as gov_detect_pricing_coordination,
+    analyze_market_networks as gov_analyze_market_networks,
+    audit_market_competition as gov_audit_market_competition,
+    compute_market_protection_intervention as gov_compute_market_protection_intervention,
+    is_market_restoration_eligible as gov_is_market_restoration_eligible,
+    DecentralizationMonitoring, MarketFairness,
+    MarketProtectionRecord, CompetitionAuditRecord,
+    MARKET_INTERVENTION_COOLDOWN_SECS,
+};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, vec, Address, Bytes,
     BytesN, Env, IntoVal, Symbol, Vec,
@@ -56,6 +69,11 @@ const MID_WEIGHT_BPS: u32 = 10_000; // 100.00%
 
 /// Late window: 66–100% — 110% weight (11000 bps)
 const LATE_WEIGHT_BPS: u32 = 11_000; // 110.00%
+
+/// Persistent storage TTL bump threshold (ledgers).
+const TTL_THRESHOLD: u32 = 500_000;
+/// Persistent storage TTL bump amount (ledgers).
+const TTL_BUMP: u32 = 1_000_000;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -217,6 +235,29 @@ pub enum DataKey {
     CancelTimestamps(Address),
     /// MultisigAdmin contract address for post-escalation cancellations
     MultisigAdmin,
+    // ── Market control protection ──────────────────────────────────────────
+    /// Cached decentralization monitoring snapshot used for regulation.
+    GovDecentralizationRecord,
+    /// Cached competition protection assessment used by governance.
+    GovCompetitionRecord,
+    /// Cached market fairness result used by governance.
+    GovMarketFairnessRecord,
+    /// Governance-issued market concentration regulation record.
+    GovMarketProtectionRecord,
+    /// Whether the governance layer has an active market-control intervention.
+    GovMarketControlActive,
+    /// Per-network session counts stored by governance for audit.
+    GovNetworkSessionCount(Symbol),
+    /// Total segment sessions stored by governance.
+    GovSegmentTotalSessions,
+    /// Count of independent mentors tracked by governance.
+    GovIndependentMentorCount,
+    /// Total active mentors tracked by governance.
+    GovTotalActiveMentors,
+    /// Competition audit record from the most recent governance audit.
+    GovCompetitionAuditRecord,
+    /// Barrier signal count stored by governance.
+    GovBarrierSignalCount,
 }
 
 #[contracttype]
@@ -1486,6 +1527,407 @@ impl GovernanceContract {
             }
         }
         env.crypto().sha256(&buf).into()
+    }
+
+    // ── Market control & decentralization protection ──────────────────────────
+
+    /// Regulate market concentration based on on-chain network metrics.
+    ///
+    /// The admin submits per-network session counts (`network_ids` /
+    /// `network_session_counts` parallel arrays), the total sessions in the
+    /// segment, and independent/total active mentor counts. The governance
+    /// contract:
+    ///
+    /// 1. Computes an HHI-based [`DecentralizationMonitoring`] score.
+    /// 2. Assesses competition barriers for independent mentors.
+    /// 3. Retrieves the cached market-fairness result (or defaults to healthy).
+    /// 4. Combines everything into a [`MarketProtectionRecord`] and persists it.
+    /// 5. Emits an event when intervention is triggered.
+    ///
+    /// Returns the computed [`DecentralizationMonitoring`] record. Only the
+    /// governance admin may call this function.
+    pub fn regulate_market_concentration(
+        env: Env,
+        admin: Address,
+        network_ids: Vec<Symbol>,
+        network_session_counts: Vec<u32>,
+        total_sessions: u32,
+        independent_mentor_count: u32,
+        total_active_mentors: u32,
+    ) -> DecentralizationMonitoring {
+        Self::assert_admin(&env, &admin);
+
+        // Persist raw inputs.
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovSegmentTotalSessions, &total_sessions);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovSegmentTotalSessions,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovIndependentMentorCount, &independent_mentor_count);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovIndependentMentorCount,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovTotalActiveMentors, &total_active_mentors);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovTotalActiveMentors,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        // Persist per-network counts for audit trail.
+        for i in 0..network_ids.len().min(network_session_counts.len()) {
+            let nid = network_ids.get(i).unwrap();
+            let cnt = network_session_counts.get(i).unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&DataKey::GovNetworkSessionCount(nid), &cnt);
+        }
+
+        // 1. Concentration detection.
+        let monitoring =
+            gov_detect_network_concentration(&network_session_counts, total_sessions);
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovDecentralizationRecord, &monitoring);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovDecentralizationRecord,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        // 2. Competition barriers.
+        let barrier_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovBarrierSignalCount)
+            .unwrap_or(0);
+        let competition = gov_assess_competition_barriers(
+            &env,
+            independent_mentor_count,
+            total_active_mentors,
+            barrier_count,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovCompetitionRecord, &competition);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovCompetitionRecord,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        // 3. Market fairness (use cached or default).
+        let fairness: MarketFairness = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovMarketFairnessRecord)
+            .unwrap_or(MarketFairness {
+                fair_pricing: true,
+                coordination_detected: false,
+                suspicious_price_moves: 0,
+                risk_score: 0,
+            });
+
+        // 4. Combined protection record.
+        let protection = gov_compute_market_protection_intervention(
+            &env,
+            &monitoring,
+            &competition,
+            &fairness,
+            MARKET_INTERVENTION_COOLDOWN_SECS,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovMarketProtectionRecord, &protection);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovMarketProtectionRecord,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        // 5. Run network analysis and produce audit record.
+        let analysis = gov_analyze_market_networks(&monitoring, &competition, &fairness);
+        let audit = gov_audit_market_competition(&monitoring, &competition, &fairness, &analysis);
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovCompetitionAuditRecord, &audit);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovCompetitionAuditRecord,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        if protection.intervene {
+            env.storage()
+                .persistent()
+                .set(&DataKey::GovMarketControlActive, &true);
+            env.storage().persistent().extend_ttl(
+                &DataKey::GovMarketControlActive,
+                TTL_THRESHOLD,
+                TTL_BUMP,
+            );
+            env.events().publish(
+                (
+                    symbol_short!("govmkt"),
+                    Symbol::new(&env, "intervention"),
+                ),
+                (
+                    monitoring.hhi_score,
+                    monitoring.dominant_share_bps,
+                    protection.combined_risk_score,
+                ),
+            );
+        }
+
+        monitoring
+    }
+
+    /// Enforce competition policies across the market.
+    ///
+    /// The admin provides:
+    /// - `barrier_signal_count`: newly detected barrier signals against
+    ///   independent mentors.
+    /// - `price_timestamps` / `price_changes_bps`: rolling window of
+    ///   price-change events for coordination detection (parallel arrays,
+    ///   sorted chronologically).
+    ///
+    /// The function:
+    /// 1. Updates barrier signal tracking and re-scores competition protection.
+    /// 2. Detects pricing coordination from the supplied window.
+    /// 3. Re-computes the combined market protection intervention decision.
+    /// 4. Runs a comprehensive competition audit.
+    /// 5. Emits events when violations are found.
+    ///
+    /// Returns the updated [`CompetitionAuditRecord`]. Only the governance
+    /// admin may call this function.
+    pub fn enforce_competition_policies(
+        env: Env,
+        admin: Address,
+        barrier_signal_count: u32,
+        price_timestamps: Vec<u64>,
+        price_changes_bps: Vec<u32>,
+    ) -> CompetitionAuditRecord {
+        Self::assert_admin(&env, &admin);
+
+        // 1. Update barrier signals.
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovBarrierSignalCount, &barrier_signal_count);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovBarrierSignalCount,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        let independent_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovIndependentMentorCount)
+            .unwrap_or(0);
+        let total_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovTotalActiveMentors)
+            .unwrap_or(0);
+        let competition = gov_assess_competition_barriers(
+            &env,
+            independent_count,
+            total_count,
+            barrier_signal_count,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovCompetitionRecord, &competition);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovCompetitionRecord,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        // 2. Pricing coordination detection.
+        let fairness = gov_detect_pricing_coordination(&price_timestamps, &price_changes_bps);
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovMarketFairnessRecord, &fairness);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovMarketFairnessRecord,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        if fairness.coordination_detected {
+            env.events().publish(
+                (
+                    symbol_short!("govfair"),
+                    Symbol::new(&env, "coord_detected"),
+                ),
+                (fairness.suspicious_price_moves, fairness.risk_score),
+            );
+        }
+
+        if competition.barriers_detected {
+            env.events().publish(
+                (
+                    symbol_short!("govcomp"),
+                    Symbol::new(&env, "barrier_found"),
+                ),
+                (competition.independent_ratio_bps, barrier_signal_count),
+            );
+        }
+
+        // 3. Re-compute combined protection.
+        let monitoring: DecentralizationMonitoring = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovDecentralizationRecord)
+            .unwrap_or(DecentralizationMonitoring {
+                healthy: true,
+                hhi_score: 0,
+                dominant_share_bps: 0,
+                network_count: 0,
+                risk_score: 0,
+            });
+        let protection = gov_compute_market_protection_intervention(
+            &env,
+            &monitoring,
+            &competition,
+            &fairness,
+            MARKET_INTERVENTION_COOLDOWN_SECS,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovMarketProtectionRecord, &protection);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovMarketProtectionRecord,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+        if protection.intervene {
+            env.storage()
+                .persistent()
+                .set(&DataKey::GovMarketControlActive, &true);
+            env.storage().persistent().extend_ttl(
+                &DataKey::GovMarketControlActive,
+                TTL_THRESHOLD,
+                TTL_BUMP,
+            );
+            env.events().publish(
+                (
+                    symbol_short!("govmkt"),
+                    Symbol::new(&env, "intervention"),
+                ),
+                (
+                    monitoring.hhi_score,
+                    monitoring.dominant_share_bps,
+                    protection.combined_risk_score,
+                ),
+            );
+        }
+
+        // 4. Comprehensive competition audit.
+        let analysis = gov_analyze_market_networks(&monitoring, &competition, &fairness);
+        let audit = gov_audit_market_competition(&monitoring, &competition, &fairness, &analysis);
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovCompetitionAuditRecord, &audit);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovCompetitionAuditRecord,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
+
+        audit
+    }
+
+    /// Restore competitive balance after a governance market-control
+    /// intervention cooldown has elapsed. Only the governance admin may call
+    /// this.
+    pub fn restore_mkt_comp_balance(env: Env, admin: Address) {
+        Self::assert_admin(&env, &admin);
+
+        let record: MarketProtectionRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovMarketProtectionRecord)
+            .expect("NoGovMarketProtectionRecord");
+
+        if !gov_is_market_restoration_eligible(&record, env.ledger().timestamp()) {
+            panic!("GovMarketRestorationNotEligible");
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::GovMarketProtectionRecord);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::GovMarketControlActive);
+
+        env.events().publish(
+            (symbol_short!("govmkt"), Symbol::new(&env, "restored")),
+            env.ledger().timestamp(),
+        );
+    }
+
+    /// Get the current governance market protection record.
+    pub fn get_gov_market_protection(env: Env) -> MarketProtectionRecord {
+        env.storage()
+            .persistent()
+            .get(&DataKey::GovMarketProtectionRecord)
+            .unwrap_or(MarketProtectionRecord {
+                intervene: false,
+                combined_risk_score: 0,
+                reason: Symbol::new(&env, "none"),
+                restoration_eligible_at: 0,
+            })
+    }
+
+    /// Get the current governance competition audit record.
+    pub fn get_competition_audit(env: Env) -> CompetitionAuditRecord {
+        env.storage()
+            .persistent()
+            .get(&DataKey::GovCompetitionAuditRecord)
+            .unwrap_or(CompetitionAuditRecord {
+                compliant: true,
+                violation_count: 0,
+                fairness_score: 100,
+                market_control_detected: false,
+            })
+    }
+
+    /// Get the governance-level decentralization monitoring record.
+    pub fn get_gov_decentralization(env: Env) -> DecentralizationMonitoring {
+        env.storage()
+            .persistent()
+            .get(&DataKey::GovDecentralizationRecord)
+            .unwrap_or(DecentralizationMonitoring {
+                healthy: true,
+                hhi_score: 0,
+                dominant_share_bps: 0,
+                network_count: 0,
+                risk_score: 0,
+            })
+    }
+
+    /// Get the governance-level market fairness record.
+    pub fn get_gov_market_fairness(env: Env) -> MarketFairness {
+        env.storage()
+            .persistent()
+            .get(&DataKey::GovMarketFairnessRecord)
+            .unwrap_or(MarketFairness {
+                fair_pricing: true,
+                coordination_detected: false,
+                suspicious_price_moves: 0,
+                risk_score: 0,
+            })
     }
 }
 

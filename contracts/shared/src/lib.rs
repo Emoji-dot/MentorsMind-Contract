@@ -43,6 +43,8 @@ pub mod justice_protection;
 pub mod outcome_authenticity;
 pub mod scalability_protection;
 pub mod learner_protection;
+pub mod market_control_protection;
+pub mod algorithm_transparency;
 
 // Security integrity system modules (added on main; module declarations
 // restored here — main shipped the files without registering them).
