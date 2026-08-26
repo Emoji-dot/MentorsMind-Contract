@@ -11,6 +11,9 @@ use shared::{
     apply_bps_multiplier, action_stake, action_unstake, action_claim,
     MIN_STAKING_DURATION_SECS, REWARD_LOCKUP_SECS,
     REWARD_MULTIPLIER_MIN_BPS, PATTERN_DETECTION_WINDOW,
+    // Fair distribution & reward security (#903)
+    exceeds_extraction_rate, detect_coordinated_timing, TokenomicsAuditResult,
+    MAX_EXTRACTION_RATE_BPS, MIN_SUSTAINABILITY_RATIO, MIN_POSITION_DELTA_SECS,
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
@@ -250,6 +253,13 @@ pub enum DataKey {
     LongevityMetrics,
     /// Ecosystem health indicators
     EcosystemHealthIndicators,
+    // ── Fair distribution & reward security (#903) ─────────────────────────
+    /// Fair distribution check record for a staker/epoch pair.
+    FairDistributionCheck(Address, u64),
+    /// Reward security audit record for an epoch.
+    RewardSecurityAudit(u64),
+    /// Tokenomics audit result for an epoch.
+    TokenomicsAuditRecord(u64),
 }
 
 #[contracttype]
@@ -3091,6 +3101,108 @@ impl StakingContract {
         }
 
         Ok(false)
+    }
+
+    // ── Fair distribution & reward security (#903) ─────────────────────────
+
+    /// Calculate rewards for a staker with manipulation-resistant validation.
+    /// Rejects rewards that would exceed extraction-rate caps.
+    pub fn calculate_rewards_securely(
+        env: Env,
+        staker: Address,
+        epoch: u64,
+    ) -> Result<i128, Error> {
+        let stake = Self::get_stake(env.clone(), staker.clone())
+            .ok_or(Error::NoStakeFound)?;
+
+        let epoch_reward: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EpochReward(epoch))
+            .unwrap_or(0);
+
+        let total_staked: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalStaked)
+            .unwrap_or(0);
+
+        if total_staked <= 0 || epoch_reward <= 0 {
+            return Ok(0);
+        }
+
+        // Check extraction rate
+        if exceeds_extraction_rate(epoch_reward, total_staked) {
+            return Err(Error::InvalidAmount);
+        }
+
+        // Pro-rata share
+        let share = (stake.amount as i128)
+            .checked_mul(epoch_reward)
+            .ok_or(Error::Overflow)?
+            .checked_div(total_staked)
+            .ok_or(Error::Overflow)?;
+
+        Ok(share)
+    }
+
+    /// Detect coordinated staking patterns that suggest manipulation.
+    pub fn detect_staking_coordination(
+        env: Env,
+        staker: Address,
+    ) -> bool {
+        let action_log: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakerActionLog(staker))
+            .unwrap_or(Vec::new(&env));
+
+        let mut timestamps: std::vec::Vec<u64> = std::vec::Vec::new();
+        for i in 0..action_log.len() {
+            if let Some(ts) = action_log.get(i) {
+                timestamps.push(ts);
+            }
+        }
+
+        detect_coordinated_timing(&timestamps, MIN_POSITION_DELTA_SECS)
+    }
+
+    /// Audit tokenomics fairness for a given epoch.
+    pub fn audit_epoch_fairness(
+        env: Env,
+        epoch: u64,
+    ) -> TokenomicsAuditResult {
+        let epoch_reward: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EpochReward(epoch))
+            .unwrap_or(0);
+
+        let total_staked: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalStaked)
+            .unwrap_or(0);
+
+        let extraction_rate = if total_staked > 0 {
+            ((epoch_reward as u64 * 10_000) / total_staked as u64) as u32
+        } else {
+            0
+        };
+
+        let sustainability = if total_staked > 0 {
+            ((epoch_reward as u64 * 100) / total_staked as u64) as u32
+        } else {
+            0
+        };
+
+        TokenomicsAuditResult {
+            fair: extraction_rate <= MAX_EXTRACTION_RATE_BPS
+                && sustainability >= MIN_SUSTAINABILITY_RATIO,
+            extraction_rate_bps: extraction_rate,
+            sustainability_ratio: sustainability,
+            flagged_stakers: 0,
+        }
     }
 }
 

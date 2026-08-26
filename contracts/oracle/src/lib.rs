@@ -1,7 +1,8 @@
 #![no_std]
+use shared::{validate_conflict_proof, ConflictProof};
 use soroban_sdk::{
-    contract, contractclient, contractimpl, contracttype, symbol_short, Address, Env, IntoVal,
-    Map, Symbol, Vec,
+    contract, contractclient, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
+    IntoVal, Map, Symbol, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -369,6 +370,56 @@ impl OracleContract {
     }
 
     // -----------------------------------------------------------------------
+    // External calendar verification (#884 scheduling-integrity protection)
+    // -----------------------------------------------------------------------
+
+    /// Submit an attested calendar-conflict proof for a mentor's time slot
+    /// (e.g. a hash of a signed external-calendar busy/free export). Only a
+    /// registered feeder or the admin may submit calendar attestations,
+    /// mirroring price-feed authorization.
+    pub fn submit_calendar_proof(
+        env: Env,
+        feeder: Address,
+        mentor: Address,
+        slot_start: u64,
+        proof_hash: BytesN<32>,
+    ) {
+        feeder.require_auth();
+        if !Self::is_feeder(&env, &feeder)
+            && !Self::has_rbac_role(&env, Symbol::new(&env, "ORACLE_FEEDER"), feeder.clone())
+        {
+            panic!("unauthorized feeder");
+        }
+
+        let key = (symbol_short!("CAL_PRF"), mentor, slot_start);
+        env.storage()
+            .persistent()
+            .set(&key, &(proof_hash, env.ledger().timestamp()));
+    }
+
+    /// Verify a mentor's claimed scheduling conflict against the calendar
+    /// proof on file for that slot, requiring the proof to be fresh
+    /// (`shared::MAX_CONFLICT_PROOF_AGE_SECS`) and to match the expected
+    /// commitment hash supplied by the caller (e.g. `session_registry`).
+    pub fn verify_calendar_availability(
+        env: Env,
+        mentor: Address,
+        slot_start: u64,
+        expected_hash: BytesN<32>,
+    ) -> ConflictProof {
+        let key = (symbol_short!("CAL_PRF"), mentor, slot_start);
+        match env.storage().persistent().get::<_, (BytesN<32>, u64)>(&key) {
+            Some((proof_hash, issued_at)) => {
+                validate_conflict_proof(&env, &proof_hash, &expected_hash, issued_at)
+            }
+            None => ConflictProof {
+                valid: false,
+                within_freshness_window: false,
+            },
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
 
@@ -632,5 +683,52 @@ mod tests {
         let (price, _) = client.get_price(&asset);
         // Regardless of manipulation, the returned price must be a valid i128.
         assert!(price > 0);
+    }
+
+    // ------------------------------------------------------------------
+    // External calendar verification (#884)
+    // ------------------------------------------------------------------
+    #[test]
+    fn test_calendar_proof_verifies_when_fresh_and_matching() {
+        let (env, admin, contract_id) = setup();
+        env.ledger().set_timestamp(1_000);
+        let client = OracleContractClient::new(&env, &contract_id);
+        let feeders = add_feeders(&env, &client, &admin, 1);
+        let mentor = Address::generate(&env);
+        let slot_start = 5_000u64;
+        let proof_hash = BytesN::from_array(&env, &[9u8; 32]);
+
+        client.submit_calendar_proof(&feeders.get(0).unwrap(), &mentor, &slot_start, &proof_hash);
+
+        let result = client.verify_calendar_availability(&mentor, &slot_start, &proof_hash);
+        assert!(result.valid);
+    }
+
+    #[test]
+    fn test_calendar_proof_rejects_mismatched_hash() {
+        let (env, admin, contract_id) = setup();
+        env.ledger().set_timestamp(1_000);
+        let client = OracleContractClient::new(&env, &contract_id);
+        let feeders = add_feeders(&env, &client, &admin, 1);
+        let mentor = Address::generate(&env);
+        let slot_start = 5_000u64;
+        let proof_hash = BytesN::from_array(&env, &[9u8; 32]);
+        let other_hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.submit_calendar_proof(&feeders.get(0).unwrap(), &mentor, &slot_start, &proof_hash);
+
+        let result = client.verify_calendar_availability(&mentor, &slot_start, &other_hash);
+        assert!(!result.valid);
+    }
+
+    #[test]
+    fn test_calendar_proof_missing_returns_invalid() {
+        let (env, _admin, contract_id) = setup();
+        let client = OracleContractClient::new(&env, &contract_id);
+        let mentor = Address::generate(&env);
+        let expected = BytesN::from_array(&env, &[1u8; 32]);
+
+        let result = client.verify_calendar_availability(&mentor, &5_000u64, &expected);
+        assert!(!result.valid);
     }
 }

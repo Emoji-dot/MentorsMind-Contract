@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{Address, Env, Symbol, Vec, BytesN, contracterror};
+use soroban_sdk::{contracttype, Address, Env, Symbol, Vec, BytesN, contracterror};
 
 /// ML Security Error Types
 #[contracterror]
@@ -38,6 +38,7 @@ pub enum AdversarialAttackType {
 }
 
 /// Model poisoning detection record
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct PoisoningRecord {
     pub model_id: Symbol,
@@ -48,6 +49,7 @@ pub struct PoisoningRecord {
 }
 
 /// Training data integrity record
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct TrainingDataIntegrityRecord {
     pub dataset_id: Symbol,
@@ -58,6 +60,7 @@ pub struct TrainingDataIntegrityRecord {
 }
 
 /// Adversarial attack detection result
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct AttackDetectionResult {
     pub is_attack: bool,
@@ -68,6 +71,7 @@ pub struct AttackDetectionResult {
 }
 
 /// Model robustness verification
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct ModelRobustnessReport {
     pub model_id: Symbol,
@@ -79,6 +83,7 @@ pub struct ModelRobustnessReport {
 }
 
 /// AI performance monitoring record
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct AIPerformanceMetrics {
     pub model_id: Symbol,
@@ -373,6 +378,7 @@ impl MLSecurity {
 }
 
 /// Training sample structure for ML validation
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct TrainingSample {
     pub data_hash: BytesN<32>,
