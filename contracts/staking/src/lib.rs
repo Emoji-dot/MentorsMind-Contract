@@ -3,23 +3,20 @@
 
 use shared::events::{emit_staking_event, evt_staking_staked, evt_staking_unstaked};
 use shared::{
-    compute_checksum, push_snapshot_index, require_not_paused, ReentrancyGuard, RollbackProposal,
-    SafeMath, SnapshotMeta, StateSnapshot, StakeRecord, StakedEventData, StateVerificationReport,
-    EMERGENCY_THRESHOLD, MAX_SNAPSHOTS, Validator, validate_amount_limits,
-    RewardLockup, PenaltyCalculation, SuspiciousPatternFlag, StakingActionRecord,
-    compute_reward_multiplier_bps, compute_early_unstake_penalty, detect_suspicious_pattern,
-    apply_bps_multiplier, action_stake, action_unstake, action_claim,
-    MIN_STAKING_DURATION_SECS, REWARD_LOCKUP_SECS,
-    REWARD_MULTIPLIER_MIN_BPS, PATTERN_DETECTION_WINDOW,
-    // Fair distribution & reward security (#903)
-    exceeds_extraction_rate, detect_coordinated_timing, TokenomicsAuditResult,
-    MAX_EXTRACTION_RATE_BPS, MIN_SUSTAINABILITY_RATIO, MIN_POSITION_DELTA_SECS,
+    action_claim, action_stake, action_unstake, apply_bps_multiplier, assess_token_velocity,
+    compute_checksum, compute_early_unstake_penalty, compute_reward_multiplier_bps,
+    correlate_attack_vectors, detect_suspicious_pattern, push_snapshot_index, require_not_paused,
+    validate_amount_limits, EconomicVelocityReport, MultiVectorThreatReport, PenaltyCalculation,
+    ReentrancyGuard, RewardLockup, RollbackProposal, SafeMath, SnapshotMeta, StakeRecord,
+    StakedEventData, StakingActionRecord, StateSnapshot, StateVerificationReport,
+    SuspiciousPatternFlag, Validator, EMERGENCY_THRESHOLD, MAX_SNAPSHOTS,
+    MIN_STAKING_DURATION_SECS, PATTERN_DETECTION_WINDOW, REWARD_LOCKUP_SECS,
+    REWARD_MULTIPLIER_MIN_BPS,
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
     IntoVal, Symbol, Vec,
 };
-
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -253,13 +250,10 @@ pub enum DataKey {
     LongevityMetrics,
     /// Ecosystem health indicators
     EcosystemHealthIndicators,
-    // ── Fair distribution & reward security (#903) ─────────────────────────
-    /// Fair distribution check record for a staker/epoch pair.
-    FairDistributionCheck(Address, u64),
-    /// Reward security audit record for an epoch.
-    RewardSecurityAudit(u64),
-    /// Tokenomics audit result for an epoch.
-    TokenomicsAuditRecord(u64),
+    /// Last velocity/concentration audit report.
+    EconomicVelocityReport,
+    /// Last correlated multi-vector threat report.
+    MultiVectorThreatReport,
 }
 
 #[contracttype]
@@ -320,9 +314,9 @@ pub struct EcosystemHealthSnapshot {
     pub timestamp: u64,
     pub total_participants: u32,
     pub average_stake: i128,
-    pub gini_coefficient_bps: u32, // Wealth inequality measure
+    pub gini_coefficient_bps: u32,    // Wealth inequality measure
     pub concentration_ratio_bps: u32, // Top 10% concentration
-    pub health_status: u32, // 0: healthy, 1: warning, 2: critical
+    pub health_status: u32,           // 0: healthy, 1: warning, 2: critical
 }
 
 // ---------------------------------------------------------------------------
@@ -561,15 +555,25 @@ impl StakingContract {
     /// Admin only. Quality checks stay disabled (stake-only tiering) until
     /// both this and `session_registry` are configured.
     pub fn set_reputation_contract(env: Env, reputation: Address) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
         admin.require_auth();
-        env.storage().instance().set(&DataKey::ReputationContract, &reputation);
+        env.storage()
+            .instance()
+            .set(&DataKey::ReputationContract, &reputation);
     }
 
     /// Configure the `session_registry` contract consulted by
     /// `compute_tier`. Admin only. See `set_reputation_contract`.
     pub fn set_session_registry_contract(env: Env, session_registry: Address) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
         admin.require_auth();
         env.storage()
             .instance()
@@ -579,7 +583,11 @@ impl StakingContract {
     /// Adjust the stake/rating/session thresholds each tier requires.
     /// Admin (governance) only.
     pub fn set_tier_requirements(env: Env, admin: Address, requirements: TierRequirements) {
-        let stored: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
         admin.require_auth();
         if stored != admin {
             panic!("Unauthorized");
@@ -689,8 +697,7 @@ impl StakingContract {
         token_client.transfer(&mentor, &env.current_contract_address(), &amount);
 
         let now = env.ledger().timestamp();
-        let lock_seconds = (lock_period_days as u64)
-            .safe_mul(&env, 86_400u64);
+        let lock_seconds = (lock_period_days as u64).safe_mul(&env, 86_400u64);
         let unlock_at = now.safe_add(&env, lock_seconds);
         let tier = Self::compute_tier(&env, amount, &mentor);
 
@@ -730,7 +737,9 @@ impl StakingContract {
             .get(&DataKey::TotalStaked)
             .unwrap_or(0);
         let new_total = total_staked.checked_add(amount).expect("Overflow");
-        env.storage().persistent().set(&DataKey::TotalStaked, &new_total);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalStaked, &new_total);
 
         // Record the epoch this staker joined in. Rewards for the epoch that
         // is currently accruing (i.e. not yet snapshotted by
@@ -768,14 +777,7 @@ impl StakingContract {
             .instance()
             .get(&DataKey::NextScheduledDistributionAt);
         let actions = Self::load_action_log(&env, &mentor);
-        let flag = detect_suspicious_pattern(
-            &env,
-            &actions,
-            amount,
-            new_total,
-            next_dist,
-            now,
-        );
+        let flag = detect_suspicious_pattern(&env, &actions, amount, new_total, next_dist, now);
         if flag != SuspiciousPatternFlag::None {
             env.events().publish(
                 (
@@ -850,11 +852,7 @@ impl StakingContract {
     /// Admin setter for the next scheduled distribution timestamp. Feeds
     /// the pattern detector so it can flag large stakes placed immediately
     /// before a known distribution window.
-    pub fn set_next_distribution_at(
-        env: Env,
-        admin: Address,
-        timestamp: u64,
-    ) -> Result<(), Error> {
+    pub fn set_next_distribution_at(env: Env, admin: Address, timestamp: u64) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
         env.storage()
             .instance()
@@ -911,12 +909,8 @@ impl StakingContract {
         // Compute the penalty BEFORE the normal locked-gate so even if the
         // staker is early (before unlock_at) they can still exit but pay.
         // -------------------------------------------------------------------
-        let penalty = compute_early_unstake_penalty(
-            record.staked_at,
-            now,
-            record.unlock_at,
-            record.amount,
-        );
+        let penalty =
+            compute_early_unstake_penalty(record.staked_at, now, record.unlock_at, record.amount);
 
         // For *strictly* before unlock_at we no longer "StillLocked".
         // Early exit used to `StillLocked` — still a hard-stop; penalties allow exit instead.
@@ -964,7 +958,10 @@ impl StakingContract {
                 &(pool.checked_add(penalty.penalty_amount).expect("Overflow")),
             );
             env.events().publish(
-                (Symbol::new(&env, "penalty"), Symbol::new(&env, "early_unstake")),
+                (
+                    Symbol::new(&env, "penalty"),
+                    Symbol::new(&env, "early_unstake"),
+                ),
                 (
                     mentor.clone(),
                     penalty.penalty_amount,
@@ -1053,14 +1050,7 @@ impl StakingContract {
             .get(&DataKey::NextScheduledDistributionAt);
         let actions = Self::load_action_log(&env, &mentor);
         let new_total_after = total_staked.checked_sub(record.amount).unwrap_or(0);
-        let flag = detect_suspicious_pattern(
-            &env,
-            &actions,
-            0,
-            new_total_after,
-            next_dist,
-            now,
-        );
+        let flag = detect_suspicious_pattern(&env, &actions, 0, new_total_after, next_dist, now);
         if flag != SuspiciousPatternFlag::None {
             env.events().publish(
                 (
@@ -1327,9 +1317,8 @@ impl StakingContract {
                     // staker has passed the minimum-duration gate.
                     let staked_duration = snapshot_at.saturating_sub(record.staked_at);
                     if staked_duration >= MIN_STAKING_DURATION_SECS {
-                        eligible_total = eligible_total
-                            .checked_add(record.amount)
-                            .expect("Overflow");
+                        eligible_total =
+                            eligible_total.checked_add(record.amount).expect("Overflow");
                     }
                 }
             }
@@ -1391,11 +1380,7 @@ impl StakingContract {
     /// Returns the per-epoch staker-snapshot amount recorded when `epoch`
     /// closed, or `None` if the staker had no active stake at that moment
     /// (or the epoch hasn't closed yet).
-    pub fn get_epoch_staker_snapshot(
-        env: Env,
-        epoch: u64,
-        staker: Address,
-    ) -> Option<i128> {
+    pub fn get_epoch_staker_snapshot(env: Env, epoch: u64, staker: Address) -> Option<i128> {
         env.storage()
             .persistent()
             .get(&DataKey::EpochStakerSnapshot(epoch, staker))
@@ -1506,9 +1491,15 @@ impl StakingContract {
                     .persistent()
                     .get::<_, StakeRecord>(&DataKey::Stake(staker.clone()))
                 {
-                    let share = record.amount.safe_mul(&env, amount).safe_div(&env, total_staked);
+                    let share = record
+                        .amount
+                        .safe_mul(&env, amount)
+                        .safe_div(&env, total_staked);
                     env.events().publish(
-                        (Symbol::new(&env, "Staking"), Symbol::new(&env, "RewardAudit")),
+                        (
+                            Symbol::new(&env, "Staking"),
+                            Symbol::new(&env, "RewardAudit"),
+                        ),
                         (staker.clone(), record.amount, total_staked, share),
                     );
                     if share > 0 {
@@ -1525,9 +1516,10 @@ impl StakingContract {
                 .persistent()
                 .get(&DataKey::PendingRewards(staker.clone()))
                 .unwrap_or(0);
-            env.storage()
-                .persistent()
-                .set(&DataKey::PendingRewards(staker.clone()), &pending.safe_add(&env, share));
+            env.storage().persistent().set(
+                &DataKey::PendingRewards(staker.clone()),
+                &pending.safe_add(&env, share),
+            );
         }
     }
 
@@ -1634,11 +1626,7 @@ impl StakingContract {
                 break;
             }
             let key = DataKey::StakerRewardLockup(staker.clone(), epoch);
-            if let Some(mut lockup) = env
-                .storage()
-                .persistent()
-                .get::<_, RewardLockup>(&key)
-            {
+            if let Some(mut lockup) = env.storage().persistent().get::<_, RewardLockup>(&key) {
                 checked += 1;
                 if !lockup.claimed && lockup.unlocks_at <= now && lockup.scaled_amount > 0 {
                     total_claimable = total_claimable
@@ -1701,14 +1689,7 @@ impl StakingContract {
             .get::<_, StakeRecord>(&DataKey::Stake(staker.clone()))
             .map(|r| r.amount)
             .unwrap_or(0);
-        let flag = detect_suspicious_pattern(
-            &env,
-            &actions,
-            stake_amount,
-            total,
-            next_dist,
-            now,
-        );
+        let flag = detect_suspicious_pattern(&env, &actions, stake_amount, total, next_dist, now);
         if flag != SuspiciousPatternFlag::None {
             env.events().publish(
                 (
@@ -1747,9 +1728,11 @@ impl StakingContract {
         let mut locked: i128 = 0;
 
         for epoch in 0..current_epoch {
-            if let Some(lockup) = env.storage().persistent().get::<_, RewardLockup>(
-                &DataKey::StakerRewardLockup(staker.clone(), epoch),
-            ) {
+            if let Some(lockup) = env
+                .storage()
+                .persistent()
+                .get::<_, RewardLockup>(&DataKey::StakerRewardLockup(staker.clone(), epoch))
+            {
                 if lockup.claimed {
                     continue;
                 }
@@ -1758,9 +1741,7 @@ impl StakingContract {
                         .checked_add(lockup.scaled_amount)
                         .unwrap_or(claimable);
                 } else {
-                    locked = locked
-                        .checked_add(lockup.scaled_amount)
-                        .unwrap_or(locked);
+                    locked = locked.checked_add(lockup.scaled_amount).unwrap_or(locked);
                 }
             }
         }
@@ -1805,8 +1786,7 @@ impl StakingContract {
                         .unwrap_or(0);
                     if epoch_reward_proxy > 0 {
                         let base = ((record.amount as u128) * (epoch_reward_proxy as u128)
-                            / (total_staked as u128))
-                            as i128;
+                            / (total_staked as u128)) as i128;
                         projected = apply_bps_multiplier(base, mult);
                     }
                 }
@@ -1845,14 +1825,15 @@ impl StakingContract {
         let caller = env.current_contract_address();
         let pre_snapshot = StateSnapshot::capture(&env);
 
-        let pool_balance: i128 = env.storage().persistent().get(&DataKey::LPRewardPool).unwrap_or(0);
-        let new_pool = pool_balance
-            .checked_add(amount)
-            .ok_or(Error::Overflow)?;
-        env.storage().persistent().set(
-            &DataKey::LPRewardPool,
-            &new_pool,
-        );
+        let pool_balance: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LPRewardPool)
+            .unwrap_or(0);
+        let new_pool = pool_balance.checked_add(amount).ok_or(Error::Overflow)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::LPRewardPool, &new_pool);
 
         let mnt_token: Address = env
             .storage()
@@ -1898,12 +1879,17 @@ impl StakingContract {
             registered_at: now,
             last_reward_at: now,
         };
-        env.storage().persistent().set(&DataKey::LiquidityProviderRecord(lp_holder), &record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::LiquidityProviderRecord(lp_holder), &record);
         Ok(())
     }
 
     pub fn verify_lp_position(env: Env, lp_holder: Address) -> bool {
-        let record: Option<LPRecord> = env.storage().persistent().get(&DataKey::LiquidityProviderRecord(lp_holder.clone()));
+        let record: Option<LPRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LiquidityProviderRecord(lp_holder.clone()));
         if let Some(r) = record {
             let client = token::Client::new(&env, &r.lp_token_contract);
             let balance = client.balance(&lp_holder);
@@ -1916,7 +1902,11 @@ impl StakingContract {
         if !Self::verify_lp_position(env.clone(), lp_holder.clone()) {
             return 0;
         }
-        let record: LPRecord = env.storage().persistent().get(&DataKey::LiquidityProviderRecord(lp_holder)).unwrap();
+        let record: LPRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LiquidityProviderRecord(lp_holder))
+            .unwrap();
         // Calculate boost based on lp_token_amount (example: 100 bps per 1000 LP tokens)
         let boost = (record.lp_token_amount / 1000) as u32;
         boost.min(500) // cap at 500 bps (5%)
@@ -1927,39 +1917,56 @@ impl StakingContract {
         if !Self::verify_lp_position(env.clone(), lp_holder.clone()) {
             return Err(Error::InvalidAmount); // Or a specific error
         }
-        
-        let mut record: LPRecord = env.storage().persistent().get(&DataKey::LiquidityProviderRecord(lp_holder.clone())).unwrap();
+
+        let mut record: LPRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LiquidityProviderRecord(lp_holder.clone()))
+            .unwrap();
         let now = env.ledger().timestamp();
         let time_staked = now.safe_sub(&env, record.last_reward_at);
-        
+
         if time_staked == 0 {
             return Ok(());
         }
 
         // Calculate rewards: proportional to time and amount
         // Assuming a rate, e.g., 1 reward token per 1000 LP tokens per day
-        let reward = record.lp_token_amount
+        let reward = record
+            .lp_token_amount
             .safe_mul(&env, time_staked as i128)
             .safe_div(&env, 1000 * 86400);
-        
+
         if reward > 0 {
-            let pool_balance: i128 = env.storage().persistent().get(&DataKey::LPRewardPool).unwrap_or(0);
+            let pool_balance: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::LPRewardPool)
+                .unwrap_or(0);
             if reward > pool_balance {
-                 // Adjust to pool balance or return error
-                 // For now, let's just pay what's in the pool
-                 let actual_reward = reward.min(pool_balance);
-                 env.storage().persistent().set(&DataKey::LPRewardPool, &(pool_balance.safe_sub(&env, actual_reward)));
-                 let token_client = token::Client::new(&env, &mnt_token);
-                 token_client.transfer(&env.current_contract_address(), &lp_holder, &actual_reward);
+                // Adjust to pool balance or return error
+                // For now, let's just pay what's in the pool
+                let actual_reward = reward.min(pool_balance);
+                env.storage().persistent().set(
+                    &DataKey::LPRewardPool,
+                    &(pool_balance.safe_sub(&env, actual_reward)),
+                );
+                let token_client = token::Client::new(&env, &mnt_token);
+                token_client.transfer(&env.current_contract_address(), &lp_holder, &actual_reward);
             } else {
-                 env.storage().persistent().set(&DataKey::LPRewardPool, &(pool_balance.safe_sub(&env, reward)));
-                 let token_client = token::Client::new(&env, &mnt_token);
-                 token_client.transfer(&env.current_contract_address(), &lp_holder, &reward);
+                env.storage().persistent().set(
+                    &DataKey::LPRewardPool,
+                    &(pool_balance.safe_sub(&env, reward)),
+                );
+                let token_client = token::Client::new(&env, &mnt_token);
+                token_client.transfer(&env.current_contract_address(), &lp_holder, &reward);
             }
         }
-        
+
         record.last_reward_at = now;
-        env.storage().persistent().set(&DataKey::LiquidityProviderRecord(lp_holder), &record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::LiquidityProviderRecord(lp_holder), &record);
 
         Ok(())
     }
@@ -2042,11 +2049,23 @@ impl StakingContract {
             }
         };
 
-        if meets(reqs.gold_stake, reqs.gold_min_rating, reqs.gold_min_sessions) {
+        if meets(
+            reqs.gold_stake,
+            reqs.gold_min_rating,
+            reqs.gold_min_sessions,
+        ) {
             3
-        } else if meets(reqs.silver_stake, reqs.silver_min_rating, reqs.silver_min_sessions) {
+        } else if meets(
+            reqs.silver_stake,
+            reqs.silver_min_rating,
+            reqs.silver_min_sessions,
+        ) {
             2
-        } else if meets(reqs.bronze_stake, reqs.bronze_min_rating, reqs.bronze_min_sessions) {
+        } else if meets(
+            reqs.bronze_stake,
+            reqs.bronze_min_rating,
+            reqs.bronze_min_sessions,
+        ) {
             1
         } else {
             0
@@ -2181,10 +2200,9 @@ impl StakingContract {
                             unlocks_at,
                             claimed: false,
                         };
-                        env.storage().persistent().set(
-                            &DataKey::StakerRewardLockup(staker.clone(), epoch),
-                            &lockup,
-                        );
+                        env.storage()
+                            .persistent()
+                            .set(&DataKey::StakerRewardLockup(staker.clone(), epoch), &lockup);
                         env.events().publish(
                             (
                                 Symbol::new(env, "reward_lockup"),
@@ -2211,11 +2229,7 @@ impl StakingContract {
     }
 
     /// Look up the RewardLockup for (staker, epoch), if any.
-    pub fn get_reward_lockup(
-        env: Env,
-        staker: Address,
-        epoch: u64,
-    ) -> Option<RewardLockup> {
+    pub fn get_reward_lockup(env: Env, staker: Address, epoch: u64) -> Option<RewardLockup> {
         env.storage()
             .persistent()
             .get(&DataKey::StakerRewardLockup(staker, epoch))
@@ -2231,9 +2245,11 @@ impl StakingContract {
             .unwrap_or(0);
         let mut total: i128 = 0;
         for e in 0..current_epoch {
-            if let Some(l) = env.storage().persistent().get::<_, RewardLockup>(
-                &DataKey::StakerRewardLockup(staker.clone(), e),
-            ) {
+            if let Some(l) = env
+                .storage()
+                .persistent()
+                .get::<_, RewardLockup>(&DataKey::StakerRewardLockup(staker.clone(), e))
+            {
                 total = total.checked_add(l.scaled_amount).unwrap_or(total);
             }
         }
@@ -2264,7 +2280,11 @@ impl StakingContract {
     ///
     /// # Auth
     /// Only the stored admin may call this.
-    pub fn set_emergency_signers(env: Env, admin: Address, signers: Vec<Address>) -> Result<(), Error> {
+    pub fn set_emergency_signers(
+        env: Env,
+        admin: Address,
+        signers: Vec<Address>,
+    ) -> Result<(), Error> {
         let stored_admin: Address = env
             .storage()
             .instance()
@@ -2626,9 +2646,7 @@ impl StakingContract {
             &DataKey::StakeRollbackApproval(proposal_id, signer.clone()),
             &true,
         );
-        proposal.approval_count = proposal
-            .approval_count
-            .safe_add(&env, 1);
+        proposal.approval_count = proposal.approval_count.safe_add(&env, 1);
         env.storage()
             .persistent()
             .set(&DataKey::StakeRollbackProposal(proposal_id), &proposal);
@@ -2758,13 +2776,13 @@ impl StakingContract {
             .persistent()
             .get(&DataKey::EpochId)
             .unwrap_or(0);
-        
+
         let total_staked: i128 = env
             .storage()
             .persistent()
             .get(&DataKey::TotalStaked)
             .unwrap_or(0);
-        
+
         let total_distributed: i128 = env
             .storage()
             .persistent()
@@ -2881,7 +2899,9 @@ impl StakingContract {
             let recent_actions = action_log.len();
             let timespan = if action_log.len() > 0 {
                 let first = action_log.get_unchecked(0).timestamp;
-                let last = action_log.get_unchecked((action_log.len() - 1) as u32).timestamp;
+                let last = action_log
+                    .get_unchecked((action_log.len() - 1) as u32)
+                    .timestamp;
                 last.saturating_sub(first)
             } else {
                 u64::MAX
@@ -2897,15 +2917,10 @@ impl StakingContract {
     }
 
     /// Monitor governance token accumulation to prevent vote manipulation
-    pub fn monitor_governance_accumulation(
-        env: Env,
-        staker: Address,
-    ) -> Result<u32, Error> {
+    pub fn monitor_governance_accumulation(env: Env, staker: Address) -> Result<u32, Error> {
         let total_staked = Self::get_total_staked(&env);
-        let staker_stake: Option<StakeRecord> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Stake(&staker));
+        let staker_stake: Option<StakeRecord> =
+            env.storage().persistent().get(&DataKey::Stake(&staker));
 
         if let Some(stake_record) = staker_stake {
             let accumulation_bps = if total_staked > 0 {
@@ -2928,6 +2943,73 @@ impl StakingContract {
         } else {
             Ok(0)
         }
+    }
+
+    /// Audit token velocity and concentration together so governance can
+    /// detect artificial scarcity, hoarding, and velocity manipulation.
+    pub fn audit_token_velocity(
+        env: Env,
+        observed_volume: i128,
+        concentration_bps: u32,
+    ) -> Result<EconomicVelocityReport, Error> {
+        Validator::new(&env)
+            .require_non_negative(observed_volume, "observed_volume")
+            .validate()
+            .map_err(|_| Error::InvalidAmount)?;
+
+        let report = assess_token_velocity(
+            Self::get_total_staked(&env),
+            observed_volume,
+            concentration_bps,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::EconomicVelocityReport, &report);
+        if report.stabilization_required {
+            env.events().publish(
+                (
+                    Symbol::new(&env, "economic"),
+                    Symbol::new(&env, "velocity_risk"),
+                ),
+                (
+                    report.velocity_bps,
+                    report.concentration_bps,
+                    report.health_score,
+                ),
+            );
+        }
+        Ok(report)
+    }
+
+    /// Combine governance, economic, technical, and social risk signals into
+    /// one coordinated-response report for multi-vector campaigns.
+    pub fn correlate_threat_vectors(
+        env: Env,
+        governance_risk: u32,
+        economic_risk: u32,
+        technical_risk: u32,
+        social_risk: u32,
+    ) -> MultiVectorThreatReport {
+        let report = correlate_attack_vectors(
+            &env,
+            governance_risk,
+            economic_risk,
+            technical_risk,
+            social_risk,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::MultiVectorThreatReport, &report);
+        if report.coordinated_response_required {
+            env.events().publish(
+                (
+                    Symbol::new(&env, "threat"),
+                    Symbol::new(&env, "multi_vector"),
+                ),
+                (report.combined_risk_score, report.vectors_triggered),
+            );
+        }
+        report
     }
 
     /// Validate sustainability metrics to prevent gaming
@@ -2968,7 +3050,7 @@ impl StakingContract {
             .persistent()
             .get(&DataKey::StakerCount)
             .unwrap_or(0);
-        
+
         let total_staked = Self::get_total_staked(&env);
         let average_stake = if total_stakers > 0 {
             total_staked / (total_stakers as i128)
@@ -2980,7 +3062,7 @@ impl StakingContract {
         // High Gini = high inequality = potential exploitation risk
         let mut top_10_pct = 0i128;
         let stake_sample_size = total_stakers.min(10);
-        
+
         for i in 0..stake_sample_size {
             if let Some(staker_addr) = Self::get_staker_at(&env, i) {
                 if let Some(stake_rec) = env
@@ -3087,7 +3169,7 @@ impl StakingContract {
         if let Some(mut record) = migration_record {
             // Check fairness window
             let elapsed = env.ledger().timestamp().saturating_sub(record.initiated_at);
-            
+
             if elapsed <= MIGRATION_FAIRNESS_WINDOW {
                 // Within fairness window - verify no coordination
                 if !record.coordination_detected {
@@ -3848,4 +3930,3 @@ mod test {
         assert_eq!(f.client().get_tier(&mentor), 3);
     }
 }
-

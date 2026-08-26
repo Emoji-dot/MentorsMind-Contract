@@ -1,69 +1,44 @@
 #![no_std]
 
 use shared::{
-    compute_scalability_intervention, detect_coordination,
-    detect_resource_competition as shared_detect_resource_competition, detect_price_coordination,
-    distribute_resources_fairly as shared_distribute_resources_fairly, evaluate_fair_access,
-    interaction_commitment, is_performance_restoration_eligible,
-    validate_load_pattern as shared_validate_load_pattern,
-    verify_demand_authenticity as shared_verify_demand_authenticity, CoordinationFlag,
-    DemandAuthenticity, FairAccessDecision, FairResourceAllocation, LoadValidationResult,
-    PerformanceInterventionRecord, PriceCoordinationFlag, ReputationProof,
-    ResourceCompetitionFlag, SocialProofRecord, PERFORMANCE_RESTORATION_COOLDOWN_SECS,
     // learner protection
-    assess_vulnerability, enforce_learner_fair_pricing as shared_enforce_learner_fair_pricing,
-    compute_learner_protection_intervention, compute_emergency_intervention,
-    is_protection_restoration_eligible,
-    detect_predatory_behavior as shared_detect_predatory_behavior,
-    identify_exploitation_patterns as shared_identify_exploitation_patterns,
+    assess_vulnerability,
+    compute_emergency_intervention,
+    compute_learner_protection_intervention,
+    compute_scalability_intervention,
     compute_welfare_status as shared_compute_welfare_status,
-    VulnerabilityAssessment, EmergencyIntervention, LearnerProtectionRecord,
-    // metadata validation and information warfare
-    validate_metadata_authenticity,
-    verify_information_integrity as shared_verify_information_integrity,
-    protect_transparency as shared_protect_transparency,
-    monitor_metadata_manipulation, audit_information_accuracy, restore_truth_and_correct,
-    is_transparency_restoration_eligible, MetadataValidation, InformationIntegrity,
-    TransparencyProtection, MetadataMonitoringRecord, InformationAuditRecord, TruthRestorationRecord,
-    TRANSPARENCY_RESTORATION_COOLDOWN_SECS,
-    // Mentor wellness (#910)
-    MentorWorkload, BurnoutRiskAssessment, SessionDifficulty, SessionDistributionRequest, FairDistributionResult,
-    WellnessIntervention, EmergencyProtection,
-    update_mentor_workload, calculate_burnout_risk, assess_burnout_risk, distribute_sessions_fairly,
-    initiate_intervention, activate_emergency_protection, can_accept_session,
-    // Session recording (#914)
-    SessionRecording, RecordingStatus, ConsentRecord, AccessRole, RedactionRecord, AccessLogEntry, IntegrityVerificationResult,
-    create_recording, compute_merkle_root, verify_recording_integrity, grant_consent, revoke_consent,
-    check_access_authorized, apply_redaction, log_access, emergency_privacy_protection,
-    // Market monitoring (#915)
-    MarketMetrics, DemandAuthenticityResult, SupplyDemandBalance, PriceDiscoveryValidation, MarketManipulationAlert, EmergencyStabilization,
-    calculate_market_metrics, assess_demand_authenticity, balance_supply_demand, validate_price_discovery, detect_market_manipulation, trigger_emergency_stabilization,
-    // Scheduling integrity / availability-gaming protection (#884)
-    compute_availability_commitment, verify_availability_commitment, validate_conflict_proof,
-    detect_availability_gaming, AvailabilityCommitment, ConflictProof, AvailabilityGamingFlag,
-    // Cross-session data isolation & privacy protection (#899)
-    enforce_session_boundary, detect_cross_session_leak, contain_data_breach,
-    SessionAccessBoundary, CrossSessionLeakResult, DataBreachContainment,
-    // Session protection & attack detection (#901)
-    compute_disruption_score, should_protect_session, activate_backup,
-    SessionProtectionRecord, ProtectionCheckResult, DISRUPTION_RISK_THRESHOLD_BPS,
-    score_attack_event, evaluate_attack_risk,
-    AttackEvent, AttackType, AttackDetectionResult,
-    needs_backup, is_backup_valid,
-    ContinuityBackup, ContinuityStatus,
-    // Quality assurance (#902)
-    compute_average_score, passes_quality_check, build_quality_metrics,
-    QualityAssessment, QualityMetrics, QualityCheckResult, QualityFailReason,
-    MIN_SESSIONS_FOR_QUALITY, QUALITY_RISK_THRESHOLD_BPS,
-    // Tokenomics protection (#903)
-    exceeds_extraction_rate, sustainability_ratio_ok, detect_coordinated_timing,
-    FairDistributionCheck, ManipulationReason, TokenomicsAuditResult,
-    MAX_EXTRACTION_RATE_BPS, MIN_SUSTAINABILITY_RATIO,
-    // Account security (#904)
-    is_account_locked as shared_is_account_locked, record_failed_attempt, record_successful_login,
-    compute_correlation_score, is_identity_match,
-    AccountSecurityRecord, CrossPlatformIdentity, FraudAlert, FraudType,
-    MAX_FAILED_ATTEMPTS, LOCKOUT_DURATION_SECS,
+    detect_coordination,
+    detect_predatory_behavior as shared_detect_predatory_behavior,
+    detect_price_coordination,
+    detect_resource_competition as shared_detect_resource_competition,
+    distribute_resources_fairly as shared_distribute_resources_fairly,
+    enforce_learner_fair_pricing as shared_enforce_learner_fair_pricing,
+    evaluate_fair_access,
+    identify_exploitation_patterns as shared_identify_exploitation_patterns,
+    interaction_commitment,
+    is_performance_restoration_eligible,
+    is_protection_restoration_eligible,
+    validate_load_pattern as shared_validate_load_pattern,
+    verify_demand_authenticity as shared_verify_demand_authenticity,
+    CartelDetection,
+    CartelDetectionResult,
+    CoordinationFlag,
+    CoordinationPattern,
+    DemandAuthenticity,
+    EmergencyIntervention,
+    FairAccessDecision,
+    FairResourceAllocation,
+    LearnerProtectionRecord,
+    LoadValidationResult,
+    PerformanceInterventionRecord,
+    PriceCoordinationFlag,
+    ReputationProof,
+    ResourceCompetitionFlag,
+    SocialProofRecord,
+    TimeSlotFairnessAnalysis,
+    TimeSlotInfo,
+    VulnerabilityAssessment,
+    PERFORMANCE_RESTORATION_COOLDOWN_SECS,
 };
 
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol, Vec, Map};
@@ -241,7 +216,8 @@ impl SessionRegistry {
         // gate on automatic fair-access intervention before committing state.
         // A panic here reverts all storage writes for this invocation.
         Self::record_monitoring_signals(&env, &mentor, &learner, amount, scheduled_at);
-        let access = Self::ensure_fair_community_access(env.clone(), mentor.clone(), learner.clone());
+        let access =
+            Self::ensure_fair_community_access(env.clone(), mentor.clone(), learner.clone());
         if !access.access_granted {
             panic!("CommunityAccessRestricted");
         }
@@ -250,26 +226,39 @@ impl SessionRegistry {
         // learner spend totals, then assess vulnerability and enforce fair pricing.
         let pair_cnt_key = DataKey::LearnerMentorSessionCount(learner.clone(), mentor.clone());
         let pair_cnt: u32 = env.storage().persistent().get(&pair_cnt_key).unwrap_or(0);
-        env.storage().persistent().set(&pair_cnt_key, &pair_cnt.saturating_add(1));
-        env.storage().persistent().extend_ttl(&pair_cnt_key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .persistent()
+            .set(&pair_cnt_key, &pair_cnt.saturating_add(1));
+        env.storage()
+            .persistent()
+            .extend_ttl(&pair_cnt_key, TTL_THRESHOLD, TTL_BUMP);
 
         let spend_key = DataKey::LearnerTotalSpend(learner.clone());
         let spend: i128 = env.storage().persistent().get(&spend_key).unwrap_or(0);
-        env.storage().persistent().set(&spend_key, &spend.saturating_add(amount));
+        env.storage()
+            .persistent()
+            .set(&spend_key, &spend.saturating_add(amount));
 
         let lsc_key = DataKey::LearnerTotalSessionCount(learner.clone());
         let lsc: u32 = env.storage().persistent().get(&lsc_key).unwrap_or(0);
-        env.storage().persistent().set(&lsc_key, &lsc.saturating_add(1));
+        env.storage()
+            .persistent()
+            .set(&lsc_key, &lsc.saturating_add(1));
 
         // Assess vulnerability and apply fair-pricing enforcement.
-        let _assessed_price = Self::enforce_fair_pricing(env.clone(), learner.clone(), mentor.clone(), amount);
+        let _assessed_price =
+            Self::enforce_fair_pricing(env.clone(), learner.clone(), mentor.clone(), amount);
         Self::assess_learner_vulnerability(env.clone(), learner.clone(), mentor.clone(), amount);
 
         // Scalability protection: track requested booking-capacity units and
         // re-score this mentor's resource-competition/load risk before
         // committing state (#scalability-protection).
         let total_units_key = DataKey::MentorTotalRequestedUnits(mentor.clone());
-        let total_units: u32 = env.storage().persistent().get(&total_units_key).unwrap_or(0);
+        let total_units: u32 = env
+            .storage()
+            .persistent()
+            .get(&total_units_key)
+            .unwrap_or(0);
         env.storage()
             .persistent()
             .set(&total_units_key, &total_units.saturating_add(duration_mins));
@@ -302,9 +291,10 @@ impl SessionRegistry {
             .persistent()
             .get(&mentor_count_key)
             .unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&DataKey::MentorSessionAt(mentor.clone(), mentor_idx), &session_id.clone());
+        env.storage().persistent().set(
+            &DataKey::MentorSessionAt(mentor.clone(), mentor_idx),
+            &session_id.clone(),
+        );
         env.storage()
             .persistent()
             .set(&mentor_count_key, &(mentor_idx + 1));
@@ -316,9 +306,10 @@ impl SessionRegistry {
             .persistent()
             .get(&learner_count_key)
             .unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&DataKey::LearnerSessionAt(learner.clone(), learner_idx), &session_id.clone());
+        env.storage().persistent().set(
+            &DataKey::LearnerSessionAt(learner.clone(), learner_idx),
+            &session_id.clone(),
+        );
         env.storage()
             .persistent()
             .set(&learner_count_key, &(learner_idx + 1));
@@ -350,12 +341,17 @@ impl SessionRegistry {
             .expect("Session not found");
 
         let old_status = record.status.clone();
-        
+
         // Release time buckets if transitioning to Cancelled
         if status == SessionStatus::Cancelled && old_status != SessionStatus::Cancelled {
-            Self::release_time_buckets(&env, &record.mentor, record.scheduled_at, record.duration_mins);
+            Self::release_time_buckets(
+                &env,
+                &record.mentor,
+                record.scheduled_at,
+                record.duration_mins,
+            );
         }
-        
+
         record.status = status.clone();
         env.storage().persistent().set(&session_key, &record);
         if status == SessionStatus::Completed {
@@ -537,7 +533,10 @@ impl SessionRegistry {
             TTL_BUMP,
         );
         env.events().publish(
-            (symbol_short!("session"), Symbol::new(env, "proof_generated")),
+            (
+                symbol_short!("session"),
+                Symbol::new(env, "proof_generated"),
+            ),
             (record.session_id.clone(), proof.commitment),
         );
     }
@@ -662,13 +661,19 @@ impl SessionRegistry {
     ) {
         // Pair coordination log, keyed on the scheduler-controlled `scheduled_at`.
         let pair_key = DataKey::MentorLearnerLog(mentor.clone(), learner.clone());
-        let mut pair_log: Vec<u64> = env.storage().persistent().get(&pair_key).unwrap_or(Vec::new(env));
+        let mut pair_log: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&pair_key)
+            .unwrap_or(Vec::new(env));
         pair_log.push_back(scheduled_at);
         while pair_log.len() > MONITORING_LOG_CAP {
             pair_log.remove(0);
         }
         env.storage().persistent().set(&pair_key, &pair_log);
-        env.storage().persistent().extend_ttl(&pair_key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .persistent()
+            .extend_ttl(&pair_key, TTL_THRESHOLD, TTL_BUMP);
 
         // Distinct-learner tracking for demand authenticity.
         let seen_key = DataKey::MentorHasBookedBefore(mentor.clone(), learner.clone());
@@ -681,19 +686,33 @@ impl SessionRegistry {
 
         // Booking-request log, keyed on wall-clock request time.
         let req_key = DataKey::MentorRequestLog(mentor.clone());
-        let mut req_log: Vec<u64> = env.storage().persistent().get(&req_key).unwrap_or(Vec::new(env));
+        let mut req_log: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&req_key)
+            .unwrap_or(Vec::new(env));
         req_log.push_back(env.ledger().timestamp());
         while req_log.len() > MONITORING_LOG_CAP {
             req_log.remove(0);
         }
         env.storage().persistent().set(&req_key, &req_log);
-        env.storage().persistent().extend_ttl(&req_key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .persistent()
+            .extend_ttl(&req_key, TTL_THRESHOLD, TTL_BUMP);
 
         // Global rolling price log for cross-mentor pricing-coordination detection.
         let prices_key = DataKey::RecentSessionPrices;
         let prices_ts_key = DataKey::RecentSessionPriceTimestamps;
-        let mut prices: Vec<i128> = env.storage().persistent().get(&prices_key).unwrap_or(Vec::new(env));
-        let mut price_ts: Vec<u64> = env.storage().persistent().get(&prices_ts_key).unwrap_or(Vec::new(env));
+        let mut prices: Vec<i128> = env
+            .storage()
+            .persistent()
+            .get(&prices_key)
+            .unwrap_or(Vec::new(env));
+        let mut price_ts: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&prices_ts_key)
+            .unwrap_or(Vec::new(env));
         prices.push_back(amount);
         price_ts.push_back(env.ledger().timestamp());
         while prices.len() > MONITORING_LOG_CAP {
@@ -704,15 +723,23 @@ impl SessionRegistry {
         }
         env.storage().persistent().set(&prices_key, &prices);
         env.storage().persistent().set(&prices_ts_key, &price_ts);
-        env.storage().persistent().extend_ttl(&prices_key, TTL_THRESHOLD, TTL_BUMP);
-        env.storage().persistent().extend_ttl(&prices_ts_key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .persistent()
+            .extend_ttl(&prices_key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .persistent()
+            .extend_ttl(&prices_ts_key, TTL_THRESHOLD, TTL_BUMP);
     }
 
     /// Score a mentor/learner pair's booking history for coordination
     /// (repeated, tightly-clustered scheduling characteristic of a
     /// manipulation ring). Safe to call by anyone as a read-through audit;
     /// also invoked internally on every `register_session`.
-    pub fn detect_mentor_coordination(env: Env, mentor: Address, learner: Address) -> CoordinationFlag {
+    pub fn detect_mentor_coordination(
+        env: Env,
+        mentor: Address,
+        learner: Address,
+    ) -> CoordinationFlag {
         let log: Vec<u64> = env
             .storage()
             .persistent()
@@ -735,7 +762,11 @@ impl SessionRegistry {
     /// the mentor's coordination score with a neutral social-proof
     /// placeholder (the reputation contract owns real endorsement signals)
     /// and returns whether scheduling should be blocked.
-    pub fn ensure_fair_community_access(env: Env, mentor: Address, learner: Address) -> FairAccessDecision {
+    pub fn ensure_fair_community_access(
+        env: Env,
+        mentor: Address,
+        learner: Address,
+    ) -> FairAccessDecision {
         let coordination = Self::detect_mentor_coordination(env.clone(), mentor.clone(), learner);
         let neutral_social_proof = SocialProofRecord {
             genuine: true,
@@ -896,7 +927,10 @@ impl SessionRegistry {
         let pair_count: u32 = env
             .storage()
             .persistent()
-            .get(&DataKey::LearnerMentorSessionCount(learner.clone(), mentor.clone()))
+            .get(&DataKey::LearnerMentorSessionCount(
+                learner.clone(),
+                mentor.clone(),
+            ))
             .unwrap_or(0);
 
         let total_spend: i128 = env
@@ -993,20 +1027,13 @@ impl SessionRegistry {
             });
 
         // Identify exploitation patterns and compute welfare status.
-        let patterns =
-            shared_identify_exploitation_patterns(&env, vulnerability, behavior);
+        let patterns = shared_identify_exploitation_patterns(&env, vulnerability, behavior);
         let pattern_count = patterns.len();
-        let welfare =
-            shared_compute_welfare_status(vulnerability, pattern_count);
+        let welfare = shared_compute_welfare_status(vulnerability, pattern_count);
 
         let now = env.ledger().timestamp();
-        let protection = compute_learner_protection_intervention(
-            &env,
-            vulnerability,
-            behavior,
-            welfare,
-            now,
-        );
+        let protection =
+            compute_learner_protection_intervention(&env, vulnerability, behavior, welfare, now);
 
         env.storage().persistent().set(
             &DataKey::LearnerProtectionIntervention(mentor.clone()),
@@ -1024,10 +1051,9 @@ impl SessionRegistry {
                 &DataKey::MentorEmergencyIntervention(mentor.clone()),
                 &emergency,
             );
-            env.storage().persistent().set(
-                &DataKey::MentorSuspended(mentor.clone()),
-                &true,
-            );
+            env.storage()
+                .persistent()
+                .set(&DataKey::MentorSuspended(mentor.clone()), &true);
             env.storage().persistent().extend_ttl(
                 &DataKey::MentorEmergencyIntervention(mentor.clone()),
                 TTL_THRESHOLD,
@@ -1217,7 +1243,8 @@ impl SessionRegistry {
     /// Restore fair resource allocation for `mentor` once the
     /// performance-protection intervention cooldown has elapsed. Only
     /// callable by the platform backend.
-    pub fn restore_fair_performance(env: Env, mentor: Address) {        let backend = Self::require_backend(&env);
+    pub fn restore_fair_performance(env: Env, mentor: Address) {
+        let backend = Self::require_backend(&env);
         backend.require_auth();
 
         let record: PerformanceInterventionRecord = env
@@ -1245,7 +1272,12 @@ impl SessionRegistry {
 
     /// Check for scheduling conflicts and buffer enforcement.
     /// Panics with "SessionConflict" if an overlap (including 15-min buffer) is detected.
-    fn check_scheduling_conflicts(env: &Env, mentor: &Address, scheduled_at: u64, duration_mins: u32) {
+    fn check_scheduling_conflicts(
+        env: &Env,
+        mentor: &Address,
+        scheduled_at: u64,
+        duration_mins: u32,
+    ) {
         let session_duration_secs = (duration_mins as u64) * 60;
         let session_end = scheduled_at + session_duration_secs;
 
@@ -1269,7 +1301,13 @@ impl SessionRegistry {
     }
 
     /// Reserve all time buckets for a session.
-    fn reserve_time_buckets(env: &Env, mentor: &Address, scheduled_at: u64, duration_mins: u32, session_id: &Symbol) {
+    fn reserve_time_buckets(
+        env: &Env,
+        mentor: &Address,
+        scheduled_at: u64,
+        duration_mins: u32,
+        session_id: &Symbol,
+    ) {
         let session_duration_secs = (duration_mins as u64) * 60;
         let session_end = scheduled_at + session_duration_secs;
 
@@ -1301,17 +1339,29 @@ impl SessionRegistry {
         }
     }
 
-    pub fn update_session_metadata(env: Env, session_id: Symbol, tags: soroban_sdk::Vec<soroban_sdk::String>) {
+    pub fn update_session_metadata(
+        env: Env,
+        session_id: Symbol,
+        tags: soroban_sdk::Vec<soroban_sdk::String>,
+    ) {
         let key = DataKey::SessionMetadata(session_id);
         env.storage().persistent().set(&key, &tags);
-        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
     }
 
-    pub fn get_session_metadata(env: Env, session_id: Symbol) -> soroban_sdk::Vec<soroban_sdk::String> {
+    pub fn get_session_metadata(
+        env: Env,
+        session_id: Symbol,
+    ) -> soroban_sdk::Vec<soroban_sdk::String> {
         let key = DataKey::SessionMetadata(session_id);
-        env.storage().persistent().get(&key).unwrap_or(Vec::new(&env))
+        env.storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(&env))
     }
-    
+
     /// Returns all session IDs where `participant` is either the mentor or the learner.
     /// Uses the indexed storage (MentorSessionAt / LearnerSessionAt) — not the deprecated Vec keys.
     pub fn get_sessions_by_participant(env: Env, participant: Address) -> soroban_sdk::Vec<Symbol> {
@@ -1361,32 +1411,50 @@ impl SessionRegistry {
     /// persists the resulting `MetadataValidation` record, and emits events when manipulation is detected.
     pub fn validate_session_metadata(
         env: Env,
-        session_id: Symbol,
-        source_count: u32,
-        unverified_changes: u32,
-        timestamp_delta: u64,
-    ) -> MetadataValidation {
-        let _session = Self::get_session(env.clone(), session_id.clone());
-
-        let validation = validate_metadata_authenticity(
-            source_count,
-            unverified_changes,
-            timestamp_delta,
-            env.ledger().timestamp(),
+        mentor: Address,
+        time_window_secs: u64,
+    ) -> CartelDetectionResult {
+        let now = env.ledger().timestamp();
+        let recent_activity = Self::mentor_time_slot_info(
+            &env,
+            &mentor,
+            now.saturating_sub(time_window_secs),
+            now.saturating_add(time_window_secs),
+        );
+        let other_activity: Vec<(Address, Vec<TimeSlotInfo>)> = Vec::new(&env);
+        let mut result = CartelDetection::detect_scheduling_cartels(
+            &env,
+            &mentor,
+            &recent_activity,
+            &other_activity,
         );
 
-        let key = DataKey::SessionMetadataValidation(session_id.clone());
-        env.storage().persistent().set(&key, &validation);
-        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
-
-        if validation.manipulation_detected {
+        let demand = Self::verify_demand_authenticity(env.clone(), mentor.clone());
+        let pricing = Self::monitor_pricing_coordination(env.clone());
+        if !demand.genuine || pricing.suspicious {
+            result.cartel_detected = true;
+            result.confidence_score = result
+                .confidence_score
+                .saturating_add(if !demand.genuine { 25 } else { 0 })
+                .saturating_add(if pricing.suspicious { 25 } else { 0 })
+                .min(100);
+            result.severity = if result.confidence_score >= 80 {
+                4
+            } else if result.confidence_score >= 70 {
+                3
+            } else {
+                2
+            };
+            if !result.involved_mentors.contains(&mentor) {
+                result.involved_mentors.push_back(mentor.clone());
+            }
+            result.recommended_action = Symbol::new(&env, "investigate_and_limit");
             env.events().publish(
-                (symbol_short!("meta"), Symbol::new(&env, "manipulated"), session_id),
-                validation.manipulation_risk_score,
+                (symbol_short!("cartel"), Symbol::new(&env, "flagged")),
+                (mentor, result.confidence_score),
             );
         }
-
-        validation
+        result
     }
 
     /// Add information integrity with disinformation prevention and accuracy verification mechanisms.
@@ -1394,38 +1462,74 @@ impl SessionRegistry {
     /// and emits an event if a disinformation flag is triggered.
     pub fn ensure_information_integrity(
         env: Env,
-        session_id: Symbol,
-        verified_claims: u32,
-        total_claims: u32,
-        disinformation_signals: u32,
-    ) -> InformationIntegrity {
-        let _session = Self::get_session(env.clone(), session_id.clone());
-
-        let integrity = shared_verify_information_integrity(
-            verified_claims,
-            total_claims,
-            disinformation_signals,
-        );
-
-        let key = DataKey::SessionInformationIntegrity(session_id.clone());
-        env.storage().persistent().set(&key, &integrity);
-        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
-
-        if integrity.disinformation_flag {
+        all_mentors: Vec<Address>,
+        time_window: (u64, u64),
+    ) -> TimeSlotFairnessAnalysis {
+        let mut slots = Vec::new(&env);
+        for mentor in all_mentors.iter() {
+            let mut mentor_slots =
+                Self::mentor_time_slot_info(&env, &mentor, time_window.0, time_window.1);
+            slots.append(&mut mentor_slots);
+        }
+        let analysis = CartelDetection::ensure_time_slot_fairness(&env, &all_mentors, &slots, 1);
+        if analysis.fairness_score < 60 {
             env.events().publish(
-                (symbol_short!("info"), Symbol::new(&env, "disinfo_flag"), session_id),
-                integrity.disinformation_risk_score,
+                (symbol_short!("slots"), Symbol::new(&env, "unfair")),
+                (analysis.fairness_score, analysis.monopolized_slots),
             );
         }
-
-        integrity
+        analysis
     }
 
-    /// Create transparency protection with information warfare resistance and truth validation capabilities.
-    /// Combines cached metadata validation and information integrity signals for a session,
-    /// persistence of transparency intervention decision, and restoration eligibility tracking.
-    pub fn protect_transparency(env: Env, session_id: Symbol) -> TransparencyProtection {
-        let _session = Self::get_session(env.clone(), session_id.clone());
+    /// Monitor mentor availability for manipulation patterns
+    /// Detects coordinated withdrawals and strategic availability changes
+    pub fn monitor_availability_patterns(env: Env, mentor: Address) -> Vec<CoordinationPattern> {
+        let demand = Self::verify_demand_authenticity(env.clone(), mentor.clone());
+        let mut patterns = Vec::new(&env);
+        if !demand.genuine {
+            let mut mentors = Vec::new(&env);
+            mentors.push_back(mentor);
+            patterns.push_back(CoordinationPattern {
+                pattern_type: 4,
+                mentors_involved: mentors,
+                time_window_start: 0,
+                time_window_end: env.ledger().timestamp(),
+                confidence_score: demand.artificial_risk_score.min(100),
+            });
+        }
+        patterns
+    }
+
+    fn mentor_time_slot_info(env: &Env, mentor: &Address, from: u64, to: u64) -> Vec<TimeSlotInfo> {
+        let mut slots = Vec::new(env);
+        let session_ids = Self::get_sessions_by_mentor(env.clone(), mentor.clone());
+        for sid in session_ids.iter() {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<_, SessionRecord>(&DataKey::Session(sid))
+            {
+                if record.scheduled_at >= from && record.scheduled_at < to {
+                    let price = if record.amount > 0 {
+                        record.amount.min(u64::MAX as i128) as u64
+                    } else {
+                        0
+                    };
+                    slots.push_back(TimeSlotInfo {
+                        slot_start: record.scheduled_at,
+                        slot_end: record
+                            .scheduled_at
+                            .saturating_add((record.duration_mins as u64).saturating_mul(60)),
+                        mentor: record.mentor,
+                        price,
+                        availability_status: record.status != SessionStatus::Cancelled,
+                    });
+                }
+            }
+        }
+        slots
+    }
+}
 
         let validation: MetadataValidation = env
             .storage()
@@ -1570,74 +1674,17 @@ impl SessionRegistry {
         restoration
     // ── Mentor Wellness & Workload Monitoring (#910) ───────────────────────────
 
-    /// Update mentor workload after session registration
-    pub fn update_mentor_workload(
-        env: Env,
-        mentor: Address,
-        session_id: Symbol,
-        difficulty: SessionDifficulty,
-        hours: u32,
-        is_start: bool,
-    ) {
-        let backend = Self::require_backend(&env);
-        backend.require_auth();
-
-        let mut workload: Option<MentorWorkload> = env.storage().persistent().get(&DataKey::MentorWorkload(mentor.clone()));
-        
-        if workload.is_none() {
-            workload = Some(MentorWorkload {
-                mentor: mentor.clone(),
-                active_sessions: 0,
-                weekly_hours: 0,
-                weekly_weighted_load: 0,
-                sessions_this_week: Vec::new(&env),
-                last_session_end: 0,
-                rest_until: 0,
-                burnout_risk_bps: 0,
-                updated_at: env.ledger().timestamp(),
-            });
-        }
-        
-        let mut w = workload.unwrap();
-        let difficulty_weight = shared::DIFFICULTY_WEIGHTS[difficulty as u32 as usize];
-        let weighted_hours = (hours as u64 * difficulty_weight as u64 / 10000) as u32;
-        
-        if is_start {
-            w.active_sessions = w.active_sessions.saturating_add(1);
-            w.weekly_hours = w.weekly_hours.saturating_add(hours);
-            w.weekly_weighted_load = w.weekly_weighted_load.saturating_add(weighted_hours);
-            w.sessions_this_week.push_back(session_id);
-        } else {
-            w.active_sessions = w.active_sessions.saturating_sub(1);
-            w.last_session_end = env.ledger().timestamp();
-            w.rest_until = env.ledger().timestamp() + (shared::MIN_REST_HOURS as u64 * 3600);
-        }
-        
-        w.updated_at = env.ledger().timestamp();
-        w.burnout_risk_bps = calculate_burnout_risk(&w);
-        
-        env.storage().persistent().set(&DataKey::MentorWorkload(mentor.clone()), &w);
-        
-        // Assess burnout risk
-        let assessment = assess_burnout_risk(&env, &w);
-        env.storage().persistent().set(&DataKey::MentorBurnoutAssessment(mentor.clone()), &assessment);
-        
-        // Auto-initiate intervention if critical
-        if assessment.risk_level == Symbol::new(&env, "critical") {
-            let intervention = initiate_intervention(
-                &env,
-                &mentor,
-                Symbol::new(&env, "emergency_pause"),
-                Symbol::new(&env, "critical_burnout_risk"),
-                shared::MANDATORY_REST_HOURS,
-                &env.current_contract_address(),
-            );
-            env.storage().persistent().set(&DataKey::WellnessIntervention(mentor.clone()), &intervention);
-            
-            env.events().publish(
-                (symbol_short!("wellness"), Symbol::new(&env, "intervention_triggered")),
-                (mentor, intervention.intervention_type, intervention.duration_hours),
-            );
+        for i in 1u32..=3 {
+            let sid = match i {
+                1 => Symbol::new(&env, "s1"),
+                2 => Symbol::new(&env, "s2"),
+                _ => Symbol::new(&env, "s3"),
+            };
+            // Non-overlapping starts past the prior occupied buckets.
+            // 60-min + 15-min buffer ending 2_004_500 occupies through bucket
+            // ending at 2_005_200, so space sessions by 5_400s.
+            let start = 2_000_000u64 + ((i as u64 - 1) * 5_400);
+            client.register_session(&sid, &mentor, &learner, &start, &60u32, &100i128, &token);
         }
     }
 
@@ -2885,10 +2932,10 @@ mod tests {
 
         // Check availability in the next 2 hours
         let availability = client.get_mentor_availability(&mentor, &2_000_000u64, &2_007_200u64);
-        
+
         // Should have at least 4 slots (2 hours / 30 min slots)
         assert!(availability.len() >= 4);
-        
+
         // First slots should be occupied, later ones should be available
         let mut occupied_count = 0;
         for (_, is_available) in availability.iter() {
@@ -2961,15 +3008,37 @@ mod tests {
         let s2 = Symbol::new(&env, "coordA2");
         let s3 = Symbol::new(&env, "coordA3");
 
-        client.register_session(&s1, &mentor, &learner, &2_000_000u64, &5u32, &100i128, &token);
-        client.register_session(&s2, &mentor, &learner, &2_003_500u64, &5u32, &100i128, &token);
+        client.register_session(
+            &s1,
+            &mentor,
+            &learner,
+            &2_000_000u64,
+            &5u32,
+            &100i128,
+            &token,
+        );
+        client.register_session(
+            &s2,
+            &mentor,
+            &learner,
+            &2_003_500u64,
+            &5u32,
+            &100i128,
+            &token,
+        );
 
         // Third clustered booking from the same pair crosses the automatic
         // fair-access intervention threshold and is blocked. The panic
         // reverts all storage writes made during this call, so the pair
         // log stays at 2 entries afterward.
         let result = client.try_register_session(
-            &s3, &mentor, &learner, &2_007_000u64, &5u32, &100i128, &token,
+            &s3,
+            &mentor,
+            &learner,
+            &2_007_000u64,
+            &5u32,
+            &100i128,
+            &token,
         );
         assert!(result.is_err());
 
@@ -2977,7 +3046,15 @@ mod tests {
         // flagged and succeeds, confirming the block was about clustering
         // rather than the pair's total interaction count.
         let s4 = Symbol::new(&env, "coordA4");
-        let returned = client.register_session(&s4, &mentor, &learner, &2_020_000u64, &5u32, &100i128, &token);
+        let returned = client.register_session(
+            &s4,
+            &mentor,
+            &learner,
+            &2_020_000u64,
+            &5u32,
+            &100i128,
+            &token,
+        );
         assert_eq!(returned, s4);
     }
 
@@ -3019,10 +3096,22 @@ mod tests {
 
         // Two independent mentors set the same price at the same instant.
         client.register_session(
-            &Symbol::new(&env, "priceA"), &mentor1, &learner1, &2_000_000u64, &5u32, &250i128, &token,
+            &Symbol::new(&env, "priceA"),
+            &mentor1,
+            &learner1,
+            &2_000_000u64,
+            &5u32,
+            &250i128,
+            &token,
         );
         client.register_session(
-            &Symbol::new(&env, "priceB"), &mentor2, &learner2, &2_100_000u64, &5u32, &250i128, &token,
+            &Symbol::new(&env, "priceB"),
+            &mentor2,
+            &learner2,
+            &2_100_000u64,
+            &5u32,
+            &250i128,
+            &token,
         );
 
         let flag = client.monitor_pricing_coordination();

@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contracttype, Address, Env, Symbol, Vec, contracterror};
+use soroban_sdk::{contracterror, contracttype, Address, Env, Symbol, Vec};
 
 /// Cartel Detection Error Types
 #[contracterror]
@@ -198,20 +198,23 @@ impl CartelDetection {
 
         // Identify monopolizers (mentors with > 60% of premium slots)
         let premium_slot_count = available_slots.iter().fold(0u32, |acc, slot| {
-            if slot.price >= premium_threshold_price { acc + 1 } else { acc }
+            if slot.price >= premium_threshold_price {
+                acc + 1
+            } else {
+                acc
+            }
         });
 
         let monopoly_threshold = (premium_slot_count * 60) / 100;
 
         for mentor in all_mentors.iter() {
-            let mentor_premium_slots =
-                available_slots.iter().fold(0u32, |acc, slot| {
-                    if slot.mentor == mentor && slot.price >= premium_threshold_price {
-                        acc + 1
-                    } else {
-                        acc
-                    }
-                });
+            let mentor_premium_slots = available_slots.iter().fold(0u32, |acc, slot| {
+                if &slot.mentor == mentor && slot.price >= premium_threshold_price {
+                    acc + 1
+                } else {
+                    acc
+                }
+            });
 
             if mentor_premium_slots > monopoly_threshold {
                 monopoly_mentors.push_back(mentor.clone());
@@ -344,7 +347,11 @@ impl CartelDetection {
         activity: &Vec<TimeSlotInfo>,
     ) -> bool {
         activity.iter().fold(0, |acc, slot| {
-            if !slot.availability_status { acc + 1 } else { acc }
+            if !slot.availability_status {
+                acc + 1
+            } else {
+                acc
+            }
         }) > activity.len() as u32 / 2
     }
 

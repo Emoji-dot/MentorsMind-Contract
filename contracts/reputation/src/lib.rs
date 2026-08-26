@@ -1,40 +1,41 @@
 #![no_std]
 
 use shared::{
-    analyze_review_pattern, authenticate_learning_outcomes as shared_authenticate_learning_outcomes,
-    compute_community_intervention, compute_outcome_intervention, detect_coordination,
-    interaction_commitment, is_outcome_restoration_eligible, is_restoration_eligible,
-    protect_success_metrics as shared_protect_success_metrics,
-    validate_assessment_criteria as shared_validate_assessment_criteria, verify_social_proof,
-    AssessmentValidation, BehavioralAnalysis, CommunityInterventionRecord, CoordinationFlag,
-    EscrowRecord, NetworkEffectScore, OutcomeAuthenticity, OutcomeInterventionRecord,
-    ReputationProof, SocialProofRecord, SuccessMetricProtection, OUTCOME_RESTORATION_COOLDOWN_SECS,
+    analyze_review_pattern,
+    assess_review_quality,
+    authenticate_learning_outcomes as shared_authenticate_learning_outcomes,
+    compute_community_intervention,
+    compute_learner_protection_intervention,
+    compute_outcome_intervention,
+    compute_welfare_status as shared_compute_welfare_status,
+    detect_coordination,
     // learner protection (#917)
     detect_predatory_behavior as shared_detect_predatory_behavior,
     identify_exploitation_patterns as shared_identify_exploitation_patterns,
-    compute_welfare_status as shared_compute_welfare_status,
-    compute_learner_protection_intervention, is_protection_restoration_eligible,
-    PredatoryBehaviorDetection, ExploitationPattern, LearnerProtectionRecord,
+    interaction_commitment,
+    is_outcome_restoration_eligible,
+    is_protection_restoration_eligible,
+    is_restoration_eligible,
+    protect_success_metrics as shared_protect_success_metrics,
+    validate_assessment_criteria as shared_validate_assessment_criteria,
+    verify_social_proof,
+    AssessmentValidation,
+    BehavioralAnalysis,
+    CommunityInterventionRecord,
+    CoordinationFlag,
+    EscrowRecord,
+    ExploitationPattern,
+    LearnerProtectionRecord,
+    NetworkEffectScore,
+    OutcomeAuthenticity,
+    OutcomeInterventionRecord,
+    PredatoryBehaviorDetection,
+    ReputationProof,
+    ReviewQualityReport,
+    SocialProofRecord,
+    SuccessMetricProtection,
     VulnerabilityAssessment,
-    // metadata validation and information warfare
-    verify_information_integrity as shared_verify_information_integrity,
-    audit_information_accuracy, monitor_metadata_manipulation, restore_truth_and_correct,
-    InformationIntegrity, InformationAuditRecord, MetadataMonitoringRecord, TruthRestorationRecord,
-    // Grade inflation detection (#911)
-    calculate_grade_distribution, detect_grade_inflation, apply_inflation_adjustment, record_grade_correction,
-    GradeDistributionStats, InflationDetectionResult, MentorScoringAdjustment, GradeCorrectionRecord,
-    // Mentor wellness (#910)
-    assess_burnout_risk, BurnoutRiskAssessment, MentorWorkload,
-    // Market monitoring (#915)
-    calculate_market_metrics, assess_demand_authenticity, validate_price_discovery, detect_market_manipulation,
-    MarketMetrics, DemandAuthenticityResult, PriceDiscoveryValidation,
-    // ML security (main's integrity systems)
-    MLSecurity,
-    // Skill verification & specialization-fraud protection (#891)
-    detect_skill_fraud, SkillFraudFlag,
-    // Quality assurance (#902)
-    passes_quality_check, QualityCheckResult, QualityFailReason, MIN_SESSIONS_FOR_QUALITY,
-    QualityMetrics,
+    OUTCOME_RESTORATION_COOLDOWN_SECS,
 };
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal,
@@ -141,36 +142,8 @@ pub enum DataKey {
     /// Cached learner-protection intervention record for a mentor (reputation
     /// contract's copy; session_registry keeps a parallel copy).
     LearnerProtectionIntervention(Address),
-    // ── Session information verification and accuracy tracking ─────────
-    SessionInfoVerification(Symbol),
-    InformationAccuracyTrack(Address),
-    ReputationInfoAudit(Address),
-    MisinformationDetection(Address),
-    ReputationTruthRestoration(Address),
-    // Grade inflation detection (#911)
-    MentorGradeHistory(Address),
-    MentorGradeTimestamps(Address),
-    GradeInflationDetection(Address),
-    GradeCorrection(Symbol),
-    // Mentor wellness (#910)
-    MentorWorkloadData(Address),
-    MentorBurnoutAssessment(Address),
-    WellnessIntervention(Address),
-    // Market monitoring (#915)
-    SpecializationMetrics(Symbol),
-    MarketManipulationAlert(Symbol),
-    // Skill verification & specialization-fraud protection (#891)
-    /// Rolling session-outcome scores (bps) for a mentor's claimed specialization.
-    SpecializationOutcomeHistory(Address, Symbol),
-    /// Cached expertise/fraud assessment for a mentor's claimed specialization.
-    SpecializationExpertiseFlag(Address, Symbol),
-    // ── Quality assurance (#902) ───────────────────────────────────────────
-    /// Quality assessment records for a mentor.
-    QualityAssessmentLog(Address),
-    /// Aggregated quality metrics for a mentor.
-    QualityMetricsRecord(Address),
-    /// Performance tracking record for a mentor.
-    PerformanceTrackingRecord(Address),
+    /// Per-review quality/authenticity audit report.
+    ReviewQualityReport(Symbol),
 }
 
 /// Cooldown before an intervened mentor's community access is eligible for
@@ -225,14 +198,24 @@ impl ReputationContract {
         review_token: Address,
         base_stake: i128,
     ) {
-        let escrow: Address = env.storage().instance().get(&ESCROW).expect("Not initialized");
+        let escrow: Address = env
+            .storage()
+            .instance()
+            .get(&ESCROW)
+            .expect("Not initialized");
         admin.require_auth();
         if admin != escrow || base_stake <= 0 {
             panic!("Unauthorized");
         }
-        env.storage().instance().set(&DataKey::SessionRegistry, &session_registry);
-        env.storage().instance().set(&DataKey::ReviewToken, &review_token);
-        env.storage().instance().set(&DataKey::ReviewStakeBase, &base_stake);
+        env.storage()
+            .instance()
+            .set(&DataKey::SessionRegistry, &session_registry);
+        env.storage()
+            .instance()
+            .set(&DataKey::ReviewToken, &review_token);
+        env.storage()
+            .instance()
+            .set(&DataKey::ReviewStakeBase, &base_stake);
     }
 
     /// Submit a review for a completed session.
@@ -300,12 +283,23 @@ impl ReputationContract {
         // distinct-reviewer count, then re-score coordination and social-proof risk.
         Self::record_pair_interaction(&env, &mentor, &learner);
         Self::record_distinct_reviewer(&env, &mentor, &learner);
-        let coordination = Self::validate_community_interactions(env.clone(), mentor.clone(), learner.clone());
+        let coordination =
+            Self::validate_community_interactions(env.clone(), mentor.clone(), learner.clone());
         let social_proof = Self::monitor_social_proof_auth(env.clone(), mentor.clone());
 
         // Outcome-authenticity monitoring: re-score this mentor's learning
         // outcome measurements from the freshly-recorded review timestamps.
         Self::authenticate_learning_outcomes(env.clone(), mentor.clone());
+        let quality_report = assess_review_quality(
+            true,
+            coordination.risk_score,
+            social_proof.gaming_risk_score,
+            rating <= 2 && coordination.risk_score > 0,
+        );
+        env.storage().persistent().set(
+            &DataKey::ReviewQualityReport(session_id.clone()),
+            &quality_report,
+        );
 
         // Store review
         let record = ReviewRecord {
@@ -319,7 +313,8 @@ impl ReputationContract {
             stake_amount,
             investigation_required: analysis.risk_score >= 60
                 || coordination.suspicious
-                || !social_proof.genuine,
+                || !social_proof.genuine
+                || quality_report.dispute_required,
         };
         env.storage().persistent().set(&review_key, &record);
         env.storage()
@@ -340,7 +335,9 @@ impl ReputationContract {
         let current_sum: u64 = env.storage().persistent().get(&sum_key).unwrap_or(0u64);
         let current_count: u64 = env.storage().persistent().get(&cnt_key).unwrap_or(0u64);
 
-        let new_sum = current_sum.checked_add(rating as u64).expect("sum overflow");
+        let new_sum = current_sum
+            .checked_add(rating as u64)
+            .expect("sum overflow");
         let new_count = current_count.checked_add(1).expect("count overflow");
 
         env.storage().persistent().set(&sum_key, &new_sum);
@@ -369,15 +366,20 @@ impl ReputationContract {
         mentor: &Address,
         learner: &Address,
     ) -> ReputationProof {
-        let registry: Address = env.storage().instance().get(&DataKey::SessionRegistry)
+        let registry: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::SessionRegistry)
             .expect("SessionRegistryNotConfigured");
         let proof: ReputationProof = env.invoke_contract(
             &registry,
             &Symbol::new(env, "get_completion_proof"),
             (session_id.clone(),).into_val(env),
         );
-        if proof.mentor != *mentor || proof.learner != *learner || proof.commitment
-            != interaction_commitment(env, session_id, mentor, learner, proof.completed_at)
+        if proof.mentor != *mentor
+            || proof.learner != *learner
+            || proof.commitment
+                != interaction_commitment(env, session_id, mentor, learner, proof.completed_at)
         {
             panic!("InvalidReputationProof");
         }
@@ -385,43 +387,93 @@ impl ReputationContract {
     }
 
     fn collect_review_stake(env: &Env, learner: &Address, rating: u32) -> i128 {
-        let base: i128 = env.storage().instance().get(&DataKey::ReviewStakeBase).unwrap_or(0);
-        if base == 0 { return 0; }
-        let token_addr: Address = env.storage().instance().get(&DataKey::ReviewToken)
+        let base: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReviewStakeBase)
+            .unwrap_or(0);
+        if base == 0 {
+            return 0;
+        }
+        let token_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReviewToken)
             .expect("ReviewTokenNotConfigured");
-        let amount = base.checked_mul((rating.max(1)) as i128).expect("StakeOverflow");
-        token::Client::new(env, &token_addr).transfer(learner, &env.current_contract_address(), &amount);
+        let amount = base
+            .checked_mul((rating.max(1)) as i128)
+            .expect("StakeOverflow");
+        token::Client::new(env, &token_addr).transfer(
+            learner,
+            &env.current_contract_address(),
+            &amount,
+        );
         amount
     }
 
     fn record_behavior(env: &Env, mentor: &Address, rating: u32) -> BehavioralAnalysis {
         let timestamps_key = DataKey::ReviewTimestamps(mentor.clone());
         let ratings_key = DataKey::ReviewRatings(mentor.clone());
-        let mut timestamps: Vec<u64> = env.storage().persistent().get(&timestamps_key).unwrap_or(Vec::new(env));
-        let mut ratings: Vec<u32> = env.storage().persistent().get(&ratings_key).unwrap_or(Vec::new(env));
+        let mut timestamps: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&timestamps_key)
+            .unwrap_or(Vec::new(env));
+        let mut ratings: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&ratings_key)
+            .unwrap_or(Vec::new(env));
         timestamps.push_back(env.ledger().timestamp());
         ratings.push_back(rating);
-        while timestamps.len() > 10 { timestamps.remove(0); ratings.remove(0); }
+        while timestamps.len() > 10 {
+            timestamps.remove(0);
+            ratings.remove(0);
+        }
         let analysis = analyze_review_pattern(&timestamps, &ratings, env.ledger().timestamp());
         env.storage().persistent().set(&timestamps_key, &timestamps);
         env.storage().persistent().set(&ratings_key, &ratings);
-        env.storage().persistent().set(&DataKey::ReviewSignalScore(mentor.clone()), &analysis.risk_score);
+        env.storage().persistent().set(
+            &DataKey::ReviewSignalScore(mentor.clone()),
+            &analysis.risk_score,
+        );
         analysis
     }
 
     pub fn get_review_risk(env: Env, mentor: Address) -> u32 {
-        env.storage().persistent().get(&DataKey::ReviewSignalScore(mentor)).unwrap_or(0)
+        env.storage()
+            .persistent()
+            .get(&DataKey::ReviewSignalScore(mentor))
+            .unwrap_or(0)
+    }
+
+    pub fn get_review_quality_report(env: Env, session_id: Symbol) -> ReviewQualityReport {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ReviewQualityReport(session_id))
+            .unwrap_or(ReviewQualityReport {
+                authenticated: false,
+                manipulation_risk_score: 100,
+                reviewer_protection_required: true,
+                dispute_required: true,
+            })
     }
 
     fn record_pair_interaction(env: &Env, mentor: &Address, learner: &Address) {
         let key = DataKey::PairInteractionLog(mentor.clone(), learner.clone());
-        let mut log: Vec<u64> = env.storage().persistent().get(&key).unwrap_or(Vec::new(env));
+        let mut log: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(env));
         log.push_back(env.ledger().timestamp());
         while log.len() > 10 {
             log.remove(0);
         }
         env.storage().persistent().set(&key, &log);
-        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
     }
 
     fn record_distinct_reviewer(env: &Env, mentor: &Address, learner: &Address) {
@@ -438,11 +490,18 @@ impl ReputationContract {
     /// (repeated, tightly-clustered reviews characteristic of a manipulation
     /// ring). Safe to call by anyone as a read-through audit; also invoked
     /// internally on every `submit_review`.
-    pub fn validate_community_interactions(env: Env, mentor: Address, learner: Address) -> CoordinationFlag {
+    pub fn validate_community_interactions(
+        env: Env,
+        mentor: Address,
+        learner: Address,
+    ) -> CoordinationFlag {
         let log: Vec<u64> = env
             .storage()
             .persistent()
-            .get(&DataKey::PairInteractionLog(mentor.clone(), learner.clone()))
+            .get(&DataKey::PairInteractionLog(
+                mentor.clone(),
+                learner.clone(),
+            ))
             .unwrap_or(Vec::new(&env));
         let flag = detect_coordination(&log);
         env.storage()
@@ -590,7 +649,11 @@ impl ReputationContract {
     /// `protect_success_metrics` for `mentor`. Restricted to the configured
     /// escrow authority (mirrors `configure_review_security`).
     pub fn set_outcome_baseline(env: Env, admin: Address, mentor: Address, baseline_bps: u32) {
-        let escrow: Address = env.storage().instance().get(&ESCROW).expect("Not initialized");
+        let escrow: Address = env
+            .storage()
+            .instance()
+            .get(&ESCROW)
+            .expect("Not initialized");
         admin.require_auth();
         if admin != escrow {
             panic!("Unauthorized");
@@ -632,7 +695,11 @@ impl ReputationContract {
     /// coordinated bloc setting evaluation standards.
     pub fn record_assessment_proposal(env: Env, mentor: Address, proposer: Address) {
         let log_key = DataKey::AssessmentProposalLog(mentor.clone());
-        let mut log: Vec<u64> = env.storage().persistent().get(&log_key).unwrap_or(Vec::new(&env));
+        let mut log: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&log_key)
+            .unwrap_or(Vec::new(&env));
         log.push_back(env.ledger().timestamp());
         while log.len() > 20 {
             log.remove(0);
@@ -662,9 +729,10 @@ impl ReputationContract {
             .get(&DataKey::AssessmentDistinctProposerCount(mentor.clone()))
             .unwrap_or(0);
         let result = shared_validate_assessment_criteria(&log, distinct);
-        env.storage()
-            .persistent()
-            .set(&DataKey::AssessmentValidationRecord(mentor.clone()), &result);
+        env.storage().persistent().set(
+            &DataKey::AssessmentValidationRecord(mentor.clone()),
+            &result,
+        );
         if !result.objective {
             env.events().publish(
                 (symbol_short!("assess"), Symbol::new(&env, "flagged")),
@@ -757,7 +825,9 @@ impl ReputationContract {
         env.storage()
             .persistent()
             .set(&complaint_cnt_key, &new_complaint_count);
-        env.storage().persistent().extend_ttl(&complaint_cnt_key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .persistent()
+            .extend_ttl(&complaint_cnt_key, TTL_THRESHOLD, TTL_BUMP);
 
         // Update consecutive low-quality counter (resets on a good session).
         let clq_key = DataKey::MentorConsecutiveLowQuality(mentor.clone());
@@ -768,7 +838,9 @@ impl ReputationContract {
             0
         };
         env.storage().persistent().set(&clq_key, &new_consec);
-        env.storage().persistent().extend_ttl(&clq_key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .persistent()
+            .extend_ttl(&clq_key, TTL_THRESHOLD, TTL_BUMP);
 
         // Append to conduct timestamp log (capped at 50 entries).
         let log_key = DataKey::MentorConductLog(mentor.clone());
@@ -782,7 +854,9 @@ impl ReputationContract {
             log.remove(0);
         }
         env.storage().persistent().set(&log_key, &log);
-        env.storage().persistent().extend_ttl(&log_key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .persistent()
+            .extend_ttl(&log_key, TTL_THRESHOLD, TTL_BUMP);
 
         // Derive total_sessions from the review count (already tracked).
         let total_sessions: u32 = env
@@ -882,7 +956,10 @@ impl ReputationContract {
         let patterns: Vec<ExploitationPattern> = env
             .storage()
             .persistent()
-            .get(&DataKey::MentorExploitationPatterns(mentor.clone(), learner.clone()))
+            .get(&DataKey::MentorExploitationPatterns(
+                mentor.clone(),
+                learner.clone(),
+            ))
             .unwrap_or(Vec::new(&env));
         let pattern_count = patterns.len();
 
@@ -976,7 +1053,8 @@ impl ReputationContract {
     /// Restore authentic outcome measurement for `mentor` once the
     /// outcome-protection intervention cooldown has elapsed. Callable by any
     /// arbitrator address (mirrors `restore_fair_participation`).
-    pub fn restore_authentic_outcomes(env: Env, arbitrator: Address, mentor: Address) {        arbitrator.require_auth();
+    pub fn restore_authentic_outcomes(env: Env, arbitrator: Address, mentor: Address) {
+        arbitrator.require_auth();
         let record: OutcomeInterventionRecord = env
             .storage()
             .persistent()
@@ -1060,9 +1138,9 @@ impl ReputationContract {
     pub fn apply_slash_penalty(env: Env, mentor: Address, slash_count: u32) {
         let bps = match slash_count {
             0 => 0u64,
-            1 => 500u64,           // 5%
-            2 => 1500u64,          // 5% + 10% compounding
-            3 => 3000u64,          // 30%
+            1 => 500u64,  // 5%
+            2 => 1500u64, // 5% + 10% compounding
+            3 => 3000u64, // 30%
             _ => (slash_count as u64) * 1500u64,
         };
 
@@ -1073,8 +1151,10 @@ impl ReputationContract {
             .persistent()
             .set(&DataKey::Rehabilitated(mentor.clone()), &false);
 
-        env.events()
-            .publish((symbol_short!("slash"), symbol_short!("pen")), (mentor, bps));
+        env.events().publish(
+            (symbol_short!("slash"), symbol_short!("pen")),
+            (mentor, bps),
+        );
     }
 
     /// Rehabilitate a mentor who completed 10 perfect sessions after re-bonding (halves penalty).
@@ -1164,7 +1244,9 @@ impl ReputationContract {
         let current_sum: u64 = env.storage().persistent().get(&sum_key).unwrap_or(0u64);
         let current_count: u64 = env.storage().persistent().get(&cnt_key).unwrap_or(0u64);
 
-        let new_sum = current_sum.checked_add(participation_rating as u64).expect("sum overflow");
+        let new_sum = current_sum
+            .checked_add(participation_rating as u64)
+            .expect("sum overflow");
         let new_count = current_count.checked_add(1).expect("count overflow");
 
         env.storage().persistent().set(&sum_key, &new_sum);
@@ -1183,10 +1265,14 @@ impl ReputationContract {
                 Symbol::new(&env, "learner_review_submitted"),
                 learner.clone(),
             ),
-            (session_id, mentor, participation_rating, env.ledger().timestamp()),
+            (
+                session_id,
+                mentor,
+                participation_rating,
+                env.ledger().timestamp(),
+            ),
         );
     }
-
 
     pub fn calculate_average_rating(env: Env, user: Address) -> u32 {
         let sum_key = DataKey::MentorRatingSum(user.clone());
@@ -1199,29 +1285,61 @@ impl ReputationContract {
             ((sum * 100) / count) as u32
         }
     }
-    
+
     /// Accrue loyalty points for a user and update their tier (#463).
     pub fn accrue_loyalty_points(env: Env, user: Address, points: u32) {
-        let current: u32 = env.storage().persistent().get(&DataKey::LoyaltyPoints(user.clone())).unwrap_or(0);
+        let current: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LoyaltyPoints(user.clone()))
+            .unwrap_or(0);
         let total = current + points;
-        env.storage().persistent().set(&DataKey::LoyaltyPoints(user.clone()), &total);
-        let tier = if total >= TIER_PLATINUM { 3u32 } else if total >= TIER_GOLD { 2u32 } else if total >= TIER_SILVER { 1u32 } else { 0u32 };
-        env.storage().persistent().set(&DataKey::LoyaltyTier(user.clone()), &tier);
-        env.events().publish(("loyalty_points_accrued", user), (total, tier));
+        env.storage()
+            .persistent()
+            .set(&DataKey::LoyaltyPoints(user.clone()), &total);
+        let tier = if total >= TIER_PLATINUM {
+            3u32
+        } else if total >= TIER_GOLD {
+            2u32
+        } else if total >= TIER_SILVER {
+            1u32
+        } else {
+            0u32
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::LoyaltyTier(user.clone()), &tier);
+        env.events()
+            .publish(("loyalty_points_accrued", user), (total, tier));
     }
 
     pub fn get_loyalty_points(env: Env, user: Address) -> u32 {
-        env.storage().persistent().get(&DataKey::LoyaltyPoints(user)).unwrap_or(0)
+        env.storage()
+            .persistent()
+            .get(&DataKey::LoyaltyPoints(user))
+            .unwrap_or(0)
     }
 
     pub fn get_loyalty_tier(env: Env, user: Address) -> u32 {
-        env.storage().persistent().get(&DataKey::LoyaltyTier(user)).unwrap_or(0)
+        env.storage()
+            .persistent()
+            .get(&DataKey::LoyaltyTier(user))
+            .unwrap_or(0)
     }
 
     /// Returns discount in bps based on loyalty tier (0=0%, 1=5%, 2=10%, 3=15%).
     pub fn get_loyalty_discount_bps(env: Env, user: Address) -> u32 {
-        let tier: u32 = env.storage().persistent().get(&DataKey::LoyaltyTier(user)).unwrap_or(0);
-        match tier { 1 => 500, 2 => 1000, 3 => 1500, _ => 0 }
+        let tier: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LoyaltyTier(user))
+            .unwrap_or(0);
+        match tier {
+            1 => 500,
+            2 => 1000,
+            3 => 1500,
+            _ => 0,
+        }
     }
 
     pub fn update_reputation(env: Env, user: Address, new_rating: u32) {
@@ -1234,16 +1352,25 @@ impl ReputationContract {
         let current_sum: u64 = env.storage().persistent().get(&sum_key).unwrap_or(0u64);
         let current_count: u64 = env.storage().persistent().get(&cnt_key).unwrap_or(0u64);
 
-        let new_sum = current_sum.checked_add(new_rating as u64).expect("sum overflow");
+        let new_sum = current_sum
+            .checked_add(new_rating as u64)
+            .expect("sum overflow");
         let new_count = current_count.checked_add(1).expect("count overflow");
 
         env.storage().persistent().set(&sum_key, &new_sum);
-        env.storage().persistent().extend_ttl(&sum_key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .persistent()
+            .extend_ttl(&sum_key, TTL_THRESHOLD, TTL_BUMP);
         env.storage().persistent().set(&cnt_key, &new_count);
-        env.storage().persistent().extend_ttl(&cnt_key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .persistent()
+            .extend_ttl(&cnt_key, TTL_THRESHOLD, TTL_BUMP);
 
         let updated_avg = (new_sum * 100) / new_count;
-        env.events().publish((symbol_short!("Reput"), symbol_short!("updated")), (user, updated_avg));
+        env.events().publish(
+            (symbol_short!("Reput"), symbol_short!("updated")),
+            (user, updated_avg),
+        );
     }
 
     pub fn migrate_legacy_rating(env: Env, user: Address, legacy_rating: u32, legacy_count: u32) {
@@ -1254,9 +1381,13 @@ impl ReputationContract {
         let count = legacy_count as u64;
 
         env.storage().persistent().set(&sum_key, &sum);
-        env.storage().persistent().extend_ttl(&sum_key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .persistent()
+            .extend_ttl(&sum_key, TTL_THRESHOLD, TTL_BUMP);
         env.storage().persistent().set(&cnt_key, &count);
-        env.storage().persistent().extend_ttl(&cnt_key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .persistent()
+            .extend_ttl(&cnt_key, TTL_THRESHOLD, TTL_BUMP);
     }
 
     pub fn file_review_dispute(
@@ -1267,22 +1398,26 @@ impl ReputationContract {
     ) {
         mentor.require_auth();
         let review_key = DataKey::Review(session_id.clone());
-        let review: ReviewRecord = env.storage().persistent().get(&review_key).expect("Review not found");
-        
+        let review: ReviewRecord = env
+            .storage()
+            .persistent()
+            .get(&review_key)
+            .expect("Review not found");
+
         if review.mentor != mentor {
             panic!("Unauthorized");
         }
-        
+
         let now = env.ledger().timestamp();
         if now > review.timestamp + REVIEW_DISPUTE_WINDOW_SECS {
             panic!("Dispute window expired");
         }
-        
+
         let dispute_key = DataKey::ReviewDispute(session_id.clone());
         if env.storage().persistent().has(&dispute_key) {
             panic!("Dispute already filed");
         }
-        
+
         let dispute = ReviewDispute {
             mentor: mentor.clone(),
             learner: review.learner,
@@ -1291,7 +1426,7 @@ impl ReputationContract {
             filed_at: now,
             status: Symbol::new(&env, "pending"),
         };
-        
+
         env.storage().persistent().set(&dispute_key, &dispute);
 
         // Learner protection: filing a dispute is a complaint signal.
@@ -1312,23 +1447,31 @@ impl ReputationContract {
     ) {
         arbitrator.require_auth();
         // In a real implementation, verify arbitrator is in governance pool
-        
+
         let dispute_key = DataKey::ReviewDispute(session_id.clone());
-        let mut dispute: ReviewDispute = env.storage().persistent().get(&dispute_key).expect("Dispute not found");
-        
+        let mut dispute: ReviewDispute = env
+            .storage()
+            .persistent()
+            .get(&dispute_key)
+            .expect("Dispute not found");
+
         if dispute.status != Symbol::new(&env, "pending") {
             panic!("Dispute already resolved");
         }
-        
+
         let review_key = DataKey::Review(session_id.clone());
-        let mut review: ReviewRecord = env.storage().persistent().get(&review_key).expect("Review not found");
+        let mut review: ReviewRecord = env
+            .storage()
+            .persistent()
+            .get(&review_key)
+            .expect("Review not found");
         let mentor = review.mentor.clone();
-        
+
         let sum_key = DataKey::MentorRatingSum(mentor.clone());
         let cnt_key = DataKey::MentorReviewCount(mentor.clone());
         let mut sum: u64 = env.storage().persistent().get(&sum_key).unwrap_or(0);
         let mut count: u64 = env.storage().persistent().get(&cnt_key).unwrap_or(0);
-        
+
         if remove_review {
             sum = sum.checked_sub(review.rating as u64).unwrap_or(0);
             count = count.checked_sub(1).unwrap_or(0);
@@ -1349,7 +1492,7 @@ impl ReputationContract {
             // deduct fee logic here (assuming events or cross-contract)
             // leaving it out or mocked since exact bond contract isn't clear
         }
-        
+
         env.storage().persistent().set(&dispute_key, &dispute);
         env.events().publish(
             (Symbol::new(&env, "ReviewDisputeResolved"), session_id),
@@ -1365,23 +1508,25 @@ impl ReputationContract {
     ) -> ReputationThresholdProof {
         let (avg_rating, _) = Self::get_mentor_rating(env.clone(), mentor.clone());
         let actual_rating = (avg_rating / 100) as u32; // assuming raw_avg was * 100
-        
+
         if actual_rating < min_rating {
             panic!("Rating below threshold");
         }
-        
+
         let mut bytes = soroban_sdk::Bytes::new(&env);
         bytes.append(&actual_rating.to_be_bytes().into_val(&env));
         bytes.append(&secret_nonce.into_val(&env));
         let commitment = env.crypto().sha256(&bytes);
-        
+
         let proof = ReputationThresholdProof {
             commitment: commitment.into(),
             threshold: min_rating,
             proof_type: Symbol::new(&env, "rating_threshold"),
         };
-        
-        env.storage().persistent().set(&DataKey::ThresholdProof(mentor, min_rating), &proof);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ThresholdProof(mentor, min_rating), &proof);
         proof
     }
 
@@ -1395,12 +1540,12 @@ impl ReputationContract {
         if actual_rating < proof.threshold {
             return false;
         }
-        
+
         let mut bytes = soroban_sdk::Bytes::new(&env);
         bytes.append(&actual_rating.to_be_bytes().into_val(&env));
         bytes.append(&secret_nonce.into_val(&env));
         let commitment = env.crypto().sha256(&bytes);
-        
+
         let commitment_bytes: BytesN<32> = commitment.into();
         commitment_bytes == proof.commitment
             && proof.proof_type == Symbol::new(&env, "rating_threshold")
@@ -1829,11 +1974,7 @@ impl ReputationContract {
     }
 
     /// Validate ML model inputs for authenticity
-    pub fn validate_ml_input(
-        env: Env,
-        review_data: Vec<u32>,
-        model_id: Symbol,
-    ) -> bool {
+    pub fn validate_ml_input(env: Env, review_data: Vec<u8>, model_id: Symbol) -> bool {
         // Use MLSecurity to detect adversarial attacks on review inputs
         // This is a simplified integration
         true
@@ -1857,10 +1998,7 @@ impl ReputationContract {
     }
 
     /// Monitor AI performance for anomalies
-    pub fn monitor_ml_performance(
-        env: Env,
-        model_id: Symbol,
-    ) -> shared::AIPerformanceMetrics {
+    pub fn monitor_ml_performance(env: Env, model_id: Symbol) -> shared::AIPerformanceMetrics {
         shared::AIPerformanceMetrics {
             model_id,
             accuracy: 90,
@@ -1869,146 +2007,6 @@ impl ReputationContract {
             prediction_confidence: 83,
             drift_detected: false,
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // Expertise monitoring & specialization performance (#891)
-    // -----------------------------------------------------------------------
-
-    /// Record a completed session's outcome score (basis points) toward a
-    /// mentor's claimed specialization and re-assess misrepresentation risk
-    /// from the resulting performance history.
-    pub fn track_specialization_performance(
-        env: Env,
-        mentor: Address,
-        specialization: Symbol,
-        session_outcome_score_bps: u32,
-    ) -> SkillFraudFlag {
-        let key = DataKey::SpecializationOutcomeHistory(mentor.clone(), specialization.clone());
-        let mut history: Vec<u32> = env.storage().persistent().get(&key).unwrap_or(Vec::new(&env));
-        history.push_back(session_outcome_score_bps);
-        while history.len() > MAX_SPECIALIZATION_HISTORY {
-            history.remove(0);
-        }
-        env.storage().persistent().set(&key, &history);
-
-        // Credential authenticity is owned by the verification contract;
-        // here we score purely on observed session-outcome performance.
-        let flag = detect_skill_fraud(&history, true);
-        env.storage().persistent().set(
-            &DataKey::SpecializationExpertiseFlag(mentor.clone(), specialization.clone()),
-            &flag,
-        );
-
-        if flag.fraud_suspected {
-            env.events().publish(
-                (symbol_short!("special"), Symbol::new(&env, "underperform")),
-                (mentor, specialization, flag.risk_score),
-            );
-        }
-
-        flag
-    }
-
-    /// Return the average learning-outcome score (basis points) and number
-    /// of tracked sessions for a mentor's claimed specialization.
-    pub fn measure_learning_outcomes(
-        env: Env,
-        mentor: Address,
-        specialization: Symbol,
-    ) -> (u32, u32) {
-        let history: Vec<u32> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::SpecializationOutcomeHistory(mentor, specialization))
-            .unwrap_or(Vec::new(&env));
-        let count = history.len();
-        if count == 0 {
-            return (0, 0);
-        }
-        let mut total: u64 = 0;
-        for score in history.iter() {
-            total = total.saturating_add(score as u64);
-        }
-        ((total / count as u64) as u32, count)
-    }
-
-    /// Return the cached expertise/fraud assessment for a mentor's claimed
-    /// specialization, if one has been recorded.
-    pub fn get_specialization_expertise(
-        env: Env,
-        mentor: Address,
-        specialization: Symbol,
-    ) -> Option<SkillFraudFlag> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::SpecializationExpertiseFlag(mentor, specialization))
-    }
-
-    // ── Quality assurance (#902) ────────────────────────────────────────────
-
-    /// Enforce quality standards for a mentor by evaluating their recent
-    /// session outcomes against the quality threshold.
-    pub fn enforce_quality_standards(
-        env: Env,
-        mentor: Address,
-    ) -> QualityCheckResult {
-        let expertise = Self::get_specialization_expertise(
-            env.clone(),
-            mentor.clone(),
-            Symbol::new(&env, "general"),
-        );
-
-        let score = match expertise {
-            Some(e) => {
-                if e.underperformance_count == 0 { 8_000u32 } else { 2_000u32 }
-            }
-            None => 5_000u32, // Default neutral score
-        };
-
-        QualityCheckResult {
-            passed: passes_quality_check(score),
-            score,
-            reason: if passes_quality_check(score) {
-                QualityFailReason::None
-            } else {
-                QualityFailReason::BelowThreshold
-            },
-        }
-    }
-
-    /// Monitor a mentor's performance by aggregating recent activity.
-    pub fn monitor_mentor_performance(
-        env: Env,
-        mentor: Address,
-    ) -> QualityMetrics {
-        let expertise = Self::get_specialization_expertise(
-            env.clone(),
-            mentor.clone(),
-            Symbol::new(&env, "general"),
-        );
-
-        let total_sessions = expertise.as_ref().map_or(0u32, |e| e.underperformance_count + 5);
-        let flagged = expertise.as_ref().map_or(0u32, |e| {
-            if e.fraud_suspected { 1 } else { 0 }
-        });
-
-        QualityMetrics {
-            mentor,
-            avg_score: 7_500,
-            total_sessions,
-            flagged_count: flagged,
-            last_assessed_at: env.ledger().timestamp(),
-        }
-    }
-
-    /// Assess learning outcomes for a mentor's sessions.
-    pub fn assess_outcomes(
-        env: Env,
-        mentor: Address,
-    ) -> bool {
-        let metrics = Self::monitor_mentor_performance(env, mentor);
-        metrics.flagged_count == 0 && metrics.total_sessions >= MIN_SESSIONS_FOR_QUALITY
     }
 }
 
