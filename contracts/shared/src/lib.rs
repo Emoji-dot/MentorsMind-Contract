@@ -7,16 +7,21 @@ use soroban_sdk::contracterror;
 ///
 /// Centralizing these definitions keeps authorization and state-transition
 /// behavior aligned across contracts that make the same safety assumptions.
+pub mod content_protection;
 pub mod escrow;
 pub mod events;
+pub mod ip_verification;
 pub mod reentrancy_guard;
 pub mod sig_validation;
 pub mod state_machine;
 pub mod storage;
 pub mod staking;
 pub mod ttl_utils;
+pub mod usage_rights_management;
 
+pub use content_protection::{ContentProtection, ContentType, EncryptionKey, AccessLevel, ProtectedContent, AccessLog};
 pub use escrow::{EscrowRecord, EscrowStatus};
+pub use ip_verification::{IPVerification, IPRecord, OwnershipProof, IPUsageRecord, InfringementRecord, IPType, IPStatus};
 pub use reentrancy_guard::ReentrancyGuard;
 pub use sig_validation::{
     current_nonce, is_deadline_valid, validate_and_consume_nonce, validate_deadline,
@@ -26,6 +31,7 @@ pub use state_machine::StateMachine;
 pub use staking::{StakeRecord, StakedEventData};
 pub use storage::{EternalStorage, StorageType, InstanceKey, PersistentKey, TempKey};
 pub use ttl_utils::{next_bump_interval, should_bump_ttl};
+pub use usage_rights_management::{UsageRightsManager, LicenseType, ViolationPenalty, License, ViolationRecord};
 
 /// Common error codes shared across all MentorsMind contracts.
 ///
@@ -55,4 +61,14 @@ pub enum SharedError {
     Overflow = 9,
     /// An arithmetic operation would underflow below zero.
     Underflow = 10,
+    /// Content access is denied due to insufficient permissions or invalid license.
+    ContentAccessDenied = 11,
+    /// Intellectual property ownership cannot be verified or is disputed.
+    IPOwnershipInvalid = 12,
+    /// Usage rights have been violated or exceeded allowed limits.
+    UsageRightsViolation = 13,
+    /// Content encryption/decryption failed.
+    EncryptionError = 14,
+    /// Content piracy or unauthorized distribution detected.
+    PiracyDetected = 15,
 }

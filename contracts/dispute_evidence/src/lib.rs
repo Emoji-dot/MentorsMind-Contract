@@ -22,7 +22,7 @@
 
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, Address, BytesN, Env,
-    Symbol, Vec, IntoVal,
+    Symbol, Vec,
 };
 
 /// Default window (seconds) within which evidence may be submitted after session end.

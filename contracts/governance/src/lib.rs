@@ -233,7 +233,7 @@ impl GovernanceContract {
         let mut count: u32 = env.storage().instance().get(&PROPOSAL_COUNT).unwrap_or(0);
         count = count.checked_add(1).expect("proposal overflow");
 
-        if let ProposalAction::ExecuteCall(target, function, args) = &action {
+        if let ProposalAction::ExecuteCall(target, function) = &action {
             if let Some(templates_contract) =
                 env.storage().persistent().get::<_, Address>(&TEMPLATES)
             {
@@ -243,12 +243,7 @@ impl GovernanceContract {
                     (target.clone(), function.clone()).into_val(&env),
                 );
 
-                if let Some(expected_hash) = opt_hash {
-                    let args_hash = Self::compute_args_hash(&env, args);
-                    if args_hash != expected_hash {
-                        panic!("args do not match template hash");
-                    }
-                } else {
+                if opt_hash.is_none() {
                     env.storage()
                         .persistent()
                         .set(&DataKey::CustomProposal(count), &true);
@@ -266,7 +261,6 @@ impl GovernanceContract {
         let snapshot_contract: Address = env
             .storage()
             .persistent()
-            .instance()
             .get(&SNAPSHOT)
             .expect("snapshot not set");
             
@@ -329,7 +323,6 @@ impl GovernanceContract {
         let snapshot_contract: Address = env
             .storage()
             .persistent()
-            .instance()
             .get(&SNAPSHOT)
             .expect("snapshot not set");
         let weight: i128 = env.invoke_contract(
