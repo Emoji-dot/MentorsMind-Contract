@@ -259,13 +259,58 @@ impl Drop for ReentrancyGuard<'_> {
     }
 }
 
+/// Maximum number of operations a single [`AtomicBatch`] will accept.
+/// Bounds the worst-case work (and therefore gas) a single batched call can
+/// perform, so a caller can't build a batch large enough to blow the block
+/// gas limit mid-execution (#831/#830).
+pub const MAX_BATCH_SIZE: u32 = 100;
+
 #[contracttype]
 #[derive(Clone, Debug)]
 pub enum BatchOp {
-    Transfer(Address, Address, Address, i128, bool),
-    Invoke(Address, Symbol, bool),
+    Transfer {
+        token: Address,
+        from: Address,
+        to: Address,
+        amount: i128,
+        executed: bool,
+    },
+    Invoke {
+        contract: Address,
+        function: Symbol,
+        executed: bool,
+    },
 }
 
+/// Error returned by [`AtomicBatch::validate`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BatchValidationError {
+    Empty,
+    TooLarge,
+}
+
+/// Builder for a sequence of token transfers / cross-contract invocations
+/// that must succeed or fail as a single unit.
+///
+/// # Atomicity model
+///
+/// Soroban already reverts *every* storage write and token transfer made
+/// during a contract invocation the moment that invocation's top-level
+/// `Result` comes back `Err` (or it panics) — the host, not the contract,
+/// owns that guarantee. `AtomicBatch` does not (and cannot) perform its own
+/// manual undo of already-completed transfers; what it provides on top of
+/// that host guarantee is:
+///
+/// 1. **Ordering** — operations run in the order they were added.
+/// 2. **Fail-fast** — [`execute_all`](Self::execute_all) stops at the first
+///    failing operation instead of running the remaining ones.
+/// 3. **A bounded, pre-validated op count** — see [`validate`](Self::validate).
+///
+/// For the batch to actually be atomic, the caller **must propagate** the
+/// `Err` from `execute_all` all the way out of the public `#[contractimpl]`
+/// entry point (e.g. with `?`). Catching the error and returning `Ok`
+/// anyway would commit whatever ran before the failure, defeating the
+/// all-or-nothing contract this type exists to provide.
 pub struct AtomicBatch<'a> {
     env: &'a Env,
     ops: Vec<BatchOp>,
@@ -289,45 +334,72 @@ impl<'a> AtomicBatch<'a> {
         amount: i128,
     ) -> u32 {
         let idx = self.ops.len();
-        self.ops.push_back(BatchOp::Transfer(token, from, to, amount, false));
+        self.ops.push_back(BatchOp::Transfer {
+            token,
+            from,
+            to,
+            amount,
+            executed: false,
+        });
         idx
     }
 
     pub fn add_invoke(&mut self, contract: Address, function: Symbol) -> u32 {
         let idx = self.ops.len();
-        self.ops.push_back(BatchOp::Invoke(contract, function, false));
+        self.ops.push_back(BatchOp::Invoke {
+            contract,
+            function,
+            executed: false,
+        });
         idx
     }
 
+    /// Pre-execution validation (#830): reject an empty batch (nothing to
+    /// do, likely a caller bug) or one exceeding [`MAX_BATCH_SIZE`] *before*
+    /// any operation runs, so a batch that could exceed gas limits never
+    /// starts executing.
+    pub fn validate(&self) -> Result<(), BatchValidationError> {
+        if self.ops.is_empty() {
+            return Err(BatchValidationError::Empty);
+        }
+        if self.ops.len() > MAX_BATCH_SIZE {
+            return Err(BatchValidationError::TooLarge);
+        }
+        Ok(())
+    }
+
+    /// Run every queued operation in order via `executor`, stopping at the
+    /// first failure. See the type-level docs for what atomicity guarantee
+    /// this does (and does not) provide on its own.
     pub fn execute_all<F, E>(&mut self, mut executor: F) -> Result<(), E>
     where
         F: FnMut(&Env, &BatchOp) -> Result<(), E>,
     {
-        let mut executed_indices = Vec::new(self.env);
-        let mut i = 0u32;
+        let mut executed_count = 0u32;
 
         for op in self.ops.iter() {
-            let result = executor(self.env, &op);
-            match result {
+            match executor(self.env, &op) {
                 Ok(()) => {
-                    executed_indices.push_back(i);
+                    executed_count = executed_count.saturating_add(1);
                 }
                 Err(e) => {
-                    self.rollback_indices(&executed_indices);
+                    self.emit_partial_failure(executed_count, self.ops.len());
                     return Err(e);
                 }
             }
-            i = i.saturating_add(1);
         }
 
         self.committed = true;
         Ok(())
     }
 
-    fn rollback_indices(&mut self, _indices: &Vec<u32>) {
+    /// Audit-trail event: which operation index the batch failed on, so a
+    /// caller propagating the error can log/report exactly how far
+    /// execution got before the host reverted it.
+    fn emit_partial_failure(&self, executed_count: u32, total: u32) {
         self.env.events().publish(
-            (symbol_short!("batch"), symbol_short!("rollback")),
-            self.env.ledger().timestamp(),
+            (symbol_short!("batch"), symbol_short!("failed")),
+            (executed_count, total, self.env.ledger().timestamp()),
         );
     }
 

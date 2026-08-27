@@ -12,10 +12,17 @@ pub mod cross_contract_auth;
 pub mod disaster_recovery;
 pub mod emergency;
 pub mod emergency_rollback;
+pub mod error_context;
 pub mod escrow;
 pub mod events;
 pub mod gas_estimation;
 pub mod governance_voting;
+pub mod interface_id;
+pub mod justice_protection;
+pub mod key_management;
+pub mod learner_protection;
+pub mod outcome_authenticity;
+pub mod pagination;
 pub mod pause_guard;
 pub mod reentrancy_guard;
 pub mod safe_math;
@@ -75,18 +82,81 @@ pub use emergency_rollback::{
 };
 pub use safe_math::SafeMath;
 pub use cross_contract_auth::{ContractRegistry, CrossContractAuth, InterfaceRegistryLookup};
+pub use error_context::{log_contract_error, ContractErrorContext};
 pub use escrow::{EscrowRecord, EscrowStatus, EscrowTransitionLog};
 pub use gas_estimation::GasEstimate;
 pub use governance_voting::{
     calculate_voting_weight, compute_commitment_hash, compute_random_deadline_extension,
     detect_vote_manipulation, get_vote_phase, validate_minimum_holding_period, ManipulationFlag,
-    MAX_RANDOM_EXTENSION_SECS, MIN_HOLDING_PERIOD_SECS, COMMIT_PHASE_BPS, RevealedVote, VoteCommitment,
-    VotePhase,
+    RevealedVote, VoteCommitment, VotePhase, COMMIT_PHASE_BPS, MAX_RANDOM_EXTENSION_SECS,
+    MIN_HOLDING_PERIOD_SECS,
+};
+pub use justice_protection::{
+    compute_justice_intervention, ensure_dispute_independence, is_justice_restoration_eligible,
+    protect_arbitration_fairness, validate_evidence_authenticity, ArbitrationBiasFlag,
+    DisputeIndependenceFlag, EvidenceAuthenticity, JusticeInterventionRecord,
+    ARBITRATION_BIAS_RATIO_BPS_THRESHOLD, ARBITRATION_BIAS_RISK_THRESHOLD,
+    ARBITRATION_MIN_RULINGS_FOR_BIAS, DISPUTE_COORDINATION_WINDOW_SECS,
+    DISPUTE_INDEPENDENCE_RISK_THRESHOLD, EVIDENCE_DUPLICATE_WINDOW_SECS,
+    EVIDENCE_TAMPER_RISK_THRESHOLD, JUSTICE_INTERVENTION_THRESHOLD,
+    JUSTICE_RESTORATION_COOLDOWN_SECS,
+};
+pub use learner_protection::{
+    assess_vulnerability, compute_emergency_intervention, compute_learner_protection_intervention,
+    compute_welfare_status, detect_predatory_behavior, enforce_learner_fair_pricing,
+    identify_exploitation_patterns, is_protection_restoration_eligible, EmergencyIntervention,
+    ExploitationPattern, LearnerProtectionRecord, PredatoryBehaviorDetection,
+    VulnerabilityAssessment, WelfareStatus, AFFORDABILITY_DEVIATION_BPS,
+    EMERGENCY_PATTERN_THRESHOLD, EMERGENCY_SUSPENSION_COOLDOWN_SECS, FINANCIAL_PROTECTION_CAP_BPS,
+    LEARNER_PROTECTION_COOLDOWN_SECS, PREDATORY_COMPLAINT_RATIO_BPS,
+    PREDATORY_LOW_QUALITY_THRESHOLD, PREDATORY_RISK_THRESHOLD,
+    VULNERABILITY_HIGH_RECURRENCE_THRESHOLD, VULNERABILITY_RISK_THRESHOLD,
+    VULNERABILITY_SESSION_WINDOW,
+};
+pub use outcome_authenticity::{
+    authenticate_learning_outcomes, compute_outcome_intervention, is_outcome_restoration_eligible,
+    protect_success_metrics, validate_assessment_criteria, AssessmentValidation,
+    OutcomeAuthenticity, OutcomeInterventionRecord, SuccessMetricProtection,
+    ASSESSMENT_COORDINATION_WINDOW_SECS, ASSESSMENT_RISK_THRESHOLD, METRIC_GAMING_DEVIATION_BPS,
+    OUTCOME_BURST_WINDOW_SECS, OUTCOME_INTERVENTION_THRESHOLD, OUTCOME_MIN_DISTINCT_BPS,
+    OUTCOME_RESTORATION_COOLDOWN_SECS, OUTCOME_RISK_THRESHOLD,
+};
+pub use pagination::{
+    BoundedIteration, BudgetExceeded, OperationBudget, Pagination, MAX_PAGE_SIZE,
+};
+pub use pause_guard::{is_paused, require_not_paused, ContractPaused};
+pub use pricing_protection::{
+    compute_pricing_intervention, detect_price_coordination, enforce_fair_pricing,
+    validate_market_rate, verify_demand_authenticity, DemandAuthenticity, FairPricingResult,
+    MarketRateValidation, PriceCoordinationFlag, PricingInterventionRecord,
+    DEFAULT_MAX_MARKET_DEVIATION_BPS, DEMAND_BURST_WINDOW_SECS, DEMAND_MIN_DISTINCT_BPS,
+    MAX_MARKET_DEVIATION_CEILING_BPS, PRICE_COORDINATION_WINDOW_SECS, PRICE_MATCH_TOLERANCE_BPS,
+    PRICING_RISK_THRESHOLD,
+};
+pub use privacy_protection::{
+    check_access, compute_privacy_intervention, detect_exploitation, minimize_to_need_to_know,
+    AccessDecision, ConsentRecord, PrivacyInterventionRecord, PrivacyMonitoringResult,
+    ACCESS_MONITORING_WINDOW_SECS, ALL_FIELDS, FIELD_CAREER_DATA, FIELD_CONTACT, FIELD_IDENTITY,
+    FIELD_LEARNING_HISTORY, FIELD_PAYMENT, MAX_ACCESSES_PER_WINDOW, MINIMAL_SESSION_FIELDS,
+    PRIVACY_RISK_THRESHOLD,
 };
 pub use pause_guard::{ContractPaused, is_paused, require_not_paused};
 pub use reentrancy_guard::{
-    AtomicBatch, BatchOp, ReentrancyAttemptLog, ReentrancyGuard, StateSnapshot,
-    validate_amount_limits, validate_caller_is_authorized,
+    validate_amount_limits, validate_caller_is_authorized, AtomicBatch, BatchOp,
+    BatchValidationError, ReentrancyAttemptLog, ReentrancyGuard, StateSnapshot, MAX_BATCH_SIZE,
+};
+pub use reputation::{
+    analyze_review_pattern, detect_sybil, interaction_commitment, BehavioralAnalysis,
+    ReputationProof, SybilDetection,
+};
+pub use safe_math::SafeMath;
+pub use scalability_protection::{
+    compute_scalability_intervention, detect_resource_competition, distribute_resources_fairly,
+    is_performance_restoration_eligible, validate_load_pattern, FairResourceAllocation,
+    LoadValidationResult, PerformanceInterventionRecord, ResourceCompetitionFlag,
+    FAIR_ALLOCATION_MAX_SHARE_BPS, LOAD_SUSPICIOUS_RATE_PER_MINUTE,
+    PERFORMANCE_INTERVENTION_THRESHOLD, PERFORMANCE_RESTORATION_COOLDOWN_SECS,
+    RESOURCE_BURST_WINDOW_SECS, RESOURCE_COMPETITION_RISK_THRESHOLD, RESOURCE_MIN_DISTINCT_BPS,
 };
 pub use sig_validation::{
     current_nonce, is_deadline_valid, validate_and_consume_nonce, validate_deadline,
