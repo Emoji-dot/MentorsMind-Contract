@@ -18,7 +18,7 @@ use shared::{
     EmergencyAuditRecord, EmergencyCircuitBreaker, EmergencyMultisig, MultisigValidation, SafeMath,
     EMERGENCY_ADMIN_TTL_SECS, EMERGENCY_MSIG_THRESHOLD, EmergencyRollback,
     ImmutableRollbackAuditRecord, RollbackAuthorization, RollbackJustification, RollbackScope,
-    SecureStorageAccess, STORAGE_DERIVE_CTX, Pagination,
+    SecureStorageAccess, STORAGE_DERIVE_CTX, Pagination, log_contract_error,
 };
 pub use shared::EscrowStatus;
 use soroban_sdk::{
@@ -1430,7 +1430,17 @@ impl EscrowContract {
         // Auth check: caller must be learner OR admin
         caller.require_auth();
         if caller != escrow.learner && caller != admin {
-            panic!("Caller not authorized");
+            log_contract_error(
+                &env,
+                Symbol::new(&env, "release_funds"),
+                Symbol::new(&env, "unauthorized"),
+                escrow_id as i128,
+                Some(caller.clone()),
+            );
+            panic!(
+                "release_funds: caller is neither the learner nor the admin for escrow {}",
+                escrow_id
+            );
         }
 
         Self::_do_release(&env, &mut escrow, &key, &caller);
@@ -3831,6 +3841,39 @@ impl EscrowContract {
             .unwrap_or(false)
     }
 
+    /// Require `caller` to be the contract admin for an escrow-scoped admin
+    /// operation, with contextual panic messages and a structured error
+    /// event on failure (#988). Replaces the repeated
+    /// `.expect("Not initialized")` / bare `panic!("Unauthorized")` pair
+    /// that gave no indication of which operation or escrow failed.
+    fn _require_admin_for_escrow(env: &Env, caller: &Address, escrow_id: u64, operation: &str) {
+        let stored_admin: Option<Address> = env.storage().persistent().get(&DataKey::Admin);
+        let stored_admin = match stored_admin {
+            Some(a) => a,
+            None => {
+                log_contract_error(
+                    env,
+                    Symbol::new(env, operation),
+                    Symbol::new(env, "not_init"),
+                    escrow_id as i128,
+                    None,
+                );
+                panic!("{}: escrow contract not initialized (no admin set)", operation);
+            }
+        };
+        caller.require_auth();
+        if *caller != stored_admin {
+            log_contract_error(
+                env,
+                Symbol::new(env, operation),
+                Symbol::new(env, "unauthorized"),
+                escrow_id as i128,
+                Some(caller.clone()),
+            );
+            panic!("{}: caller is not the admin for escrow {}", operation, escrow_id);
+        }
+    }
+
     /// Shared escrow creation logic with strict token whitelist validation.
     ///
     /// This function is the single entry point for all escrow creation paths
@@ -4891,11 +4934,7 @@ impl EscrowContract {
     /// (mirrored from the dispute-evidence contract by the admin) so that
     /// `resolve_dispute_secure` can validate evidence sufficiency on-chain.
     pub fn record_evidence_count(env: Env, admin: Address, escrow_id: u64, evidence_count: u32) {
-        let stored_admin: Address = env.storage().persistent().get(&DataKey::Admin).expect("Not initialized");
-        admin.require_auth();
-        if admin != stored_admin {
-            panic!("Unauthorized");
-        }
+        Self::_require_admin_for_escrow(&env, &admin, escrow_id, "record_evidence_count");
         env.storage().persistent().set(&DataKey::DisputeEvidenceCount(escrow_id), &evidence_count);
     }
 
@@ -4906,11 +4945,7 @@ impl EscrowContract {
     ///
     /// Falls back to the same split logic as `resolve_dispute`.
     pub fn resolve_dispute_secure(env: Env, admin: Address, escrow_id: u64, mentor_pct: u32) {
-        let stored_admin: Address = env.storage().persistent().get(&DataKey::Admin).expect("Not initialized");
-        admin.require_auth();
-        if admin != stored_admin {
-            panic!("Unauthorized");
-        }
+        Self::_require_admin_for_escrow(&env, &admin, escrow_id, "resolve_dispute_secure");
 
         if Self::is_isolated(env.clone(), escrow_id) {
             panic!("Escrow isolated pending manual review");
@@ -4958,11 +4993,7 @@ impl EscrowContract {
     /// known incident, or by automation after `assess_payment_manipulation_risk`
     /// reports a suspected attack.
     pub fn emergency_isolate_escrow(env: Env, admin: Address, escrow_id: u64, reason: Symbol) -> EmergencyFundLock {
-        let stored_admin: Address = env.storage().persistent().get(&DataKey::Admin).expect("Not initialized");
-        admin.require_auth();
-        if admin != stored_admin {
-            panic!("Unauthorized");
-        }
+        Self::_require_admin_for_escrow(&env, &admin, escrow_id, "emergency_isolate_escrow");
 
         let lock = EmergencyFundLock {
             isolate: true,
@@ -4995,11 +5026,7 @@ impl EscrowContract {
     /// Lift emergency isolation on an escrow after manual admin review,
     /// allowing normal release/resolution flows to resume.
     pub fn recover_isolated_escrow(env: Env, admin: Address, escrow_id: u64) {
-        let stored_admin: Address = env.storage().persistent().get(&DataKey::Admin).expect("Not initialized");
-        admin.require_auth();
-        if admin != stored_admin {
-            panic!("Unauthorized");
-        }
+        Self::_require_admin_for_escrow(&env, &admin, escrow_id, "recover_isolated_escrow");
         env.storage().persistent().set(&DataKey::IsolatedEscrow(escrow_id), &false);
         env.events().publish(
             (Symbol::new(&env, "Escrow"), Symbol::new(&env, "Recovered"), escrow_id),
