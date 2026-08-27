@@ -193,7 +193,7 @@ pub fn register_validator(env: &Env, validator: &Address) -> ValidatorRecord {
     env.storage().persistent().set(&key, &record);
 
     env.events().publish(
-        (symbol_short!("valacct"), symbol_short!("registered")),
+        (symbol_short!("valacct"), symbol_short!("register")),
         (validator.clone(), INITIAL_REPUTATION_SCORE),
     );
 

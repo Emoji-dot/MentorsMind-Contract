@@ -542,7 +542,7 @@ impl GovernanceContract {
         let mut count: u32 = env.storage().instance().get(&PROPOSAL_COUNT).unwrap_or(0);
         count = count.checked_add(1).expect("proposal overflow");
 
-        if let ProposalAction::ExecuteCall(target, function) = &action {
+        if let ProposalAction::ExecuteCall(target, function, _) = &action {
             if let Some(templates_contract) =
                 env.storage().persistent().get::<_, Address>(&TEMPLATES)
             {
@@ -1959,7 +1959,7 @@ impl GovernanceContract {
             .set(&DataKey::GovValidatorRecord(validator.clone()), &true);
 
         env.events().publish(
-            (symbol_short!("govval"), symbol_short!("registered")),
+            (symbol_short!("govval"), symbol_short!("register")),
             (validator, env.ledger().timestamp()),
         );
     }

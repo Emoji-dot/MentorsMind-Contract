@@ -271,7 +271,7 @@ pub fn acknowledge_prepare(
     if op.prepared_count >= total {
         op.phase = XChainPhase::Committing;
         env.events().publish(
-            (symbol_short!("xcsync"), symbol_short!("committing")),
+            (symbol_short!("xcsync"), symbol_short!("commit")),
             op_id.clone(),
         );
     }

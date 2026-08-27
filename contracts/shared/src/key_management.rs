@@ -219,7 +219,7 @@ pub fn register_key(
     env.storage().persistent().set(&ver_key, &record.version);
 
     env.events().publish(
-        (symbol_short!("keymgmt"), symbol_short!("registered")),
+        (symbol_short!("keymgmt"), symbol_short!("register")),
         (account.clone(), record.version, record.scheme as u32),
     );
 

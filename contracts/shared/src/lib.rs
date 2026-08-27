@@ -38,6 +38,16 @@ pub mod outcome_authenticity;
 pub mod scalability_protection;
 pub mod learner_protection;
 
+// Additional protection modules
+pub mod cartel_detection;
+pub mod key_management;
+pub mod transaction_guard;
+pub mod validator_accountability;
+pub mod cross_chain_sync;
+pub mod recording_integrity;
+pub mod session_privacy;
+pub mod payment_integrity;
+
 // Content protection modules 
 pub mod content_protection;
 pub mod ip_verification; 
@@ -190,6 +200,59 @@ pub use learner_protection::{
     PREDATORY_COMPLAINT_RATIO_BPS, PREDATORY_RISK_THRESHOLD,
     EMERGENCY_PATTERN_THRESHOLD, EMERGENCY_SUSPENSION_COOLDOWN_SECS,
     LEARNER_PROTECTION_COOLDOWN_SECS,
+};
+
+// Key management exports  
+pub use key_management::{
+    register_key, propose_key_rotation, execute_key_rotation, is_rotation_due, 
+    emergency_revoke_key, is_key_revoked, get_current_key,
+    KeyRecord, KeyRotationProposal, KeyScheme,
+};
+
+// Transaction intent protection exports
+pub use transaction_guard::{
+    evaluate_transaction_intent, get_protection_state,
+    TransactionIntent, RiskLevel,
+};
+
+// Recording integrity exports
+pub use recording_integrity::{
+    create_recording, compute_merkle_root, verify_recording_integrity,
+    grant_consent, revoke_consent, check_access_authorized, apply_redaction,
+    log_access, emergency_privacy_protection,
+    SessionRecording, RecordingStatus, ConsentRecord as RecordingConsentRecord, AccessRole, RedactionRecord, 
+    AccessLogEntry, IntegrityVerificationResult,
+};
+
+// Payment integrity exports
+pub use payment_integrity::{
+    validate_evidence_sufficiency, EvidenceSufficiency,
+};
+
+// Market protection exports (aliases for governance compatibility)
+pub use community_protection::{
+    validate_network_authenticity as detect_network_concentration,
+    evaluate_fair_access as assess_competition_barriers,
+    compute_community_intervention as analyze_market_networks,
+    is_restoration_eligible as audit_market_competition,
+    CoordinationFlag as DecentralizationMonitoring,
+    FairAccessDecision as MarketFairness,
+    CommunityInterventionRecord as MarketProtectionRecord,
+    COMMUNITY_INTERVENTION_THRESHOLD as MARKET_INTERVENTION_COOLDOWN_SECS,
+};
+pub use pricing_protection::{
+    detect_price_coordination as detect_pricing_coordination,
+    compute_pricing_intervention as compute_market_protection_intervention,
+    PricingInterventionRecord as CompetitionAuditRecord,
+};
+pub use scalability_protection::{
+    is_performance_restoration_eligible as is_market_restoration_eligible,
+};
+
+// Validator accountability exports
+pub use validator_accountability::{
+    assess_incentive_alignment, get_validator_record, is_validator_ejected,
+    register_validator, IncentiveAlignmentScore, ValidatorRecord,
 };
 
 // Content protection exports

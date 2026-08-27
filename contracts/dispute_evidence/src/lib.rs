@@ -34,7 +34,7 @@ use shared::{
 };
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, Address, BytesN, Env,
-    IntoVal, Symbol, Vec, Map,
+    IntoVal, Symbol, Vec,
 };
 
 use shared::{
