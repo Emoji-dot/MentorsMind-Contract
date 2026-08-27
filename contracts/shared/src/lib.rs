@@ -12,6 +12,7 @@ pub mod atomic_state;
 pub mod cartel_detection;
 pub mod community_protection;
 pub mod cross_contract_auth;
+pub mod cross_chain_sync;
 pub mod disaster_recovery;
 pub mod emergency;
 pub mod emergency_rollback;
@@ -22,6 +23,7 @@ pub mod gas_estimation;
 pub mod governance_voting;
 pub mod interface_id;
 pub mod justice_protection;
+pub mod key_management;
 pub mod learner_protection;
 pub mod outcome_authenticity;
 pub mod pause_guard;
@@ -37,7 +39,9 @@ pub mod state_machine;
 pub mod storage;
 pub mod storage_compatibility;
 pub mod threat_intelligence;
+pub mod transaction_guard;
 pub mod ttl_utils;
+pub mod validator_accountability;
 pub mod validation;
 
 use soroban_sdk::{contracttype, symbol_short, xdr::ToXdr, Address, Bytes, BytesN, Env, Symbol, Vec};
@@ -197,6 +201,65 @@ pub use ttl_utils::{
     WARNING_THRESHOLD_LEDGERS,
 };
 pub use validation::{require_auth_and_validate, ValidationError, Validator};
+
+// ---------------------------------------------------------------------------
+// #866 — Cross-Chain State Synchronization
+// ---------------------------------------------------------------------------
+pub use cross_chain_sync::{
+    acknowledge_prepare, begin_atomic_xchain_op, compute_state_merkle_root, confirm_commit,
+    confirm_rollback, expire_xchain_op, get_chain_isolation, get_inconsistency,
+    get_xchain_op, initiate_rollback, is_chain_isolated, is_reorg_safe, isolate_chain,
+    lift_chain_isolation, record_inconsistency, record_reorg_event, require_finality,
+    validate_state_proof, AtomicXChainOp, ChainFinalityConfig, ChainIsolationRecord,
+    CrossChainInconsistency, CrossChainStateProof, FinalityTier, XChainPhase,
+    XChainSyncError, MAX_PARTICIPATING_CHAINS, MIN_FINALITY_CONFIRMATIONS,
+    REORG_SAFE_DEPTH, XCHAIN_OP_TIMEOUT_SECS,
+};
+
+// ---------------------------------------------------------------------------
+// #867 — Social Engineering / Transaction-Intent Protection
+// ---------------------------------------------------------------------------
+pub use transaction_guard::{
+    add_multisig_approval, create_multisig_requirement, evaluate_transaction_intent,
+    get_protection_state, is_multisig_satisfied, record_suspicious_pattern,
+    require_account_not_blocked, require_cooling_off_elapsed, unblock_account,
+    AccountProtectionState, MultiSigRequirement, RiskLevel, SuspiciousPattern,
+    TransactionIntent, AUTO_BLOCK_SCORE_THRESHOLD, COOLING_OFF_PERIOD_SECS,
+    EMERGENCY_COOLING_OFF_SECS, HIGH_VALUE_THRESHOLD_BPS, MAX_OPS_PER_WINDOW,
+};
+
+// ---------------------------------------------------------------------------
+// #868 — Advanced Cryptographic Key Management
+// ---------------------------------------------------------------------------
+pub use key_management::{
+    approve_social_recovery, derive_child_key_commitment, emergency_revoke_key,
+    execute_key_rotation, execute_social_recovery, get_current_key, get_guardians,
+    initiate_social_recovery, is_key_revoked, is_registered_guardian,
+    is_reinstate_eligible, is_rotation_due, is_scheme_supported,
+    is_threshold_met, propose_key_rotation, register_guardian,
+    register_key, register_threshold_share, submit_threshold_share,
+    KeyRecord, KeyRevocationRecord, KeyRotationProposal, KeyScheme,
+    SocialRecoverySession, ThresholdKeyShare, DEFAULT_THRESHOLD_K, DEFAULT_THRESHOLD_N,
+    KEY_ROTATION_OVERLAP_SECS, KEY_ROTATION_PERIOD_SECS, MAX_GUARDIANS,
+    MAX_THRESHOLD_SHARES, REVOCATION_COOLDOWN_SECS, SOCIAL_RECOVERY_QUORUM,
+};
+
+// ---------------------------------------------------------------------------
+// #869 — Validator Accountability / Consensus Attack Resistance
+// ---------------------------------------------------------------------------
+pub use validator_accountability::{
+    activate_emergency_consensus, apply_slash, assess_incentive_alignment,
+    compute_network_anomaly_score, deactivate_emergency_consensus, detect_consensus_attack,
+    get_emergency_state, get_validator_record, graduated_slash_bps, is_emergency_active,
+    is_validator_ejected, record_epoch_participation, record_missed_epoch,
+    readmit_validator, register_validator, select_healthy_validators,
+    ConsensusAnomalyRecord, EmergencyConsensusState, IncentiveAlignmentScore,
+    SlashingEvent, ValidatorRecord, ViolationType,
+    ATTACK_EJECTION_THRESHOLD, EJECTION_COOLDOWN_SECS, EMERGENCY_TRIGGER_SCORE,
+    INITIAL_REPUTATION_SCORE, MAX_REPUTATION_SCORE, MIN_REPUTATION_SCORE,
+    REPUTATION_PENALTY_ATTACK, REPUTATION_PENALTY_EQUIVOCATION,
+    REPUTATION_PENALTY_MISSED, SLASH_CRITICAL_BPS, SLASH_MAJOR_BPS, SLASH_MINOR_BPS,
+};
 
 /// Layer-2 and state-channel integration metadata tracked by contracts that
 /// need to defer L1 commitment until the applicable challenge window ends.

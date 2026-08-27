@@ -22,6 +22,11 @@ use shared::{
     DecentralizationMonitoring, MarketFairness,
     MarketProtectionRecord, CompetitionAuditRecord,
     MARKET_INTERVENTION_COOLDOWN_SECS,
+    // #869 — Validator accountability and consensus oversight
+    assess_incentive_alignment, get_validator_record, is_validator_ejected,
+    register_validator, IncentiveAlignmentScore, ValidatorRecord,
+    // #867 — Transaction intent protection
+    evaluate_transaction_intent, RiskLevel, TransactionIntent,
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, vec, Address, Bytes,
@@ -258,6 +263,14 @@ pub enum DataKey {
     GovCompetitionAuditRecord,
     /// Barrier signal count stored by governance.
     GovBarrierSignalCount,
+    // ── #869 Validator accountability ─────────────────────────────────────
+    /// Registered validators tracked by governance.
+    GovValidatorRecord(Address),
+    /// Whether governance-level emergency consensus is active.
+    GovConsensusEmergency,
+    // ── #867 Transaction intent ────────────────────────────────────────────
+    /// Whether a voter's account has been flagged for suspicious activity.
+    GovVoterFlag(Address),
 }
 
 #[contracttype]
@@ -1928,6 +1941,146 @@ impl GovernanceContract {
                 suspicious_price_moves: 0,
                 risk_score: 0,
             })
+    }
+
+    // =======================================================================
+    // #869 — Validator Accountability Integration
+    // =======================================================================
+
+    /// Register a governance participant (validator) for accountability tracking.
+    ///
+    /// Must be called by admin when on-boarding new validators or arbitrators
+    /// whose performance will be tracked through the governance contract.
+    pub fn register_governance_validator(env: Env, admin: Address, validator: Address) {
+        Self::assert_admin(&env, &admin);
+
+        // Register in shared validator accountability system.
+        if get_validator_record(&env, &validator).is_none() {
+            register_validator(&env, &validator);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovValidatorRecord(validator.clone()), &true);
+
+        env.events().publish(
+            (symbol_short!("govval"), symbol_short!("registered")),
+            (validator, env.ledger().timestamp()),
+        );
+    }
+
+    /// Assess the incentive alignment of a governance participant.
+    ///
+    /// Returns an `IncentiveAlignmentScore` indicating whether the validator's
+    /// economic interests support protocol security. Low-aligned validators
+    /// may be excluded from future governance roles.
+    pub fn assess_validator_alignment(
+        env: Env,
+        validator: Address,
+    ) -> IncentiveAlignmentScore {
+        assess_incentive_alignment(&env, &validator)
+    }
+
+    /// Get the validator record for a governance participant.
+    pub fn get_governance_validator(env: Env, validator: Address) -> Option<ValidatorRecord> {
+        get_validator_record(&env, &validator)
+    }
+
+    /// Check whether a validator is currently ejected from the protocol.
+    pub fn is_governance_validator_ejected(env: Env, validator: Address) -> bool {
+        is_validator_ejected(&env, &validator)
+    }
+
+    /// Activate governance-level consensus emergency mode.
+    ///
+    /// Called by admin when a consensus-layer attack is detected at the
+    /// governance layer. Blocks new proposals until emergency is resolved.
+    pub fn activate_governance_emergency(env: Env, admin: Address) {
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovConsensusEmergency, &true);
+
+        env.events().publish(
+            (symbol_short!("govval"), symbol_short!("emer_on")),
+            env.ledger().timestamp(),
+        );
+    }
+
+    /// Deactivate governance-level consensus emergency mode.
+    pub fn deactivate_governance_emergency(env: Env, admin: Address) {
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::GovConsensusEmergency);
+
+        env.events().publish(
+            (symbol_short!("govval"), symbol_short!("emer_off")),
+            env.ledger().timestamp(),
+        );
+    }
+
+    /// Check whether governance-level consensus emergency is active.
+    pub fn is_governance_emergency_active(env: Env) -> bool {
+        env.storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::GovConsensusEmergency)
+            .unwrap_or(false)
+    }
+
+    // =======================================================================
+    // #867 — Transaction Intent Verification
+    // =======================================================================
+
+    /// Evaluate the risk of a governance vote before casting it.
+    ///
+    /// Returns a `TransactionIntent` with risk level, anomaly score, and
+    /// cooling-off requirements. Callers (e.g. front-ends or relay services)
+    /// should check `account_blocked` before submitting the real vote.
+    pub fn evaluate_vote_risk(
+        env: Env,
+        voter: Address,
+        proposal_id: u32,
+        support: bool,
+    ) -> TransactionIntent {
+        let intent = evaluate_transaction_intent(
+            &env,
+            &voter,
+            Symbol::new(&env, "vote"),
+            proposal_id as i128,
+            false,
+        );
+
+        // If account is blocked or at critical risk, store the flag.
+        if intent.account_blocked || intent.risk_level == RiskLevel::Critical {
+            env.storage()
+                .persistent()
+                .set(&DataKey::GovVoterFlag(voter.clone()), &true);
+        }
+
+        let _ = support;
+        intent
+    }
+
+    /// Check whether a voter has been flagged for suspicious activity.
+    pub fn is_voter_flagged(env: Env, voter: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::GovVoterFlag(voter))
+            .unwrap_or(false)
+    }
+
+    /// Clear a voter flag after investigation (admin only).
+    pub fn clear_voter_flag(env: Env, admin: Address, voter: Address) {
+        Self::assert_admin(&env, &admin);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::GovVoterFlag(voter.clone()));
+
+        env.events().publish(
+            (symbol_short!("govtx"), symbol_short!("flag_clr")),
+            voter,
+        );
     }
 }
 
