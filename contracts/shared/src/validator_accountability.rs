@@ -193,7 +193,7 @@ pub fn register_validator(env: &Env, validator: &Address) -> ValidatorRecord {
     env.storage().persistent().set(&key, &record);
 
     env.events().publish(
-        (symbol_short!("valacct"), symbol_short!("registered")),
+        (symbol_short!("valacct"), symbol_short!("register")),
         (validator.clone(), INITIAL_REPUTATION_SCORE),
     );
 
@@ -651,6 +651,7 @@ fn emergency_state_key() -> Symbol {
 
 #[cfg(test)]
 mod tests {
+    use soroban_sdk::testutils::Address as _;
     extern crate std;
     use super::*;
     use soroban_sdk::{testutils::Ledger, BytesN, Env};

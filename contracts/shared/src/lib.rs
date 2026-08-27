@@ -7,6 +7,7 @@ use soroban_sdk::contracterror;
 ///
 /// Centralizing these definitions keeps authorization and state-transition
 /// behavior aligned across contracts that make the same safety assumptions.
+pub mod account_security;
 pub mod admin;
 pub mod atomic_state;
 pub mod cartel_detection;
@@ -43,6 +44,25 @@ pub mod transaction_guard;
 pub mod ttl_utils;
 pub mod validator_accountability;
 pub mod validation;
+pub mod algorithm_transparency;
+pub mod exit_facilitation;
+pub mod reputation_bridging;
+pub mod session_uniqueness;
+pub mod metadata_validation;
+pub mod mentor_wellness;
+pub mod onboarding_protection;
+pub mod skill_verification;
+pub mod assessment_authenticity;
+pub mod grade_inflation;
+pub mod assessment_security;
+pub mod recording_integrity;
+pub mod transfer_security;
+pub mod market_monitoring;
+pub mod scheduling_integrity;
+pub mod service_continuity;
+pub mod session_privacy;
+pub mod session_protection;
+pub mod attack_detection;
 
 use soroban_sdk::{contracttype, symbol_short, xdr::ToXdr, Address, Bytes, BytesN, Env, Symbol, Vec};
 
@@ -460,3 +480,129 @@ pub enum SharedError {
     /// A cross-contract caller failed interface-registry verification.
     UnauthorizedContract = 12,
 }
+
+// ---------------------------------------------------------------------------
+// Additional modules re-exports
+// ---------------------------------------------------------------------------
+pub use algorithm_transparency::{
+    assess_algorithm_transparency, audit_algorithm_transparency,
+    compute_algo_protection_intervention, compute_algo_protection_intervention as compute_algorithm_protection,
+    compute_transparency_balance, detect_reverse_engineering,
+    is_algo_restoration_eligible, is_algo_restoration_eligible as is_algorithm_restoration_eligible,
+    monitor_ranking_algorithm, should_block_transparency_response, AlgorithmMonitoringResult,
+    AlgorithmProtectionRecord, AlgorithmTransparency, ReverseEngineeringProtection,
+    TransparencyAuditRecord, TransparencyBalance, ALGO_INTERVENTION_THRESHOLD,
+    ALGO_MANIPULATION_RISK_THRESHOLD, ALGO_PROTECTION_COOLDOWN_SECS,
+    MAX_TRANSPARENCY_DISCLOSURE_BPS, MIN_TRANSPARENCY_DISCLOSURE_BPS,
+    PROBE_DETECTION_WINDOW_SECS, PROBE_HIGH_FREQUENCY_THRESHOLD, RANKING_FACTOR_COUNT,
+    RANKING_GAMING_WINDOW_SECS, RANKING_SCORE_DEVIATION_BPS,
+    REVERSE_ENGINEERING_RISK_THRESHOLD,
+};
+pub use account_security::{CrossPlatformIdentity, is_identity_match};
+pub use exit_facilitation::{
+    evaluate_competition_protection, facilitate_migration, validate_dependency_necessity,
+    CompetitionProtectionDecision, DataPortabilityPackage, DependencyValidationResult,
+    ExitMonitoringReport, MigrationFacilitationRecord, MAX_SWITCHING_COST_BPS,
+};
+pub use reputation_bridging::{
+    audit_reputation_bridging, check_identity_consistency, isolate_reputation_score,
+    verify_cross_platform_attestation, BridgedReputationRecord, BridgingAuditReport,
+    CrossPlatformAttestation, IdentityConsistencyCheck, PlatformReliabilityScore,
+    MAX_BRIDGED_REPUTATION_DISCOUNT_BPS, MIN_PLATFORM_RELIABILITY_BPS,
+};
+pub use session_uniqueness::{
+    audit_session_integrity, detect_temporal_replay, recover_session_content,
+    validate_session_nonce, verify_content_checksum, ContentIntegrityRecord,
+    ReplayDetectionResult, SessionAuditRecord, SessionNonceRecord, SessionRecoveryRecord,
+    MAX_SESSION_TIME_DRIFT_SECS, REPLAY_CONFIDENCE_THRESHOLD_BPS,
+};
+pub use metadata_validation::{
+    audit_information_accuracy, is_transparency_restoration_eligible,
+    monitor_metadata_manipulation, protect_transparency,
+    protect_transparency as shared_protect_transparency, restore_truth_and_correct,
+    validate_metadata_authenticity, verify_information_integrity, InformationAuditRecord,
+    InformationIntegrity, MetadataMonitoringRecord, MetadataValidation, TransparencyProtection,
+    TruthRestorationRecord, DISINFORMATION_RISK_THRESHOLD, METADATA_AUTHENTICITY_THRESHOLD,
+    MIN_SOURCE_CREDIBILITY_BPS, TRANSPARENCY_RESTORATION_COOLDOWN_SECS, TRANSPARENCY_RISK_THRESHOLD,
+};
+pub use mentor_wellness::{
+    activate_emergency_protection, assess_burnout_risk, calculate_burnout_risk,
+    can_accept_session, distribute_sessions_fairly, initiate_intervention, update_mentor_workload,
+    BurnoutRiskAssessment, EmergencyProtection, FairDistributionResult, MentorWorkload,
+    SessionDifficulty, SessionDistributionRequest, WellnessIntervention,
+    BURNOUT_RISK_THRESHOLD_BPS, DIFFICULTY_WEIGHTS, MANDATORY_REST_HOURS, MAX_CONCURRENT_SESSIONS,
+    MAX_WEEKLY_HOURS, MIN_REST_HOURS,
+};
+pub use onboarding_protection::{
+    assess_admission_equity, compute_onboarding_protection, monitor_onboarding_access_patterns,
+    AccessMonitoringRecord, AdmissionEquity, OnboardingFairness, OnboardingProtectionRecord,
+    VerificationAuthenticity, BARRIER_GAMING_RISK_THRESHOLD, ONBOARDING_FAIRNESS_THRESHOLD,
+    ONBOARDING_RESTORATION_COOLDOWN_SECS,
+};
+pub use skill_verification::{
+    authenticate_external_credential, compute_recertification_due, detect_skill_fraud,
+    evaluate_domain_governance, score_practical_assessment, validate_peer_consensus,
+    ExpertiseAuthenticationRecord, PracticalAssessment, RecertificationSchedule, SkillFraudFlag,
+    SpecializationGovernanceRecord,
+};
+pub use assessment_authenticity::{
+    check_source_diversity, perform_consensus_validation, submit_validation,
+    verify_assessment_authenticity, verify_blockchain_attestation, AuthenticityVerification,
+    ConsensusRecord, ValidationResult, ValidationSource, MAX_VALIDATION_AGE_SECS,
+    MIN_VALIDATION_SOURCES, VALIDATION_CONSENSUS_BPS,
+};
+pub use grade_inflation::{
+    apply_inflation_adjustment, calculate_grade_distribution, detect_grade_inflation,
+    record_grade_correction, GradeCorrectionRecord, GradeDistributionStats,
+    InflationDetectionResult, MentorScoringAdjustment, INFLATION_PENALTY_BPS_PER_DETECTION,
+    INFLATION_WINDOW, MAX_INFLATION_RATE_BPS, MIN_SESSIONS_FOR_ANALYSIS, OUTLIER_ZSCORE_THRESHOLD,
+};
+pub use assessment_security::{
+    AssessmentMetrics, AssessmentRecord, AssessmentSecurity, AssessmentSecurityError,
+    GamingDetectionResult, GamingFlag, ManipulationRecord, ProgressAuthenticityRecord,
+};
+pub use recording_integrity::{
+    apply_redaction, check_access_authorized, compute_merkle_root, create_recording,
+    emergency_privacy_protection, grant_consent, log_access, revoke_consent,
+    verify_recording_integrity, AccessLogEntry, AccessRole,
+    IntegrityVerificationResult, RecordingStatus, RedactionRecord, SessionRecording,
+    DEFAULT_RETENTION_DAYS, MAX_RECORDING_SIZE_MB, MIN_CONSENT_DURATION_HOURS,
+};
+pub use transfer_security::{
+    CredentialAuthenticityProof, CredentialFraudType, CredentialTransfer, CreditInflationRecord,
+    CrossPlatformVerification, FraudDetectionResult, TransferIntegrityResult, TransferSecurity,
+    TransferSecurityError, VerificationStep,
+};
+pub use market_monitoring::{
+    assess_demand_authenticity, balance_supply_demand, calculate_market_metrics,
+    detect_market_manipulation, trigger_emergency_stabilization,
+    validate_price_discovery, DemandAuthenticityResult, EmergencyStabilization,
+    MarketManipulationAlert, MarketMetrics, PriceDiscoveryValidation, SupplyDemandBalance,
+    ARTIFICIAL_DEMAND_THRESHOLD_BPS, MAX_PRICE_DEVIATION_BPS, MIN_MARKET_DATA_POINTS,
+    STABILIZATION_THRESHOLD_BPS, SUPPLY_RESTRICTION_THRESHOLD_BPS,
+};
+pub use scheduling_integrity::{
+    assign_fair_slot, compute_availability_commitment, compute_random_tiebreak,
+    detect_availability_gaming, validate_conflict_proof, verify_availability_commitment,
+    AvailabilityCommitment, AvailabilityGamingFlag, ConflictProof, FairSchedulingDecision,
+    SchedulingAuditRecord, GAMING_RISK_THRESHOLD, MAX_CONFLICT_PROOF_AGE_SECS,
+    MIN_COMMITMENT_LEAD_SECS, RAPID_AVAILABILITY_CHANGE_WINDOW_SECS,
+};
+pub use service_continuity::{
+    is_backup_valid, needs_backup, ContinuityBackup, ContinuityStatus, BACKUP_MAX_AGE_SECS,
+    MAX_BACKUP_RECORDS,
+};
+pub use session_privacy::{
+    contain_data_breach, detect_cross_session_leak, enforce_session_boundary,
+    CrossSessionLeakResult, DataBreachContainment, SessionAccessBoundary, BREACH_RISK_THRESHOLD,
+    CROSS_SESSION_MONITORING_WINDOW_SECS, LEAK_DISTINCT_SESSION_THRESHOLD,
+};
+pub use session_protection::{
+    compute_disruption_score, should_protect_session, ProtectionCheckResult,
+    SessionProtectionRecord, DISRUPTION_RISK_THRESHOLD_BPS, MAX_PROTECTED_SESSIONS,
+    PROTECTION_CHECK_COOLDOWN_SECS,
+};
+pub use attack_detection::{
+    evaluate_attack_risk, AttackDetectionResult, AttackEvent, AttackType,
+    ATTACK_DETECTION_WINDOW_SECS, ATTACK_FLAG_THRESHOLD,
+};
