@@ -1142,6 +1142,7 @@ impl EscrowContract {
         session_end_time: u64,
         total_sessions: u32,
     ) -> u64 {
+        let _guard = ReentrancyGuard::enter_with_caller(&env, symbol_short!("create"), learner.clone());
         Self::_create_escrow_internal(
             env,
             mentor,
@@ -1163,6 +1164,7 @@ impl EscrowContract {
     /// Calculates the platform fee (`gross * fee_bps / 10_000`), transfers the
     /// fee to the treasury, and transfers the remainder to the mentor.
     pub fn release_funds(env: Env, caller: Address, escrow_id: u64) {
+        let _guard = ReentrancyGuard::enter_with_caller(&env, symbol_short!("release"), caller.clone());
         let key = (symbol_short!("ESCROW"), escrow_id);
         env.storage()
             .persistent()
@@ -1202,6 +1204,7 @@ impl EscrowContract {
 
     /// Release a partial amount (one session worth) from a multi-session escrow.
     pub fn release_partial(env: Env, caller: Address, escrow_id: u64) {
+        let _guard = ReentrancyGuard::enter_with_caller(&env, symbol_short!("partial"), caller.clone());
         let key = (symbol_short!("ESCROW"), escrow_id);
         env.storage()
             .persistent()
@@ -1654,6 +1657,7 @@ impl EscrowContract {
 
     /// Open a dispute (called by mentor or learner).
     pub fn dispute(env: Env, caller: Address, escrow_id: u64, reason: Symbol) {
+        let _guard = ReentrancyGuard::enter_with_caller(&env, symbol_short!("dispute"), caller.clone());
         let key = (symbol_short!("ESCROW"), escrow_id);
         env.storage()
             .persistent()
@@ -1710,6 +1714,7 @@ impl EscrowContract {
     ///   The remainder (`100 - mentor_pct`) goes to the learner. No platform fee
     ///   is deducted — the full escrowed amount is split between the parties.
     pub fn resolve_dispute(env: Env, escrow_id: u64, mentor_pct: u32) {
+        let _guard = ReentrancyGuard::enter(&env, symbol_short!("resolve"));
         // --- Admin auth ---
         let admin: Address = env.storage().persistent().get(&DataKey::Admin).expect("Not initialized");
         env.storage().persistent().extend_ttl(&DataKey::Admin, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
@@ -2429,6 +2434,7 @@ impl EscrowContract {
         reason_hash: BytesN<32>,
         emergency_action_id: u32,
     ) -> bool {
+        let _guard = ReentrancyGuard::enter_with_caller(&env, symbol_short!("emer"), caller.clone());
         let action: EmergencyAction = env
             .storage()
             .persistent()
@@ -6090,4 +6096,3 @@ mod test {
         f.client().release_funds(&f.learner, &id);
     }
 }
-

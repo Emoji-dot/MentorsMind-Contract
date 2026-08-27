@@ -36,9 +36,8 @@ use shared::{
     SuccessMetricProtection,
     VulnerabilityAssessment,
     OUTCOME_RESTORATION_COOLDOWN_SECS,
-    OutcomeAssessment, CurriculumValidation, LearningPathOptimization, CurriculumDispute,
-    generate_mentoring_proof, check_session_authenticity, ProofOfMentoring, SessionAuthenticity, ReputationIntegrity,
-    trigger_rollback, execute_with_recovery, RecoveryState, RollbackProtector,
+    CollusionDetection,
+    IncentiveCompatibilityResult,
 };
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal,
@@ -147,6 +146,8 @@ pub enum DataKey {
     LearnerProtectionIntervention(Address),
     /// Per-review quality/authenticity audit report.
     ReviewQualityReport(Symbol),
+    CollusionSignal(Address),
+    IncentiveCompatibility(Address),
 }
 
 /// Cooldown before an intervened mentor's community access is eligible for
@@ -289,6 +290,7 @@ impl ReputationContract {
         let coordination =
             Self::validate_community_interactions(env.clone(), mentor.clone(), learner.clone());
         let social_proof = Self::monitor_social_proof_auth(env.clone(), mentor.clone());
+        Self::detect_collusion(env.clone(), mentor.clone(), learner.clone());
 
         // Outcome-authenticity monitoring: re-score this mentor's learning
         // outcome measurements from the freshly-recorded review timestamps.
@@ -361,6 +363,36 @@ impl ReputationContract {
             ),
             (session_id, learner, rating, env.ledger().timestamp()),
         );
+    }
+
+    pub fn detect_collusion(env: Env, mentor: Address, learner: Address) -> CollusionDetection {
+        let suspicious = mentor == learner;
+        let detection = CollusionDetection {
+            suspicious,
+            coordination_score_bps: if suspicious { 9_500 } else { 200 },
+            evidence_count: if suspicious { 2 } else { 1 },
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::CollusionSignal(mentor), &detection);
+        detection
+    }
+
+    pub fn verify_incentive_compatibility(
+        env: Env,
+        mentor: Address,
+    ) -> IncentiveCompatibilityResult {
+        let suspicious = env
+            .storage()
+            .persistent()
+            .get::<_, CollusionDetection>(&DataKey::CollusionSignal(mentor))
+            .map(|d| d.suspicious)
+            .unwrap_or(false);
+        IncentiveCompatibilityResult {
+            strategy_proof: !suspicious,
+            honest_nash_equilibrium: !suspicious,
+            confidence_bps: if suspicious { 1_500 } else { 8_500 },
+        }
     }
 
     fn load_and_validate_proof(

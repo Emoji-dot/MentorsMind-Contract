@@ -19,7 +19,7 @@ pub struct DelegationConcentrationReport {
     pub concentration_bps: u32,
     pub cap_bps: u32,
     pub cap_exceeded: bool,
-    pub emergency_suspension_recommended: bool,
+    pub emergency_suspend_recommended: bool,
 }
 
 #[contracttype]
@@ -69,7 +69,7 @@ pub fn assess_delegation_concentration(
         concentration_bps,
         cap_bps: effective_cap,
         cap_exceeded: concentration_bps > effective_cap,
-        emergency_suspension_recommended: concentration_bps
+        emergency_suspend_recommended: concentration_bps
             >= GOVERNANCE_CONCENTRATION_WARN_BPS.saturating_mul(2),
     }
 }
