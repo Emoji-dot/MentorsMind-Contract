@@ -26,6 +26,7 @@ pub mod justice_protection;
 pub mod key_management;
 pub mod learner_protection;
 pub mod outcome_authenticity;
+pub mod pagination;
 pub mod pause_guard;
 pub mod pricing_protection;
 pub mod privacy_protection;
@@ -126,6 +127,9 @@ pub use outcome_authenticity::{
     ASSESSMENT_COORDINATION_WINDOW_SECS, ASSESSMENT_RISK_THRESHOLD, METRIC_GAMING_DEVIATION_BPS,
     OUTCOME_BURST_WINDOW_SECS, OUTCOME_INTERVENTION_THRESHOLD, OUTCOME_MIN_DISTINCT_BPS,
     OUTCOME_RESTORATION_COOLDOWN_SECS, OUTCOME_RISK_THRESHOLD,
+};
+pub use pagination::{
+    BoundedIteration, BudgetExceeded, OperationBudget, Pagination, MAX_PAGE_SIZE,
 };
 pub use pause_guard::{is_paused, require_not_paused, ContractPaused};
 pub use pricing_protection::{
