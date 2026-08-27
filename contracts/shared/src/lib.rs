@@ -47,6 +47,8 @@ pub mod cross_chain_sync;
 pub mod recording_integrity;
 pub mod session_privacy;
 pub mod payment_integrity;
+pub mod threat_intelligence;
+pub mod tokenomics_protection;
 
 // Content protection modules 
 pub mod content_protection;
@@ -226,7 +228,9 @@ pub use recording_integrity::{
 
 // Payment integrity exports
 pub use payment_integrity::{
-    validate_evidence_sufficiency, EvidenceSufficiency,
+    validate_evidence_sufficiency, detect_payment_timing_manipulation, check_multisig_threshold,
+    compute_emergency_isolation,
+    EvidenceSufficiency, PaymentTimingCheck, EscrowMultisigApproval, EmergencyFundLock, PaymentAuditEntry,
 };
 
 // Market protection exports (aliases for governance compatibility)
@@ -259,6 +263,19 @@ pub use validator_accountability::{
 pub use content_protection::{ContentProtection, ContentType, EncryptionKey, AccessLevel, ProtectedContent, AccessLog};
 pub use ip_verification::{IPVerification, IPRecord, OwnershipProof, IPUsageRecord, InfringementRecord, IPType, IPStatus};
 pub use usage_rights_management::{UsageRightsManager, LicenseType, ViolationPenalty, License, ViolationRecord};
+
+// Threat intelligence exports
+pub use threat_intelligence::{
+    assess_delegation_concentration, assess_token_velocity, correlate_attack_vectors, assess_review_quality,
+    DelegationConcentrationReport, EconomicVelocityReport, MultiVectorThreatReport, ReviewQualityReport,
+    CollusionDetection, GameTheoryState, IncentiveCompatibilityResult,
+};
+
+// Tokenomics protection exports
+pub use tokenomics_protection::{
+    exceeds_extraction_rate, detect_coordinated_timing,
+    ManipulationReason, TokenomicsAuditResult, MAX_EXTRACTION_RATE_BPS, MIN_SUSTAINABILITY_RATIO, MIN_POSITION_DELTA_SECS,
+};
 
 /// Economic sanity ceiling for a single financial amount (token smallest units).
 pub const MAX_FINANCIAL_AMOUNT: i128 = 1_000_000_000_000_000;

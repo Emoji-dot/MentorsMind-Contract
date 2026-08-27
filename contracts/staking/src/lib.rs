@@ -6,13 +6,14 @@ use shared::{
     action_claim, action_stake, action_unstake, apply_bps_multiplier, assess_token_velocity,
     compute_checksum, compute_early_unstake_penalty, compute_reward_multiplier_bps,
     correlate_attack_vectors, detect_suspicious_pattern, push_snapshot_index, require_not_paused,
-    validate_amount_limits, EconomicVelocityReport, MultiVectorThreatReport, PenaltyCalculation,
+    validate_amount_limits, exceeds_extraction_rate, detect_coordinated_timing,
+    EconomicVelocityReport, MultiVectorThreatReport, PenaltyCalculation,
     ReentrancyGuard, RewardLockup, RollbackProposal, SafeMath, SnapshotMeta, StakeRecord,
     StakedEventData, StakingActionRecord, StateSnapshot, StateVerificationReport,
     SuspiciousPatternFlag, Validator, EMERGENCY_THRESHOLD, MAX_SNAPSHOTS,
     MIN_STAKING_DURATION_SECS, PATTERN_DETECTION_WINDOW, REWARD_LOCKUP_SECS,
-    REWARD_MULTIPLIER_MIN_BPS,
-    CollusionDetection, GameTheoryState, IncentiveCompatibilityResult,
+    REWARD_MULTIPLIER_MIN_BPS, MIN_POSITION_DELTA_SECS,
+    CollusionDetection, GameTheoryState, IncentiveCompatibilityResult, TokenomicsAuditResult,
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
@@ -110,7 +111,7 @@ const MIN_SUSTAINABILITY_RATIO: u32 = 150; // 1.5x coverage required
 const MAX_TRADING_VARIANCE_BPS: u32 = 750; // 7.5% deviation threshold
 
 /// Minimum time between large stake positions for coordination detection
-const MIN_POSITION_DELTA_SECS: u64 = 60 * 60; // 1 hour
+// Worker constants
 
 /// Governance token accumulation threshold for monitoring
 const GOVERNANCE_ACCUMULATION_THRESHOLD_BPS: u32 = 250; // 2.5% of total
@@ -609,12 +610,13 @@ impl StakingContract {
             .storage()
             .instance()
             .get::<_, CollusionDetection>(&DataKey::CollusionSignal(mentor))
-            .map(|d| d.suspicious)
+            .map(|d| d.detected)
             .unwrap_or(false);
         IncentiveCompatibilityResult {
-            strategy_proof: !suspicious,
-            honest_nash_equilibrium: !suspicious,
-            confidence_bps: if suspicious { 1_500 } else { 8_500 },
+            compatible: !suspicious,
+            misalignment_risk: if suspicious { 75 } else { 15 },
+            mechanism_integrity: if suspicious { 25 } else { 95 },
+            welfare_efficiency: if suspicious { 30 } else { 85 },
         }
     }
 
@@ -622,9 +624,10 @@ impl StakingContract {
         env.storage().instance().set(
             &DataKey::GameTheoryState,
             &GameTheoryState {
-                collusion_score_bps,
-                audit_sample_rate_bps: if collusion_score_bps > 5_000 { 8_000 } else { 2_500 },
-                penalty_multiplier_bps: if collusion_score_bps > 5_000 { 12_000 } else { 5_000 },
+                equilibrium_stable: collusion_score_bps < 5_000,
+                defection_risk: if collusion_score_bps > 5_000 { 80 } else { 25 },
+                cooperation_incentive: if collusion_score_bps > 5_000 { 20 } else { 75 },
+                nash_deviation_risk: if collusion_score_bps > 5_000 { 60 } else { 15 },
             },
         );
     }
@@ -2890,7 +2893,7 @@ impl StakingContract {
         let entry_epoch: u64 = env
             .storage()
             .persistent()
-            .get(&DataKey::StakerEpochEntry(&staker))
+            .get(&DataKey::StakerEpochEntry(staker))
             .unwrap_or(current_epoch);
 
         // Check for late deposit in current epoch (within 1 block/60 seconds)
@@ -2903,7 +2906,7 @@ impl StakingContract {
         if let Some(dist_time) = next_distribution {
             if now + 60 >= dist_time && entry_epoch == current_epoch {
                 // High-risk late deposit just before distribution
-                let is_large = amount > Self::get_total_staked(&env) / 10; // >10% of total
+                let is_large = amount > Self::get_total_staked(env) / 10; // >10% of total
                 if is_large {
                     return Ok(true);
                 }
@@ -2922,8 +2925,8 @@ impl StakingContract {
         let action_log: Vec<StakingActionRecord> = env
             .storage()
             .persistent()
-            .get(&DataKey::StakerActionLog(&staker))
-            .unwrap_or_else(|_| soroban_sdk::Vec::new(&env));
+            .get(&DataKey::StakerActionLog(staker))
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
 
         // Check for unusual trading frequency or pattern
         if action_log.len() > 5 {
@@ -2950,9 +2953,9 @@ impl StakingContract {
 
     /// Monitor governance token accumulation to prevent vote manipulation
     pub fn monitor_governance_accumulation(env: Env, staker: Address) -> Result<u32, Error> {
-        let total_staked = Self::get_total_staked(&env);
+        let total_staked = Self::get_total_staked(env.clone());
         let staker_stake: Option<StakeRecord> =
-            env.storage().persistent().get(&DataKey::Stake(&staker));
+            env.storage().persistent().get(&DataKey::Stake(staker.clone()));
 
         if let Some(stake_record) = staker_stake {
             let accumulation_bps = if total_staked > 0 {
@@ -2968,7 +2971,7 @@ impl StakingContract {
             if accumulation_bps > GOVERNANCE_ACCUMULATION_THRESHOLD_BPS {
                 env.storage()
                     .persistent()
-                    .set(&DataKey::GovernanceAccumulation(&staker), &accumulation_bps);
+                    .set(&DataKey::GovernanceAccumulation(staker), &accumulation_bps);
             }
 
             Ok(accumulation_bps)
@@ -2990,7 +2993,7 @@ impl StakingContract {
             .map_err(|_| Error::InvalidAmount)?;
 
         let report = assess_token_velocity(
-            Self::get_total_staked(&env),
+            Self::get_total_staked(env.clone()),
             observed_volume,
             concentration_bps,
         );
@@ -3083,7 +3086,7 @@ impl StakingContract {
             .get(&DataKey::StakerCount)
             .unwrap_or(0);
 
-        let total_staked = Self::get_total_staked(&env);
+        let total_staked = Self::get_total_staked(env.clone());
         let average_stake = if total_stakers > 0 {
             total_staked / (total_stakers as i128)
         } else {
@@ -3096,11 +3099,11 @@ impl StakingContract {
         let stake_sample_size = total_stakers.min(10);
 
         for i in 0..stake_sample_size {
-            if let Some(staker_addr) = Self::get_staker_at(&env, i) {
+            if let Some(staker_addr) = Self::get_staker_at(env.clone(), i) {
                 if let Some(stake_rec) = env
                     .storage()
                     .persistent()
-                    .get::<_, StakeRecord>(&DataKey::Stake(&staker_addr))
+                    .get::<_, StakeRecord>(&DataKey::Stake(staker_addr))
                 {
                     top_10_pct = top_10_pct.saturating_add(stake_rec.amount);
                 }
@@ -3147,7 +3150,7 @@ impl StakingContract {
         admin.require_auth();
 
         // Validate current sustainability state
-        Self::validate_sustainability_metrics(&env)?;
+        Self::validate_sustainability_metrics(env.clone())?;
 
         // If we reach here, sustainability is maintained
         Ok(())
@@ -3172,7 +3175,7 @@ impl StakingContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey::MigrationState(&user), &migration_record);
+            .set(&DataKey::MigrationState(user), &migration_record);
 
         Ok(())
     }
@@ -3196,7 +3199,7 @@ impl StakingContract {
         let migration_record: Option<MigrationIntegrityRecord> = env
             .storage()
             .persistent()
-            .get(&DataKey::MigrationState(&user));
+            .get(&DataKey::MigrationState(user.clone()));
 
         if let Some(mut record) = migration_record {
             // Check fairness window
@@ -3208,7 +3211,7 @@ impl StakingContract {
                     record.fairness_verified = true;
                     env.storage()
                         .persistent()
-                        .set(&DataKey::MigrationState(&user), &record);
+                        .set(&DataKey::MigrationState(user), &record);
                     return Ok(true);
                 }
             }
@@ -3226,8 +3229,7 @@ impl StakingContract {
         staker: Address,
         epoch: u64,
     ) -> Result<i128, Error> {
-        let stake = Self::get_stake(env.clone(), staker.clone())
-            .ok_or(Error::NoStakeFound)?;
+        let stake = Self::get_stake(env.clone(), staker.clone())?;
 
         let epoch_reward: i128 = env
             .storage()
@@ -3271,14 +3273,26 @@ impl StakingContract {
             .get(&DataKey::StakerActionLog(staker))
             .unwrap_or(Vec::new(&env));
 
-        let mut timestamps: std::vec::Vec<u64> = std::vec::Vec::new();
+        let mut timestamps: soroban_sdk::Vec<u64> = soroban_sdk::Vec::new(&env);
         for i in 0..action_log.len() {
             if let Some(ts) = action_log.get(i) {
-                timestamps.push(ts);
+                timestamps.push_back(ts);
             }
         }
 
-        detect_coordinated_timing(&timestamps, MIN_POSITION_DELTA_SECS)
+        // Simple coordinated timing detection for soroban_sdk::Vec
+        let mut coordinated = false;
+        if timestamps.len() >= 2 {
+            for i in 0..(timestamps.len() - 1) {
+                if let (Some(ts1), Some(ts2)) = (timestamps.get(i), timestamps.get(i + 1)) {
+                    if ts2.saturating_sub(ts1) < MIN_POSITION_DELTA_SECS / 10 {
+                        coordinated = true;
+                        break;
+                    }
+                }
+            }
+        }
+        coordinated
     }
 
     /// Audit tokenomics fairness for a given epoch.
