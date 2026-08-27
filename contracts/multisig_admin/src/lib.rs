@@ -1,6 +1,25 @@
 #![no_std]
+#![allow(deprecated)] // Temporarily allow deprecated Events::publish until we migrate to #[contractevent]
 
-use soroban_sdk::{contract, contractimpl, contracterror, contracttype, symbol_short, Address, Env, Symbol, TryIntoVal, Val, Vec};
+use shared::{
+    compute_checksum, compute_justice_intervention, protect_arbitration_fairness,
+    push_snapshot_index, ArbitrationBiasFlag, DisputeIndependenceFlag, EvidenceAuthenticity,
+    JusticeInterventionRecord, MultisigValidation, RollbackAuthorization, RollbackJustification,
+    RollbackProposal, SnapshotMeta, StateVerificationReport, EMERGENCY_MSIG_SIGNERS,
+    EMERGENCY_MSIG_THRESHOLD, EMERGENCY_THRESHOLD, JUSTICE_RESTORATION_COOLDOWN_SECS,
+    MAX_SNAPSHOTS, SecureStorageAccess,
+    // #868 — Key management and rotation
+    emergency_revoke_key, execute_key_rotation, get_current_key, is_key_revoked,
+    is_rotation_due, propose_key_rotation, register_key,
+    KeyRecord, KeyRotationProposal, KeyScheme,
+    // #867 — Transaction intent / high-risk operation protection
+    evaluate_transaction_intent, get_protection_state, TransactionIntent,
+};
+use soroban_sdk::{
+    contract, contractimpl, contracterror, contracttype, symbol_short, Address, Bytes, BytesN,
+    Env, Symbol, TryIntoVal, Val, Vec,
+};
+
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -22,6 +41,10 @@ pub enum Error {
     Cancelled          = 10,
     Expired            = 11,
     InvalidThreshold   = 12,
+    /// Emergency signature set failed 4-of-7 validation.
+    InvalidEmergencySignatures = 13,
+    /// Duplicate or unregistered emergency signer in aggregation.
+    InvalidEmergencySigner = 14,
 }
 
 // ---------------------------------------------------------------------------
@@ -55,12 +78,71 @@ const EXPIRY_SECONDS: u64 = 7 * 24 * 60 * 60; // 7 days
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Threshold,
     SignerCount,
     ProposalCount,
     Signer(Address),
     Proposal(u32),
     Approval(u32, Address),
+    // -----------------------------------------------------------------------
+    // Disaster-recovery keys
+    // -----------------------------------------------------------------------
+    /// Serialised governance config snapshot for snapshot `n`.
+    GovSnapshot(u32),
+    /// SnapshotMeta for governance snapshot `n`.
+    GovSnapshotMeta(u32),
+    /// Ordered Vec<u32> of retained governance snapshot IDs.
+    GovSnapshotIndex,
+    /// Vec<Address> of up to 7 emergency signers for governance rollback.
+    GovEmergencySigners,
+    /// RollbackProposal for governance rollback proposal `n`.
+    GovRollbackProposal(u32),
+    /// Boolean approval for (proposal_id, signer) governance rollback.
+    GovRollbackApproval(u32, Address),
+    /// Auto-incremented governance rollback proposal counter.
+    GovRollbackProposalCount,
+    // -----------------------------------------------------------------------
+    // Justice-monitoring / dispute-oversight keys (#justice-protection)
+    // -----------------------------------------------------------------------
+    /// Latest recorded dispute-oversight audit for a given escrow_id.
+    DisputeAudit(u64),
+    /// Latest recorded arbitration-fairness audit for a given arbitrator.
+    ArbitratorAudit(Address),
+    // -----------------------------------------------------------------------
+    // #868 — Key management keys
+    // -----------------------------------------------------------------------
+    /// Key management namespace root for this multisig instance.
+    KeyManagementRoot,
+}
+
+/// Record of a multisig-signer-reviewed dispute oversight audit.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeOversightRecord {
+    pub escrow_id: u64,
+    pub reviewer: Address,
+    pub justice_status: JusticeInterventionRecord,
+    pub reviewed_at: u64,
+}
+
+// ---------------------------------------------------------------------------
+// DR-only TTL constants (persistent; 57 day window)
+// ---------------------------------------------------------------------------
+const DR_TTL_THRESHOLD: u32 = 500_000;
+const DR_TTL_BUMP: u32 = 1_000_000;
+
+/// Compact governance config snapshot stored per snapshot_id.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovConfigSnapshot {
+    /// Approval threshold at snapshot time.
+    pub threshold: u32,
+    /// Number of registered signers at snapshot time.
+    pub signer_count: u32,
+    /// Total proposals created at snapshot time.
+    pub proposal_count: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -79,6 +161,8 @@ impl MultisigAdminContract {
         signers: Vec<Address>,
         threshold: u32,
     ) -> Result<(), Error> {
+        SecureStorageAccess::install_namespace(&env, &DataKey::NamespaceRoot, symbol_short!("mm_msig"));
+
         if env.storage().instance().has(&DataKey::Threshold) {
             return Err(Error::AlreadyInitialized);
         }
@@ -305,7 +389,824 @@ impl MultisigAdminContract {
             .get(&DataKey::SignerCount)
             .ok_or(Error::NotInitialized)
     }
+
+    // -----------------------------------------------------------------------
+    // Emergency signature validation (4-of-7)
+    // -----------------------------------------------------------------------
+
+    /// Validate that `approvals` is an exact 4-of-7 set drawn from the
+    /// registered governance emergency signers.
+    ///
+    /// Used by escrow and other consumers that need host-side confirmation
+    /// that an aggregated emergency signature set meets threshold policy.
+    pub fn validate_emergency_signatures(
+        env: Env,
+        approvals: Vec<Address>,
+    ) -> Result<bool, Error> {
+        let registered: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovEmergencySigners)
+            .ok_or(Error::NotInitialized)?;
+        if !MultisigValidation::validate_emergency_signatures(&registered, &approvals) {
+            return Err(Error::InvalidEmergencySignatures);
+        }
+        Ok(true)
+    }
+
+    /// Aggregate a newly authenticated emergency signer into an approval set.
+    ///
+    /// `signer` must `require_auth` and must be a registered emergency signer.
+    /// Returns the updated approval vector (deduplicated).
+    pub fn aggregate_signatures(
+        env: Env,
+        signer: Address,
+        mut approvals: Vec<Address>,
+    ) -> Result<Vec<Address>, Error> {
+        let registered: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovEmergencySigners)
+            .ok_or(Error::NotInitialized)?;
+        if !MultisigValidation::is_emergency_signer(&registered, &signer) {
+            return Err(Error::InvalidEmergencySigner);
+        }
+        signer.require_auth();
+        MultisigValidation::aggregate_signatures(&mut approvals, signer);
+        // Cap at threshold — callers should stop collecting once exact 4 is reached.
+        if (approvals.len() as u32) > EMERGENCY_MSIG_THRESHOLD {
+            return Err(Error::InvalidEmergencySignatures);
+        }
+        Ok(approvals)
+    }
+
+    /// Return the emergency multisig threshold constant (always 4).
+    pub fn get_emergency_threshold(_env: Env) -> u32 {
+        EMERGENCY_MSIG_THRESHOLD
+    }
+
+    /// Return the emergency signer slot count constant (always 7).
+    pub fn get_emergency_signer_slots(_env: Env) -> u32 {
+        EMERGENCY_MSIG_SIGNERS
+    }
+
+    // =======================================================================
+    // Disaster Recovery — Governance Contract
+    // =======================================================================
+
+    /// Register emergency signers for governance-level rollback (admin-threshold signers only).
+    ///
+    /// Must provide exactly 7 addresses. A signer added here does not need to
+    /// be a regular multisig signer — they form a separate emergency break-glass
+    /// authority.
+    ///
+    /// # Auth
+    /// Requires that the calling set has already reached the current threshold
+    /// (enforced by requiring a valid threshold-passing proposal to be provided
+    /// or by the caller being among the existing signers with sufficient approvals).
+    /// For simplicity in the DR path, this is callable by any current signer.
+    pub fn set_emergency_signers(
+        env: Env,
+        caller: Address,
+        signers: Vec<Address>,
+    ) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Threshold) {
+            return Err(Error::NotInitialized);
+        }
+        // Caller must be a regular multisig signer to set emergency signers.
+        if !env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Signer(caller.clone()))
+            .unwrap_or(false)
+        {
+            return Err(Error::NotSigner);
+        }
+        caller.require_auth();
+        if !MultisigValidation::is_valid_emergency_config(&signers, EMERGENCY_MSIG_THRESHOLD) {
+            return Err(Error::InvalidThreshold);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovEmergencySigners, &signers);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovEmergencySigners,
+            DR_TTL_THRESHOLD,
+            DR_TTL_BUMP,
+        );
+        env.events().publish(
+            (
+                symbol_short!("DR"),
+                symbol_short!("sgn_set"),
+            ),
+            signers.len() as u32,
+        );
+        Ok(())
+    }
+
+    /// Capture a governance config snapshot before an upgrade.
+    ///
+    /// Records `Threshold`, `SignerCount`, `ProposalCount` and associated
+    /// `SnapshotMeta` under `DataKey::GovSnapshot(snapshot_id)`.  Manages
+    /// a rolling window of at most `MAX_SNAPSHOTS` (3); the oldest is evicted
+    /// automatically when a 4th is created.
+    ///
+    /// # Auth
+    /// Caller must be a registered multisig signer.
+    pub fn snapshot_state(
+        env: Env,
+        caller: Address,
+        snapshot_id: u32,
+    ) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Threshold) {
+            return Err(Error::NotInitialized);
+        }
+        if !env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Signer(caller.clone()))
+            .unwrap_or(false)
+        {
+            return Err(Error::NotSigner);
+        }
+        caller.require_auth();
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Threshold)
+            .unwrap_or(0);
+        let signer_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SignerCount)
+            .unwrap_or(0);
+        let proposal_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposalCount)
+            .unwrap_or(0);
+
+        // Compute checksum
+        let mut checksum_input = Bytes::new(&env);
+        for b in threshold.to_be_bytes().iter() {
+            checksum_input.push_back(*b);
+        }
+        for b in signer_count.to_be_bytes().iter() {
+            checksum_input.push_back(*b);
+        }
+        for b in proposal_count.to_be_bytes().iter() {
+            checksum_input.push_back(*b);
+        }
+        let checksum = compute_checksum(&env, &checksum_input);
+
+        // Build config snapshot
+        let config = GovConfigSnapshot {
+            threshold,
+            signer_count,
+            proposal_count,
+        };
+
+        // WASM hash for version tracking
+        let wasm_hash: BytesN<32> = BytesN::from_array(&env, &[0; 32]);
+
+        // Manage rolling window
+        let mut index: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovSnapshotIndex)
+            .unwrap_or(Vec::new(&env));
+        let snapshot_pos = index.len() as u32;
+        let evicted = push_snapshot_index(&mut index, snapshot_id);
+        if let Some(old_id) = evicted {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::GovSnapshot(old_id));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::GovSnapshotMeta(old_id));
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovSnapshotIndex, &index);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovSnapshotIndex,
+            DR_TTL_THRESHOLD,
+            DR_TTL_BUMP,
+        );
+
+        let meta = SnapshotMeta {
+            created_at: env.ledger().timestamp(),
+            block_height: env.ledger().sequence(),
+            contract_version: wasm_hash,
+            admin: caller.clone(),
+            checksum,
+            record_count: signer_count as u64,
+            snapshot_index: snapshot_pos.min(MAX_SNAPSHOTS - 1),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovSnapshot(snapshot_id), &config);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovSnapshot(snapshot_id),
+            DR_TTL_THRESHOLD,
+            DR_TTL_BUMP,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovSnapshotMeta(snapshot_id), &meta);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovSnapshotMeta(snapshot_id),
+            DR_TTL_THRESHOLD,
+            DR_TTL_BUMP,
+        );
+
+        env.events().publish(
+            (symbol_short!("DR"), symbol_short!("gov_snap"), snapshot_id),
+            (signer_count, env.ledger().sequence()),
+        );
+        Ok(())
+    }
+
+    /// Compare governance snapshot against current state.
+    ///
+    /// Checks `Threshold`, `SignerCount`, and `ProposalCount` from the
+    /// snapshot metadata against live instance storage.
+    ///
+    /// # Returns
+    /// A `StateVerificationReport` (mismatches empty = state intact).
+    ///
+    /// # Errors
+    /// `ProposalNotFound` if `snapshot_id` does not exist.
+    pub fn verify_post_upgrade_state(
+        env: Env,
+        snapshot_id: u32,
+    ) -> Result<StateVerificationReport, Error> {
+        let config: GovConfigSnapshot = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovSnapshot(snapshot_id))
+            .ok_or(Error::ProposalNotFound)?;
+
+        let mut mismatches: Vec<soroban_sdk::String> = Vec::new(&env);
+        let mut fields_checked: u32 = 0;
+
+        let cur_threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Threshold)
+            .unwrap_or(0);
+        fields_checked += 1;
+        if cur_threshold != config.threshold {
+            mismatches.push_back(soroban_sdk::String::from_str(&env, "Threshold mismatch"));
+        }
+
+        let cur_signer_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SignerCount)
+            .unwrap_or(0);
+        fields_checked += 1;
+        if cur_signer_count != config.signer_count {
+            mismatches.push_back(soroban_sdk::String::from_str(
+                &env,
+                "SignerCount mismatch",
+            ));
+        }
+
+        let cur_proposal_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposalCount)
+            .unwrap_or(0);
+        fields_checked += 1;
+        if cur_proposal_count != config.proposal_count {
+            mismatches.push_back(soroban_sdk::String::from_str(
+                &env,
+                "ProposalCount mismatch",
+            ));
+        }
+
+        Ok(StateVerificationReport {
+            fields_checked,
+            mismatches,
+        })
+    }
+
+    /// Open an emergency governance rollback proposal.
+    ///
+    /// `proposer` must be a registered governance emergency signer.
+    pub fn propose_emergency_rollback(
+        env: Env,
+        proposer: Address,
+        snapshot_id: u32,
+        old_wasm_hash: BytesN<32>,
+    ) -> Result<u32, Error> {
+        let signers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovEmergencySigners)
+            .ok_or(Error::NotInitialized)?;
+        if !signers.iter().any(|s| s == proposer) {
+            return Err(Error::NotSigner);
+        }
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::GovSnapshotMeta(snapshot_id))
+        {
+            return Err(Error::ProposalNotFound);
+        }
+        proposer.require_auth();
+
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovRollbackProposalCount)
+            .unwrap_or(0);
+        let new_id = count.checked_add(1).expect("Governance rollback count overflow");
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovRollbackProposalCount, &new_id);
+
+        let proposal = RollbackProposal {
+            id: new_id,
+            snapshot_id,
+            old_wasm_hash: old_wasm_hash.clone(),
+            approval_count: 1,
+            executed: false,
+            created_at: env.ledger().timestamp(),
+            proposer: proposer.clone(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovRollbackProposal(new_id), &proposal);
+        env.storage().persistent().extend_ttl(
+            &DataKey::GovRollbackProposal(new_id),
+            DR_TTL_THRESHOLD,
+            DR_TTL_BUMP,
+        );
+        env.storage().persistent().set(
+            &DataKey::GovRollbackApproval(new_id, proposer.clone()),
+            &true,
+        );
+
+        env.events().publish(
+            (
+                symbol_short!("DR"),
+                symbol_short!("grb_prop"),
+                new_id,
+            ),
+            (snapshot_id, proposer, old_wasm_hash),
+        );
+        Ok(new_id)
+    }
+
+    /// Cast an approval on an open governance rollback proposal.
+    ///
+    /// `signer` must be a registered governance emergency signer.
+    pub fn approve_emergency_rollback(
+        env: Env,
+        signer: Address,
+        proposal_id: u32,
+    ) -> Result<(), Error> {
+        let signers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovEmergencySigners)
+            .ok_or(Error::NotInitialized)?;
+        if !signers.iter().any(|s| s == signer) {
+            return Err(Error::NotSigner);
+        }
+
+        let mut proposal: RollbackProposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovRollbackProposal(proposal_id))
+            .ok_or(Error::ProposalNotFound)?;
+        if proposal.executed {
+            return Err(Error::AlreadyExecuted);
+        }
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::GovRollbackApproval(proposal_id, signer.clone()))
+            .unwrap_or(false)
+        {
+            return Err(Error::AlreadySigned);
+        }
+        signer.require_auth();
+
+        env.storage().persistent().set(
+            &DataKey::GovRollbackApproval(proposal_id, signer.clone()),
+            &true,
+        );
+        proposal.approval_count = proposal
+            .approval_count
+            .checked_add(1)
+            .expect("Approval count overflow");
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovRollbackProposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (
+                symbol_short!("DR"),
+                symbol_short!("grb_aprv"),
+                proposal_id,
+            ),
+            (signer, proposal.approval_count),
+        );
+        Ok(())
+    }
+
+    /// Execute a governance rollback after 4-of-7 approval.
+    ///
+    /// Restores `Threshold`, `SignerCount`, and `ProposalCount` from the
+    /// snapshot, then re-applies the old WASM binary.
+    ///
+    /// # Pre-conditions
+    /// * Old WASM must be pre-uploaded via `soroban contract install`.
+    /// * `EMERGENCY_THRESHOLD` (4) distinct approvals required.
+    pub fn execute_emergency_rollback(
+        env: Env,
+        proposal_id: u32,
+    ) -> Result<(), Error> {
+        let mut proposal: RollbackProposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovRollbackProposal(proposal_id))
+            .ok_or(Error::ProposalNotFound)?;
+        if proposal.executed {
+            return Err(Error::AlreadyExecuted);
+        }
+        if proposal.approval_count < EMERGENCY_THRESHOLD {
+            return Err(Error::BelowThreshold);
+        }
+
+        let config: GovConfigSnapshot = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GovSnapshot(proposal.snapshot_id))
+            .ok_or(Error::ProposalNotFound)?;
+
+        // Restore governance config from snapshot
+        env.storage()
+            .instance()
+            .set(&DataKey::Threshold, &config.threshold);
+        env.storage()
+            .instance()
+            .set(&DataKey::SignerCount, &config.signer_count);
+        env.storage()
+            .instance()
+            .set(&DataKey::ProposalCount, &config.proposal_count);
+
+        // Re-apply old WASM
+        env.deployer()
+            .update_current_contract_wasm(proposal.old_wasm_hash.clone());
+
+        proposal.executed = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::GovRollbackProposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (
+                symbol_short!("DR"),
+                symbol_short!("grb_exec"),
+                proposal_id,
+            ),
+            (proposal.snapshot_id, proposal.old_wasm_hash),
+        );
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Disaster Recovery — View helpers
+    // -----------------------------------------------------------------------
+
+    /// Return governance snapshot metadata, or `None` if not found.
+    pub fn get_gov_snapshot_meta(
+        env: Env,
+        snapshot_id: u32,
+    ) -> Option<SnapshotMeta> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::GovSnapshotMeta(snapshot_id))
+    }
+
+    /// Return the ordered list of retained governance snapshot IDs.
+    pub fn get_gov_snapshot_index(env: Env) -> Vec<u32> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::GovSnapshotIndex)
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Return a governance rollback proposal by ID.
+    pub fn get_gov_rollback_proposal(
+        env: Env,
+        proposal_id: u32,
+    ) -> Option<RollbackProposal> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::GovRollbackProposal(proposal_id))
+    }
+
+    /// Validate cryptographic rollback evidence digests (non-zero required).
+    pub fn validate_rollback_evidence(
+        env: Env,
+        evidence_hash: BytesN<32>,
+        incident_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        let justification = RollbackJustification {
+            evidence_hash,
+            incident_hash,
+            description_hash: RollbackAuthorization::zero_hash(&env),
+        };
+        if RollbackAuthorization::validate_justification(&env, &justification) {
+            Ok(())
+        } else {
+            Err(Error::InvalidEmergencySignatures)
+        }
+    }
+
+    /// Validate that a snapshot timestamp is within the 24-hour rollback window.
+    pub fn validate_rollback_scope(env: Env, snapshot_created_at: u64) -> Result<(), Error> {
+        if RollbackAuthorization::validate_scope_window(env.ledger().timestamp(), snapshot_created_at)
+        {
+            Ok(())
+        } else {
+            Err(Error::InvalidEmergencySignatures)
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Justice monitoring / dispute oversight (#justice-protection)
+    // -----------------------------------------------------------------------
+
+    /// Combine dispute-independence, evidence-authenticity, and
+    /// arbitration-bias signals (as computed by the dispute-evidence
+    /// contract) into a single audited justice-protection decision for
+    /// `escrow_id`, recorded under multisig oversight. Caller must be a
+    /// registered signer.
+    pub fn oversee_dispute_resolution(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        independence: DisputeIndependenceFlag,
+        evidence: EvidenceAuthenticity,
+        bias: ArbitrationBiasFlag,
+    ) -> Result<JusticeInterventionRecord, Error> {
+        if !env.storage().instance().has(&DataKey::Threshold) {
+            return Err(Error::NotInitialized);
+        }
+        if !env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Signer(caller.clone()))
+            .unwrap_or(false)
+        {
+            return Err(Error::NotSigner);
+        }
+        caller.require_auth();
+
+        let record = compute_justice_intervention(
+            &env,
+            independence,
+            evidence,
+            bias,
+            JUSTICE_RESTORATION_COOLDOWN_SECS,
+        );
+        let oversight = DisputeOversightRecord {
+            escrow_id,
+            reviewer: caller.clone(),
+            justice_status: record.clone(),
+            reviewed_at: env.ledger().timestamp(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::DisputeAudit(escrow_id), &oversight);
+        env.events().publish(
+            (symbol_short!("multisig"), symbol_short!("dsp_audit"), escrow_id),
+            (caller, record.intervene, record.combined_risk_score),
+        );
+        Ok(record)
+    }
+
+    /// Audit an arbitrator's recent ruling-favor history for systematic
+    /// bias, recording the result under multisig oversight. Caller must be
+    /// a registered signer.
+    pub fn ensure_arbitration_fairness(
+        env: Env,
+        caller: Address,
+        arbitrator: Address,
+        favor_history: Vec<bool>,
+    ) -> Result<ArbitrationBiasFlag, Error> {
+        if !env.storage().instance().has(&DataKey::Threshold) {
+            return Err(Error::NotInitialized);
+        }
+        if !env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Signer(caller.clone()))
+            .unwrap_or(false)
+        {
+            return Err(Error::NotSigner);
+        }
+        caller.require_auth();
+
+        let flag = protect_arbitration_fairness(&favor_history);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ArbitratorAudit(arbitrator.clone()), &flag);
+        env.events().publish(
+            (symbol_short!("multisig"), symbol_short!("bias_aud")),
+            (arbitrator, flag.fair, flag.bias_risk_score),
+        );
+        Ok(flag)
+    }
+
+    /// Return the last recorded dispute-oversight audit for `escrow_id`.
+    pub fn get_dispute_audit(env: Env, escrow_id: u64) -> Option<DisputeOversightRecord> {
+        env.storage().persistent().get(&DataKey::DisputeAudit(escrow_id))
+    }
+
+    /// Return the last recorded arbitration-fairness audit for `arbitrator`.
+    pub fn get_arbitrator_audit(env: Env, arbitrator: Address) -> Option<ArbitrationBiasFlag> {
+        env.storage().persistent().get(&DataKey::ArbitratorAudit(arbitrator))
+    }
+
+    // =======================================================================
+    // #868 — Key Management and Rotation
+    // =======================================================================
+
+    /// Register or rotate a signing key for a multisig signer.
+    ///
+    /// Uses hierarchical deterministic derivation so each signer can maintain
+    /// forward secrecy. Only the signer themselves may register their own key.
+    pub fn register_signer_key(
+        env: Env,
+        signer: Address,
+        pubkey_commitment: BytesN<32>,
+        derivation_path_hash: BytesN<32>,
+    ) -> Result<KeyRecord, Error> {
+        if !env.storage().instance().has(&DataKey::Threshold) {
+            return Err(Error::NotInitialized);
+        }
+        if !env.storage().persistent()
+            .get::<_, bool>(&DataKey::Signer(signer.clone()))
+            .unwrap_or(false)
+        {
+            return Err(Error::NotSigner);
+        }
+        signer.require_auth();
+
+        let record = register_key(
+            &env,
+            &signer,
+            KeyScheme::Ed25519,
+            pubkey_commitment,
+            derivation_path_hash,
+            true, // enable forward secrecy
+        );
+
+        env.events().publish(
+            (symbol_short!("multisig"), symbol_short!("key_reg")),
+            (signer, record.version),
+        );
+
+        Ok(record)
+    }
+
+    /// Propose an automatic key rotation for a signer.
+    ///
+    /// The new key becomes active immediately upon `execute_signer_key_rotation`.
+    /// The old key remains valid for `KEY_ROTATION_OVERLAP_SECS` (7 days).
+    pub fn propose_signer_key_rotation(
+        env: Env,
+        signer: Address,
+        new_pubkey_commitment: BytesN<32>,
+        new_derivation_path_hash: BytesN<32>,
+    ) -> Result<KeyRotationProposal, Error> {
+        if !env.storage().instance().has(&DataKey::Threshold) {
+            return Err(Error::NotInitialized);
+        }
+        if !env.storage().persistent()
+            .get::<_, bool>(&DataKey::Signer(signer.clone()))
+            .unwrap_or(false)
+        {
+            return Err(Error::NotSigner);
+        }
+        signer.require_auth();
+
+        let proposal = propose_key_rotation(
+            &env,
+            &signer,
+            KeyScheme::Ed25519,
+            new_pubkey_commitment,
+            new_derivation_path_hash,
+        );
+
+        Ok(proposal)
+    }
+
+    /// Execute a pending key rotation for a signer.
+    pub fn execute_signer_key_rotation(
+        env: Env,
+        signer: Address,
+    ) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Threshold) {
+            return Err(Error::NotInitialized);
+        }
+        signer.require_auth();
+
+        execute_key_rotation(&env, &signer);
+        Ok(())
+    }
+
+    /// Emergency revoke a compromised signer key.
+    ///
+    /// Can be called by any registered signer (peer accountability).
+    /// The affected signer cannot re-register for `REVOCATION_COOLDOWN_SECS`.
+    pub fn emergency_revoke_signer_key(
+        env: Env,
+        caller: Address,
+        compromised_signer: Address,
+        key_version: u32,
+        reason: Symbol,
+    ) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Threshold) {
+            return Err(Error::NotInitialized);
+        }
+        if !env.storage().persistent()
+            .get::<_, bool>(&DataKey::Signer(caller.clone()))
+            .unwrap_or(false)
+        {
+            return Err(Error::NotSigner);
+        }
+        caller.require_auth();
+
+        if is_key_revoked(&env, &compromised_signer, key_version) {
+            return Err(Error::AlreadyExecuted);
+        }
+
+        emergency_revoke_key(&env, &compromised_signer, key_version, reason.clone());
+
+        env.events().publish(
+            (symbol_short!("multisig"), symbol_short!("key_rev")),
+            (caller, compromised_signer, key_version, reason),
+        );
+
+        Ok(())
+    }
+
+    /// Check whether a signer's current key is due for rotation.
+    pub fn is_key_rotation_due(env: Env, signer: Address) -> bool {
+        is_rotation_due(&env, &signer)
+    }
+
+    /// Get the current key record for a signer, if any.
+    pub fn get_signer_key(env: Env, signer: Address) -> Option<KeyRecord> {
+        get_current_key(&env, &signer)
+    }
+
+    // =======================================================================
+    // #867 — Transaction Intent Verification
+    // =======================================================================
+
+    /// Evaluate the risk of a proposed multisig action before signing.
+    ///
+    /// Returns a `TransactionIntent` with risk level, cooling-off requirements,
+    /// anomaly score, and whether the caller's account is blocked. Callers
+    /// should check `account_blocked` and `requires_cooling_off` before
+    /// proceeding with `propose_action` or `sign_action`.
+    pub fn evaluate_action_risk(
+        env: Env,
+        caller: Address,
+        operation: Symbol,
+        amount: i128,
+        is_new_target: bool,
+    ) -> TransactionIntent {
+        evaluate_transaction_intent(
+            &env,
+            &caller,
+            operation,
+            amount,
+            is_new_target,
+        )
+    }
+
+    /// Check whether an account is blocked due to suspicious activity.
+    ///
+    /// High-risk operations should call this before executing.
+    pub fn is_account_blocked(env: Env, account: Address) -> bool {
+        let state = get_protection_state(&env, &account);
+        state.blocked
+    }
 }
+
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -320,8 +1221,6 @@ fn apply_add_signer(env: &Env, new_signer: Address) -> Result<(), Error> {
     let new_count = count.checked_add(1).expect("Signer count overflow");
     env.storage().instance().set(&DataKey::SignerCount, &new_count);
     env.events().publish(
-        (symbol_short!("multisig"), symbol_short!("sgn_add"), new_signer),
-        count + 1,
         (symbol_short!("multisig"), symbol_short!("sgn_added"), new_signer),
         new_count,
     );
@@ -341,8 +1240,6 @@ fn apply_remove_signer(env: &Env, signer: Address) -> Result<(), Error> {
     env.storage().persistent().remove(&DataKey::Signer(signer.clone()));
     env.storage().instance().set(&DataKey::SignerCount, &new_count);
     env.events().publish(
-        (symbol_short!("multisig"), symbol_short!("sgn_rm"), signer),
-        count - 1,
         (symbol_short!("multisig"), symbol_short!("sgn_rmvd"), signer),
         new_count,
     );

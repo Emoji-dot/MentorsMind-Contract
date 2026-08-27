@@ -1,5 +1,11 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol, Vec};
+
+use shared::{
+    get_all_params, get_param, init_protocol_params, set_param,
+    key_sub_expiry_grace,
+    DEFAULT_SUB_EXPIRY_GRACE,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -20,9 +26,8 @@ pub const RENEWAL_GRACE_SECS: u64 = 60; // 1 minute
 /// Maximum time after `next_billing_date` that a subscription is still
 /// considered Active before it transitions to Expired.  After this window
 /// the subscription must be explicitly renewed or it is treated as lapsed.
-/// This prevents a subscription from remaining "Active" indefinitely if the
-/// learner never renews.
-pub const SUBSCRIPTION_EXPIRY_GRACE_SECS: u64 = 7 * 24 * 60 * 60; // 7 days
+/// Compile-time default — live value is governed via `key_sub_expiry_grace()`.
+pub const SUBSCRIPTION_EXPIRY_GRACE_SECS: u64 = DEFAULT_SUB_EXPIRY_GRACE as u64; // 7 days
 
 /// Platform fee taken from every subscribe/renew payment, in basis points
 /// (10_000 bps = 100%). Deducted before the remainder is routed to escrow.
@@ -64,6 +69,8 @@ pub struct SubscriptionRecord {
 
 #[contracttype]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     Escrow,
     PlanCounter,

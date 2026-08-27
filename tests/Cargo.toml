@@ -14,7 +14,7 @@ path = "lib.rs"
 soroban-sdk = { workspace = true, features = ["testutils"] }
 mentorminds-escrow = { path = "../escrow", features = ["testutils"] }
 mentorminds-verification = { path = "../contracts/verification", features = ["testutils"] }
-shared = { path = "../contracts/shared" }
+shared = { path = "../contracts/shared", features = ["testutils"] }
 mentorminds-governance = { path = "../contracts/governance", features = ["testutils"] }
 mentorminds-oracle = { path = "../contracts/oracle", features = ["testutils"] }
 mentorminds-reputation = { path = "../contracts/reputation", features = ["testutils"] }
@@ -25,9 +25,14 @@ mentorminds-lending-pool = { path = "../contracts/lending_pool", features = ["te
 mentorminds-upgrade-registry = { path = "../contracts/upgrade_registry", features = ["testutils"] }
 mentorminds-pause-guardian = { path = "../contracts/pause_guardian", features = ["testutils"] }
 mentorminds-dispute-evidence = { path = "../contracts/dispute_evidence", features = ["testutils"] }
+mentorminds-insurance = { path = "../contracts/insurance", features = ["testutils"] }
 mentorminds-referral = { path = "../contracts/referral", features = ["testutils"] }
 payment_router = { path = "../contracts/payment_router", features = ["testutils"] }
 mentorminds-snapshot = { path = "../contracts/snapshot", features = ["testutils"] }
+mentorminds-multisig = { path = "../multisig", features = ["testutils"] }
+mentorminds-rbac = { path = "../contracts/rbac", features = ["testutils"] }
+mentorminds-performance-bond = { path = "../contracts/performance_bond", features = ["testutils"] }
+mentorminds-subscription = { path = "../contracts/subscription", features = ["testutils"] }
 
 [dev-dependencies]
 
@@ -78,3 +83,11 @@ path = "upgrade_safety_tests.rs"
 [[test]]
 name = "disaster_recovery"
 path = "disaster_recovery.rs"
+
+[[test]]
+name = "security_regression"
+path = "security_regression.rs"
+
+[[test]]
+name = "protocol_params_integration"
+path = "protocol_params_integration.rs"

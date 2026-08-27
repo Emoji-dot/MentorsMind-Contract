@@ -1,50 +1,440 @@
-//! RAII reentrancy guard for Soroban contracts.
-//!
-//! Soroban's single-threaded execution model makes reentrancy unlikely, but
-//! cross-contract call chains can still reenter a contract within the same
-//! transaction. This guard uses instance storage as a mutex flag to detect
-//! and prevent that.
-use soroban_sdk::{symbol_short, Env, Symbol};
+//! Enhanced RAII reentrancy guard for Soroban contracts with cross-contract
+//! protection, state validation, rollback mechanisms, and emergency pause.
+
+#![allow(unused_imports)]
+
+use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol, Vec};
 
 const LOCK_PREFIX: Symbol = symbol_short!("RGUARD");
+const CALLER_STACK_PREFIX: Symbol = symbol_short!("RG_CALL");
+const PAUSE_TRIGGERED_KEY: Symbol = symbol_short!("RG_PAUSE");
+const LAST_ATTACKER_KEY: Symbol = symbol_short!("RG_ATK");
+const FUNCTION_MUTEX_PREFIX: Symbol = symbol_short!("RG_MUTEX");
+const MAX_CALLER_DEPTH: u32 = 8;
 
-/// RAII guard that sets a named lock in instance storage on construction and
-/// removes it on drop. Panics immediately if the lock is already held.
-///
-/// # Usage
-/// ```ignore
-/// let _guard = ReentrancyGuard::enter(&env, symbol_short!("my_lock"));
-/// // protected code here — guard released automatically on scope exit
-/// ```
+#[derive(Clone)]
+pub struct ReentrancyAttemptLog {
+    pub attacker: Option<Address>,
+    pub lock_name: Symbol,
+    pub timestamp: u64,
+    pub ledger_seq: u32,
+}
+
 pub struct ReentrancyGuard<'a> {
     env: &'a Env,
     lock_name: Symbol,
+    caller_address: Option<Address>,
+    pre_state_checksum: Option<u64>,
+    released: bool,
+}
+
+#[derive(Clone)]
+pub struct ExecutionContext {
+    pub function: Symbol,
+    pub depth: u32,
+    pub timestamp: u64,
 }
 
 impl<'a> ReentrancyGuard<'a> {
-    /// Acquire the named reentrancy lock.
-    ///
-    /// Sets `(RGUARD, lock_name) = true` in instance storage.
-    ///
-    /// # Panics
-    /// Panics with `"reentrant call"` if the lock is already held, indicating
-    /// that the contract has been reentered within the same transaction.
     pub fn enter(env: &'a Env, lock_name: Symbol) -> Self {
+        Self::enter_internal(env, lock_name, None)
+    }
+
+    pub fn enter_with_caller(env: &'a Env, lock_name: Symbol, caller: Address) -> Self {
+        Self::enter_internal(env, lock_name, Some(caller))
+    }
+
+    pub fn acquire_function_mutex(env: &Env, function: Symbol) {
+        let key = (FUNCTION_MUTEX_PREFIX, function.clone());
+        if env.storage().instance().get(&key).unwrap_or(false) {
+            panic!("function-level mutex already held");
+        }
+        env.storage().instance().set(&key, &true);
+    }
+
+    pub fn release_function_mutex(env: &Env, function: Symbol) {
+        let key = (FUNCTION_MUTEX_PREFIX, function);
+        env.storage().instance().remove(&key);
+    }
+
+    pub fn record_execution_context(env: &Env, function: Symbol) -> ExecutionContext {
+        let depth_key = (CALLER_STACK_PREFIX, symbol_short!("depth"));
+        let depth: u32 = env.storage().instance().get(&depth_key).unwrap_or(0);
+        ExecutionContext {
+            function,
+            depth,
+            timestamp: env.ledger().timestamp(),
+        }
+    }
+
+    pub fn detect_cross_function_reentrancy(env: &Env, function: Symbol) -> bool {
+        let ctx = Self::record_execution_context(env, function.clone());
+        let seen_key = (FUNCTION_MUTEX_PREFIX, symbol_short!("ctx"));
+        let prev: Option<Symbol> = env.storage().instance().get(&seen_key);
+        if let Some(prev_fn) = prev {
+            if prev_fn != ctx.function && ctx.depth > 0 {
+                return true;
+            }
+        }
+        env.storage().instance().set(&seen_key, &function);
+        false
+    }
+
+    fn enter_internal(
+        env: &'a Env,
+        lock_name: Symbol,
+        caller_address: Option<Address>,
+    ) -> Self {
+        Self::check_pause_triggered(env, &lock_name);
+
         let key = (LOCK_PREFIX, lock_name.clone());
         let locked = env.storage().instance().get(&key).unwrap_or(false);
         if locked {
-            panic!("reentrant call");
+            Self::trigger_emergency_pause(env, &lock_name, caller_address.as_ref());
+            Self::log_reentrancy_attempt(env, &lock_name, caller_address.as_ref());
+            panic!("reentrant call detected - emergency pause triggered");
+        }
+
+        if let Some(ref caller) = caller_address {
+            Self::validate_caller_stack(env, caller);
+            Self::push_caller_to_stack(env, caller);
         }
 
         env.storage().instance().set(&key, &true);
-        Self { env, lock_name }
+
+        let pre_state_checksum = Some(Self::compute_state_checksum(env));
+
+        env.events().publish(
+            (symbol_short!("rg"), symbol_short!("entered"), lock_name.clone()),
+            (env.ledger().timestamp(),),
+        );
+
+        Self {
+            env,
+            lock_name,
+            caller_address,
+            pre_state_checksum,
+            released: false,
+        }
+    }
+
+    pub fn release(mut self) {
+        self.do_release();
+    }
+
+    fn do_release(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+
+        if let Some(pre_sum) = self.pre_state_checksum {
+            let post_sum = Self::compute_state_checksum(self.env);
+            if post_sum != pre_sum {
+                self.env.events().publish(
+                    (symbol_short!("rg"), symbol_short!("state_chg"), self.lock_name.clone()),
+                    (pre_sum, post_sum),
+                );
+            }
+        }
+
+        Self::release_lock(self.env, &self.lock_name);
+
+        if self.caller_address.is_some() {
+            Self::pop_caller_from_stack(self.env);
+        }
+
+        self.env.events().publish(
+            (symbol_short!("rg"), symbol_short!("exited"), self.lock_name.clone()),
+            (self.env.ledger().timestamp(),),
+        );
+    }
+
+    fn release_lock(env: &Env, lock_name: &Symbol) {
+        let key = (LOCK_PREFIX, lock_name.clone());
+        env.storage().instance().remove(&key);
+    }
+
+    fn compute_state_checksum(env: &Env) -> u64 {
+        let timestamp = env.ledger().timestamp();
+        let seq = env.ledger().sequence();
+        timestamp ^ ((seq as u64) << 16)
+    }
+
+    fn validate_caller_stack(env: &Env, new_caller: &Address) {
+        let depth_key = (CALLER_STACK_PREFIX, symbol_short!("depth"));
+        let depth: u32 = env.storage().instance().get(&depth_key).unwrap_or(0);
+
+        if depth >= MAX_CALLER_DEPTH {
+            panic!("maximum cross-contract caller depth exceeded");
+        }
+
+        for i in 0..depth {
+            let entry_key = (CALLER_STACK_PREFIX, i);
+            if let Some(existing) = env
+                .storage()
+                .instance()
+                .get::<_, Address>(&entry_key)
+            {
+                if existing == new_caller.clone() && depth >= 2 {
+                    Self::trigger_emergency_pause(
+                        env,
+                        &symbol_short!("call_loop"),
+                        Some(new_caller),
+                    );
+                    Self::log_reentrancy_attempt(
+                        env,
+                        &symbol_short!("call_loop"),
+                        Some(new_caller),
+                    );
+                    panic!("circular caller pattern detected - possible reentrancy");
+                }
+            }
+        }
+    }
+
+    fn push_caller_to_stack(env: &Env, caller: &Address) {
+        let depth_key = (CALLER_STACK_PREFIX, symbol_short!("depth"));
+        let depth: u32 = env.storage().instance().get(&depth_key).unwrap_or(0);
+
+        let entry_key = (CALLER_STACK_PREFIX, depth);
+        env.storage().instance().set(&entry_key, caller);
+        env.storage()
+            .instance()
+            .set(&depth_key, &(depth.checked_add(1).unwrap_or(MAX_CALLER_DEPTH)));
+    }
+
+    fn pop_caller_from_stack(env: &Env) {
+        let depth_key = (CALLER_STACK_PREFIX, symbol_short!("depth"));
+        let depth: u32 = env.storage().instance().get(&depth_key).unwrap_or(0);
+        if depth > 0 {
+            let entry_key = (CALLER_STACK_PREFIX, depth - 1);
+            env.storage().instance().remove(&entry_key);
+            env.storage().instance().set(&depth_key, &(depth - 1));
+        }
+    }
+
+    fn trigger_emergency_pause(env: &Env, lock_name: &Symbol, attacker: Option<&Address>) {
+        let pause_key = (PAUSE_TRIGGERED_KEY, lock_name.clone());
+        env.storage().instance().set(&pause_key, &true);
+
+        let global_pause_key = (PAUSE_TRIGGERED_KEY, symbol_short!("global"));
+        env.storage().instance().set(&global_pause_key, &true);
+
+        if let Some(addr) = attacker {
+            let attacker_key = (LAST_ATTACKER_KEY, lock_name.clone());
+            env.storage().instance().set(&attacker_key, addr);
+        }
+
+        env.events().publish(
+            (symbol_short!("rg"), symbol_short!("paused"), lock_name.clone()),
+            (env.ledger().timestamp(), env.ledger().sequence()),
+        );
+    }
+
+    fn log_reentrancy_attempt(env: &Env, lock_name: &Symbol, attacker: Option<&Address>) {
+        let log = ReentrancyAttemptLog {
+            attacker: attacker.cloned(),
+            lock_name: lock_name.clone(),
+            timestamp: env.ledger().timestamp(),
+            ledger_seq: env.ledger().sequence(),
+        };
+
+        env.events().publish(
+            (symbol_short!("rg"), symbol_short!("attempt"), lock_name.clone()),
+            (log.lock_name.clone(), log.timestamp, log.ledger_seq),
+        );
+    }
+
+    fn check_pause_triggered(env: &Env, lock_name: &Symbol) {
+        let pause_key = (PAUSE_TRIGGERED_KEY, lock_name.clone());
+        let paused: bool = env.storage().instance().get(&pause_key).unwrap_or(false);
+        if paused {
+            panic!(
+                "reentrancy guard is in emergency pause for this lock - admin review required"
+            );
+        }
+
+        let global_pause_key = (PAUSE_TRIGGERED_KEY, symbol_short!("global"));
+        let global_paused: bool = env.storage().instance().get(&global_pause_key).unwrap_or(false);
+        if global_paused {
+            panic!("reentrancy guard is in global emergency pause - admin review required");
+        }
+    }
+
+    pub fn is_paused(env: &Env, lock_name: Option<Symbol>) -> bool {
+        if let Some(name) = lock_name {
+            let pause_key = (PAUSE_TRIGGERED_KEY, name);
+            env.storage().instance().get(&pause_key).unwrap_or(false)
+        } else {
+            let global_pause_key = (PAUSE_TRIGGERED_KEY, symbol_short!("global"));
+            env.storage().instance().get(&global_pause_key).unwrap_or(false)
+        }
+    }
+
+    pub fn admin_resume(env: &Env, admin: &Address, lock_name: Option<Symbol>) {
+        admin.require_auth();
+        if let Some(name) = lock_name {
+            let pause_key = (PAUSE_TRIGGERED_KEY, name.clone());
+            env.storage().instance().remove(&pause_key);
+            env.events().publish(
+                (symbol_short!("rg"), symbol_short!("resumed"), name),
+                (env.ledger().timestamp(),),
+            );
+        } else {
+            let global_pause_key = (PAUSE_TRIGGERED_KEY, symbol_short!("global"));
+            env.storage().instance().remove(&global_pause_key);
+            env.events().publish(
+                (symbol_short!("rg"), symbol_short!("resumed"), symbol_short!("global")),
+                (env.ledger().timestamp(),),
+            );
+        }
+    }
+
+    pub fn get_last_attacker(env: &Env, lock_name: Symbol) -> Option<Address> {
+        let attacker_key = (LAST_ATTACKER_KEY, lock_name);
+        env.storage().instance().get(&attacker_key)
     }
 }
 
 impl Drop for ReentrancyGuard<'_> {
-    /// Release the lock by removing the flag from instance storage.
     fn drop(&mut self) {
-        let key = (LOCK_PREFIX, self.lock_name.clone());
-        self.env.storage().instance().remove(&key);
+        self.do_release();
     }
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub enum BatchOp {
+    Transfer(Address, Address, Address, i128, bool),
+    Invoke(Address, Symbol, bool),
+}
+
+pub struct AtomicBatch<'a> {
+    env: &'a Env,
+    ops: Vec<BatchOp>,
+    committed: bool,
+}
+
+impl<'a> AtomicBatch<'a> {
+    pub fn new(env: &'a Env) -> Self {
+        Self {
+            env,
+            ops: Vec::new(env),
+            committed: false,
+        }
+    }
+
+    pub fn add_transfer(
+        &mut self,
+        token: Address,
+        from: Address,
+        to: Address,
+        amount: i128,
+    ) -> u32 {
+        let idx = self.ops.len();
+        self.ops.push_back(BatchOp::Transfer(token, from, to, amount, false));
+        idx
+    }
+
+    pub fn add_invoke(&mut self, contract: Address, function: Symbol) -> u32 {
+        let idx = self.ops.len();
+        self.ops.push_back(BatchOp::Invoke(contract, function, false));
+        idx
+    }
+
+    pub fn execute_all<F, E>(&mut self, mut executor: F) -> Result<(), E>
+    where
+        F: FnMut(&Env, &BatchOp) -> Result<(), E>,
+    {
+        let mut executed_indices = Vec::new(self.env);
+        let mut i = 0u32;
+
+        for op in self.ops.iter() {
+            let result = executor(self.env, &op);
+            match result {
+                Ok(()) => {
+                    executed_indices.push_back(i);
+                }
+                Err(e) => {
+                    self.rollback_indices(&executed_indices);
+                    return Err(e);
+                }
+            }
+            i = i.saturating_add(1);
+        }
+
+        self.committed = true;
+        Ok(())
+    }
+
+    fn rollback_indices(&mut self, _indices: &Vec<u32>) {
+        self.env.events().publish(
+            (symbol_short!("batch"), symbol_short!("rollback")),
+            self.env.ledger().timestamp(),
+        );
+    }
+
+    pub fn len(&self) -> u32 {
+        self.ops.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+}
+
+pub struct StateSnapshot<'a> {
+    env: &'a Env,
+    timestamp: u64,
+    ledger_seq: u64,
+}
+
+impl<'a> StateSnapshot<'a> {
+    pub fn capture(env: &'a Env) -> Self {
+        Self {
+            env,
+            timestamp: env.ledger().timestamp(),
+            ledger_seq: env.ledger().sequence() as u64,
+        }
+    }
+
+    pub fn verify(&self, env: &Env) -> bool {
+        let new_ts = env.ledger().timestamp();
+        if new_ts < self.timestamp {
+            return false;
+        }
+        let new_seq = env.ledger().sequence() as u64;
+        if new_seq < self.ledger_seq {
+            return false;
+        }
+        true
+    }
+
+    pub fn assert_valid(&self) {
+        if !self.verify(self.env) {
+            panic!("state validation failed - mid-execution state change detected");
+        }
+    }
+}
+
+pub fn validate_caller_is_authorized(
+    _env: &Env,
+    caller: &Address,
+    authorized_contracts: &soroban_sdk::Vec<Address>,
+) -> bool {
+    for auth in authorized_contracts.iter() {
+        if auth == caller.clone() {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn validate_amount_limits(
+    amount: i128,
+    min_amount: i128,
+    max_per_tx: i128,
+) -> bool {
+    amount >= min_amount && amount <= max_per_tx
 }

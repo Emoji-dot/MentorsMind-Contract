@@ -10,10 +10,10 @@ crate-type = ["cdylib"]
 [dependencies]
 soroban-sdk = { workspace = true }
 shared = { path = "../shared" }
+mentorminds-mnt-token = { path = "../mnt-token" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
-mentorminds-mnt-token = { path = "../mnt-token" }
 mentorminds-referral-leaderboard = { path = "../referral_leaderboard" }
 
 [features]

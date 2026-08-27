@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.70"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 soroban-sdk = { workspace = true }

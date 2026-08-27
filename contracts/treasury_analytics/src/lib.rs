@@ -73,6 +73,8 @@ pub struct AnalyticsReport {
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     /// Fee revenue count
     FeeRevenueCount,

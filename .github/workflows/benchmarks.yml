@@ -24,6 +24,9 @@ on:
       - 'contracts/dispute_evidence/**'
       - 'contracts/shared/**'
       - 'benchmarks/**'
+  # Nightly scheduled run on main to catch drift over time.
+  schedule:
+    - cron: '0 3 * * *'
   workflow_dispatch:
     inputs:
       update_baseline:
@@ -50,11 +53,18 @@ jobs:
   benchmark:
     name: Run Benchmarks
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+    # Allow the job to push history commits back to the repo on main/schedule.
+    permissions:
+      contents: write
+      pull-requests: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Fetch full history so we can commit history records back.
+          fetch-depth: 0
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -65,7 +75,7 @@ jobs:
       - name: Add wasm32v1-none target
         run: rustup target add wasm32v1-none
 
-      # Layered caching: registry index, downloaded crates, compiled artifacts
+      # Layered caching: registry index, downloaded crates, compiled artifacts.
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -86,7 +96,7 @@ jobs:
             ${{ runner.os }}-cargo-build-bench-${{ hashFiles('**/Cargo.lock') }}-
             ${{ runner.os }}-cargo-build-bench-
 
-      # Build WASM binaries first so wasm_bytes metrics are populated
+      # Build WASM binaries first so wasm_bytes metrics are populated.
       - name: Build WASM binaries (release)
         run: |
           cargo build \
@@ -99,7 +109,14 @@ jobs:
             -p mentorminds-upgrade-registry \
             -p mentorminds-dispute-evidence
 
-      # Run the benchmark binary; exits 1 on >10% regression
+      # Expose run metadata to the benchmark binary via env vars.
+      - name: Set benchmark environment
+        run: |
+          echo "BENCH_DATE=$(date -u '+%Y-%m-%d')" >> "$GITHUB_ENV"
+          echo "GITHUB_SHA=${{ github.sha }}" >> "$GITHUB_ENV"
+          echo "GITHUB_REF_NAME=${{ github.ref_name }}" >> "$GITHUB_ENV"
+
+      # Run the benchmark binary; exits 1 on >10% regression.
       - name: Run benchmarks
         id: bench
         run: cargo run -p mentorminds-benchmarks 2>&1 | tee benchmarks/results/bench.log
@@ -141,8 +158,10 @@ jobs:
         with:
           commit_message: 'chore(bench): update performance baselines'
           file_pattern: benchmarks/baselines.json
+          commit_user_name: 'github-actions[bot]'
+          commit_user_email: 'github-actions[bot]@users.noreply.github.com'
 
-      # Always upload reports so they're accessible from the Actions summary
+      # Always upload reports so they're accessible from the Actions summary.
       - name: Upload benchmark reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -157,7 +176,7 @@ jobs:
             gas_optimization_analysis.md
           retention-days: 90
 
-      # Post a summary table to the PR as a comment
+      # Post (or update) a summary table comment on the PR.
       - name: Post PR comment
         if: github.event_name == 'pull_request' && always()
         uses: actions/github-script@v7

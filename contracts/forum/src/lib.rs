@@ -104,6 +104,8 @@ pub struct UserReputation {
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Post(u32),
     Reply(u32),
     Category(u32),

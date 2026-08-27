@@ -18,18 +18,34 @@ const TTL_THRESHOLD: u32 = 500_000;
 const TTL_BUMP: u32 = 9_000_000; // large enough to survive test time jumps
 
 // ---------------------------------------------------------------------------
+// Milestone types
+// ---------------------------------------------------------------------------
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Milestone {
+    pub description_hash: BytesN<32>,
+    pub reward_bps: u32,
+    pub completed: bool,
+    pub completed_by: Option<Address>,
+}
+
+// ---------------------------------------------------------------------------
 // Storage keys
 // ---------------------------------------------------------------------------
 
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     VerificationContract,
     BountyCount,
     Bounty(u32),
     Claim(u32, Address), // (bounty_id, learner)
     ClaimEvidence(u32, Address), // (bounty_id, learner)
+    BountyLock(u32),
 }
 
 // ---------------------------------------------------------------------------
@@ -40,8 +56,9 @@ pub enum DataKey {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BountyStatus {
     Open,
-    Claimed,  // at least one learner has claimed
-    Verified, // a claim was verified and reward released
+    Claimed,          // at least one learner has claimed
+    PartiallyVerified, // some milestones completed, but not all
+    Verified,         // all milestones completed and rewards released
     Disputed,
     Refunded,
 }
@@ -66,6 +83,7 @@ pub struct BountyRecord {
     pub deadline: u64,
     pub status: BountyStatus,
     pub winner: Option<Address>,
+    pub milestones: Vec<Milestone>,
 }
 
 #[contracttype]
@@ -166,7 +184,8 @@ impl BountyContract {
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
     }
 
-    /// Post a new bounty. Transfers `reward` tokens from poster to this contract.
+    /// Post a new bounty with milestones. Transfers `reward` tokens from poster to this contract.
+    /// `milestones` must have reward_bps summing to 10000.
     /// Returns the new bounty ID.
     pub fn post_bounty(
         env: Env,
@@ -176,6 +195,7 @@ impl BountyContract {
         reward: i128,
         token: Address,
         deadline: u64,
+        milestones: Vec<Milestone>,
     ) -> u32 {
         poster.require_auth();
 
@@ -184,6 +204,26 @@ impl BountyContract {
         }
         if deadline <= env.ledger().timestamp() {
             panic!("Deadline must be in the future");
+        }
+
+        // Validate milestone bps sum == 10000
+        if milestones.len() == 0 {
+            panic!("At least one milestone required");
+        }
+        let mut total_bps: u32 = 0;
+        for milestone in milestones.iter() {
+            total_bps = total_bps.checked_add(milestone.reward_bps).expect("BPS overflow");
+        }
+        if total_bps != 10000 {
+            panic!("Milestone reward_bps must sum to 10000");
+        }
+
+        // Ensure milestone descriptions are non-zero
+        let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
+        for milestone in milestones.iter() {
+            if milestone.description_hash == zero_hash {
+                panic!("Milestone description_hash cannot be zero");
+            }
         }
 
         // Pull reward tokens into the contract
@@ -207,6 +247,7 @@ impl BountyContract {
             deadline,
             status: BountyStatus::Open,
             winner: None,
+            milestones,
         };
 
         env.storage()
@@ -326,7 +367,8 @@ impl BountyContract {
         );
     }
 
-    /// Verified mentor confirms a learner completed the challenge. Releases reward to learner.
+    /// Verified mentor confirms a learner completed the challenge.
+    /// Releases reward for all remaining unverified milestones to the learner.
     /// First verified claim wins; subsequent calls panic.
     pub fn verify_completion(
         env: Env,
@@ -335,11 +377,17 @@ impl BountyContract {
         learner: Address,
         reviewer_notes_hash: BytesN<32>,
     ) {
+        let lock_key = DataKey::BountyLock(bounty_id);
+        if env.storage().persistent().get(&lock_key).unwrap_or(false) {
+            panic!("Bounty is locked");
+        }
+        env.storage().persistent().set(&lock_key, &true);
+
         mentor.require_auth();
 
-        // Validate reviewer notes hash is not zero
         let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
         if reviewer_notes_hash == zero_hash {
+            env.storage().persistent().set(&lock_key, &false);
             panic!("Reviewer notes hash cannot be zero");
         }
 
@@ -356,6 +404,7 @@ impl BountyContract {
                 args
             });
         if !is_verified {
+            env.storage().persistent().set(&lock_key, &false);
             panic!("Mentor is not verified");
         }
 
@@ -366,9 +415,11 @@ impl BountyContract {
             .expect("Bounty not found");
 
         if bounty.status == BountyStatus::Verified {
+            env.storage().persistent().set(&lock_key, &false);
             panic!("Bounty already verified");
         }
         if bounty.status == BountyStatus::Refunded {
+            env.storage().persistent().set(&lock_key, &false);
             panic!("Bounty already refunded");
         }
 
@@ -380,13 +431,31 @@ impl BountyContract {
             .expect("No claim found for this learner");
 
         if claim.status == ClaimStatus::Disputed {
+            env.storage().persistent().set(&lock_key, &false);
             panic!("Claim is disputed");
         }
 
-        // Release reward to learner
-        let token_client = token::Client::new(&env, &bounty.token);
-        token_client.transfer(&env.current_contract_address(), &learner, &bounty.reward);
+        // Calculate total remaining milestone reward
+        let mut total_remaining: i128 = 0;
+        let mut milestones = bounty.milestones.clone();
+        for i in 0..milestones.len() {
+            let m = milestones.get(i).unwrap();
+            if !m.completed {
+                let ms_reward = bounty.reward * (m.reward_bps as i128) / 10000;
+                total_remaining += ms_reward;
+                let mut updated = m.clone();
+                updated.completed = true;
+                updated.completed_by = Some(learner.clone());
+                milestones.set(i, updated);
+            }
+        }
 
+        if total_remaining == 0 {
+            env.storage().persistent().set(&lock_key, &false);
+            panic!("All milestones already completed");
+        }
+
+        // Checks-Effects-Interactions: Update state BEFORE token transfer
         claim.status = ClaimStatus::Verified;
         env.storage().persistent().set(&claim_key, &claim);
         env.storage()
@@ -395,6 +464,7 @@ impl BountyContract {
 
         bounty.status = BountyStatus::Verified;
         bounty.winner = Some(learner.clone());
+        bounty.milestones = milestones;
         env.storage()
             .persistent()
             .set(&DataKey::Bounty(bounty_id), &bounty);
@@ -403,6 +473,13 @@ impl BountyContract {
             .extend_ttl(&DataKey::Bounty(bounty_id), TTL_THRESHOLD, TTL_BUMP);
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
 
+        // Release remaining reward to learner after state update
+        let token_client = token::Client::new(&env, &bounty.token);
+        token_client.transfer(&env.current_contract_address(), &learner, &total_remaining);
+
+        // Unlock bounty lock
+        env.storage().persistent().set(&lock_key, &false);
+
         emit_bounty_event(
             &env,
             evt_bounty_verified(&env),
@@ -410,7 +487,143 @@ impl BountyContract {
                 bounty_id,
                 learner,
                 mentor,
-                reward: bounty.reward,
+                reward: total_remaining,
+            },
+        );
+    }
+
+    /// Verify a single milestone for a learner, releasing the proportional reward.
+    /// Different learners can complete different milestones (collaborative bounties).
+    pub fn verify_milestone(
+        env: Env,
+        mentor: Address,
+        bounty_id: u32,
+        learner: Address,
+        milestone_index: u32,
+        reviewer_notes_hash: BytesN<32>,
+    ) {
+        let lock_key = DataKey::BountyLock(bounty_id);
+        if env.storage().persistent().get(&lock_key).unwrap_or(false) {
+            panic!("Bounty is locked");
+        }
+        env.storage().persistent().set(&lock_key, &true);
+
+        mentor.require_auth();
+
+        let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
+        if reviewer_notes_hash == zero_hash {
+            env.storage().persistent().set(&lock_key, &false);
+            panic!("Reviewer notes hash cannot be zero");
+        }
+
+        // Check mentor is verified
+        let ver_contract: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VerificationContract)
+            .expect("Not initialized");
+        let is_verified: bool =
+            env.invoke_contract(&ver_contract, &Symbol::new(&env, "is_verified"), {
+                let mut args: Vec<Val> = Vec::new(&env);
+                args.push_back(mentor.clone().into_val(&env));
+                args
+            });
+        if !is_verified {
+            env.storage().persistent().set(&lock_key, &false);
+            panic!("Mentor is not verified");
+        }
+
+        let mut bounty: BountyRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Bounty(bounty_id))
+            .expect("Bounty not found");
+
+        if bounty.status == BountyStatus::Verified {
+            env.storage().persistent().set(&lock_key, &false);
+            panic!("Bounty already fully verified");
+        }
+        if bounty.status == BountyStatus::Refunded {
+            env.storage().persistent().set(&lock_key, &false);
+            panic!("Bounty already refunded");
+        }
+
+        // Validate milestone index
+        if milestone_index as u32 >= bounty.milestones.len() {
+            env.storage().persistent().set(&lock_key, &false);
+            panic!("Milestone index out of bounds");
+        }
+
+        let milestone_ref = &bounty.milestones.get(milestone_index).unwrap();
+        if milestone_ref.completed {
+            env.storage().persistent().set(&lock_key, &false);
+            panic!("Milestone already completed");
+        }
+
+        // Check learner has a claim on this bounty
+        let claim_key = DataKey::Claim(bounty_id, learner.clone());
+        let mut claim: ClaimRecord = env
+            .storage()
+            .persistent()
+            .get(&claim_key)
+            .expect("No claim found for this learner");
+
+        if claim.status == ClaimStatus::Disputed {
+            env.storage().persistent().set(&lock_key, &false);
+            panic!("Claim is disputed");
+        }
+
+        // Calculate milestone reward
+        let milestone_reward = bounty.reward * (milestone_ref.reward_bps as i128) / 10000;
+
+        // Checks-Effects-Interactions: Update state BEFORE token transfer
+        let mut milestones = bounty.milestones.clone();
+        let mut updated_milestone = milestone_ref.clone();
+        updated_milestone.completed = true;
+        updated_milestone.completed_by = Some(learner.clone());
+        milestones.set(milestone_index, updated_milestone);
+
+        let all_completed = milestones.iter().all(|m| m.completed);
+
+        if all_completed {
+            bounty.status = BountyStatus::Verified;
+            bounty.winner = Some(learner.clone());
+            claim.status = ClaimStatus::Verified;
+        } else {
+            bounty.status = BountyStatus::PartiallyVerified;
+            claim.status = ClaimStatus::Verified;
+        }
+
+        bounty.milestones = milestones;
+
+        env.storage().persistent().set(&claim_key, &claim);
+        env.storage()
+            .persistent()
+            .extend_ttl(&claim_key, TTL_THRESHOLD, TTL_BUMP);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Bounty(bounty_id), &bounty);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Bounty(bounty_id), TTL_THRESHOLD, TTL_BUMP);
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
+
+        // Transfer milestone reward to learner after state update
+        let token_client = token::Client::new(&env, &bounty.token);
+        token_client.transfer(&env.current_contract_address(), &learner, &milestone_reward);
+
+        // Unlock bounty lock
+        env.storage().persistent().set(&lock_key, &false);
+
+        emit_bounty_event(
+            &env,
+            evt_bounty_verified(&env),
+            BountyVerifiedEvent {
+                bounty_id,
+                learner,
+                mentor,
+                reward: milestone_reward,
             },
         );
     }
@@ -486,7 +699,8 @@ impl BountyContract {
         );
     }
 
-    /// Poster reclaims reward if deadline passed with no verified claim.
+    /// Poster reclaims unverified milestone rewards if deadline passed.
+    /// Only returns rewards for milestones not yet completed.
     pub fn refund_bounty(env: Env, bounty_id: u32) {
         let mut bounty: BountyRecord = env
             .storage()
@@ -497,7 +711,7 @@ impl BountyContract {
         bounty.poster.require_auth();
 
         if bounty.status == BountyStatus::Verified {
-            panic!("Bounty already verified");
+            panic!("Bounty already fully verified");
         }
         if bounty.status == BountyStatus::Refunded {
             panic!("Already refunded");
@@ -506,11 +720,19 @@ impl BountyContract {
             panic!("Deadline has not passed yet");
         }
 
+        // Calculate remaining unverified milestone amount
+        let mut unverified_reward: i128 = 0;
+        for milestone in bounty.milestones.iter() {
+            if !milestone.completed {
+                unverified_reward += bounty.reward * (milestone.reward_bps as i128) / 10000;
+            }
+        }
+
         let token_client = token::Client::new(&env, &bounty.token);
         token_client.transfer(
             &env.current_contract_address(),
             &bounty.poster,
-            &bounty.reward,
+            &unverified_reward,
         );
 
         bounty.status = BountyStatus::Refunded;
@@ -528,7 +750,7 @@ impl BountyContract {
             BountyRefundedEvent {
                 bounty_id,
                 poster: bounty.poster.clone(),
-                reward: bounty.reward,
+                reward: unverified_reward,
             },
         );
     }
@@ -741,6 +963,17 @@ mod test {
             self.env.ledger().timestamp() + 7 * 24 * 60 * 60 // 1 week
         }
 
+        fn default_milestones(&self) -> Vec<Milestone> {
+            let mut ms = Vec::new(&self.env);
+            ms.push_back(Milestone {
+                description_hash: BytesN::from_array(&self.env, &[1u8; 32]),
+                reward_bps: 10000,
+                completed: false,
+                completed_by: None,
+            });
+            ms
+        }
+
         fn post_default_bounty(&self) -> u32 {
             self.client().post_bounty(
                 &self.poster,
@@ -749,6 +982,7 @@ mod test {
                 &100_000,
                 &self.token_id,
                 &self.deadline(),
+                &self.default_milestones(),
             )
         }
     }
@@ -988,5 +1222,219 @@ mod test {
         let id = f.post_default_bounty();
         assert_eq!(id, 1);
         assert_eq!(f.client().get_bounty_count(), 1);
+    }
+
+    // ── Milestone tests ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_post_bounty_with_milestones_validates_bps_sum() {
+        let f = TestFixture::setup();
+        let mut milestones = Vec::new(&f.env);
+        milestones.push_back(Milestone {
+            description_hash: BytesN::from_array(&f.env, &[1u8; 32]),
+            reward_bps: 3000,
+            completed: false,
+            completed_by: None,
+        });
+        milestones.push_back(Milestone {
+            description_hash: BytesN::from_array(&f.env, &[2u8; 32]),
+            reward_bps: 3000,
+            completed: false,
+            completed_by: None,
+        });
+        milestones.push_back(Milestone {
+            description_hash: BytesN::from_array(&f.env, &[3u8; 32]),
+            reward_bps: 4000,
+            completed: false,
+            completed_by: None,
+        });
+
+        let id = f.client().post_bounty(
+            &f.poster,
+            &Symbol::new(&f.env, "Multi"),
+            &BytesN::from_array(&f.env, &[0u8; 32]),
+            &100_000,
+            &f.token_id,
+            &f.deadline(),
+            &milestones,
+        );
+
+        let bounty = f.client().get_bounty(&id);
+        assert_eq!(bounty.milestones.len(), 3);
+        assert_eq!(bounty.status, BountyStatus::Open);
+    }
+
+    #[test]
+    #[should_panic(expected = "Milestone reward_bps must sum to 10000")]
+    fn test_post_bounty_invalid_bps_sum_panics() {
+        let f = TestFixture::setup();
+        let mut milestones = Vec::new(&f.env);
+        milestones.push_back(Milestone {
+            description_hash: BytesN::from_array(&f.env, &[1u8; 32]),
+            reward_bps: 5000,
+            completed: false,
+            completed_by: None,
+        });
+        milestones.push_back(Milestone {
+            description_hash: BytesN::from_array(&f.env, &[2u8; 32]),
+            reward_bps: 4000,
+            completed: false,
+            completed_by: None,
+        });
+
+        f.client().post_bounty(
+            &f.poster,
+            &Symbol::new(&f.env, "Bad"),
+            &BytesN::from_array(&f.env, &[0u8; 32]),
+            &100_000,
+            &f.token_id,
+            &f.deadline(),
+            &milestones,
+        );
+    }
+
+    #[test]
+    fn test_verify_milestone_pays_partial_reward() {
+        let f = TestFixture::setup();
+        let mut milestones = Vec::new(&f.env);
+        milestones.push_back(Milestone {
+            description_hash: BytesN::from_array(&f.env, &[1u8; 32]),
+            reward_bps: 3000,
+            completed: false,
+            completed_by: None,
+        });
+        milestones.push_back(Milestone {
+            description_hash: BytesN::from_array(&f.env, &[2u8; 32]),
+            reward_bps: 7000,
+            completed: false,
+            completed_by: None,
+        });
+
+        let id = f.client().post_bounty(
+            &f.poster,
+            &Symbol::new(&f.env, "Test"),
+            &BytesN::from_array(&f.env, &[0u8; 32]),
+            &100_000,
+            &f.token_id,
+            &f.deadline(),
+            &milestones,
+        );
+
+        f.client().claim_bounty(&f.learner, &id);
+
+        // Verify first milestone (30% = 30_000)
+        f.client().verify_milestone(&f.mentor, &id, &f.learner, &0u32);
+        assert_eq!(f.token().balance(&f.learner), 30_000);
+        assert_eq!(f.token().balance(&f.bounty_id), 70_000);
+
+        let bounty = f.client().get_bounty(&id);
+        assert_eq!(bounty.status, BountyStatus::PartiallyVerified);
+        assert!(bounty.milestones.get(0).unwrap().completed);
+    }
+
+    #[test]
+    fn test_different_learners_complete_different_milestones() {
+        let f = TestFixture::setup();
+        let learner2 = Address::generate(&f.env);
+
+        let mut milestones = Vec::new(&f.env);
+        milestones.push_back(Milestone {
+            description_hash: BytesN::from_array(&f.env, &[1u8; 32]),
+            reward_bps: 4000,
+            completed: false,
+            completed_by: None,
+        });
+        milestones.push_back(Milestone {
+            description_hash: BytesN::from_array(&f.env, &[2u8; 32]),
+            reward_bps: 6000,
+            completed: false,
+            completed_by: None,
+        });
+
+        let id = f.client().post_bounty(
+            &f.poster,
+            &Symbol::new(&f.env, "Collab"),
+            &BytesN::from_array(&f.env, &[0u8; 32]),
+            &100_000,
+            &f.token_id,
+            &f.deadline(),
+            &milestones,
+        );
+
+        f.client().claim_bounty(&f.learner, &id);
+        f.client().claim_bounty(&learner2, &id);
+
+        // Learner1 completes milestone 0 (40% = 40_000)
+        f.client().verify_milestone(&f.mentor, &id, &f.learner, &0u32);
+        assert_eq!(f.token().balance(&f.learner), 40_000);
+
+        // Learner2 completes milestone 1 (60% = 60_000)
+        f.client().verify_milestone(&f.mentor, &id, &learner2, &1u32);
+        assert_eq!(f.token().balance(&learner2), 60_000);
+
+        // Bounty should be fully verified now
+        let bounty = f.client().get_bounty(&id);
+        assert_eq!(bounty.status, BountyStatus::Verified);
+    }
+
+    #[test]
+    fn test_refund_returns_only_unverified_milestones() {
+        let f = TestFixture::setup();
+        let mut milestones = Vec::new(&f.env);
+        milestones.push_back(Milestone {
+            description_hash: BytesN::from_array(&f.env, &[1u8; 32]),
+            reward_bps: 3000,
+            completed: false,
+            completed_by: None,
+        });
+        milestones.push_back(Milestone {
+            description_hash: BytesN::from_array(&f.env, &[2u8; 32]),
+            reward_bps: 7000,
+            completed: false,
+            completed_by: None,
+        });
+
+        let id = f.client().post_bounty(
+            &f.poster,
+            &Symbol::new(&f.env, "Refund"),
+            &BytesN::from_array(&f.env, &[0u8; 32]),
+            &100_000,
+            &f.token_id,
+            &f.deadline(),
+            &milestones,
+        );
+
+        f.client().claim_bounty(&f.learner, &id);
+
+        // Verify first milestone (30% = 30_000)
+        f.client().verify_milestone(&f.mentor, &id, &f.learner, &0u32);
+        assert_eq!(f.token().balance(&f.learner), 30_000);
+        assert_eq!(f.token().balance(&f.bounty_id), 70_000);
+
+        // Bump TTLs before advancing time
+        f.env.as_contract(&f.token_id, || {
+            f.env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
+        });
+        f.env.as_contract(&f.bounty_id, || {
+            f.env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
+        });
+
+        // Advance past deadline
+        f.env.ledger().set(LedgerInfo {
+            timestamp: f.deadline() + 1,
+            protocol_version: 21,
+            sequence_number: 200,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 1,
+            min_persistent_entry_ttl: 1,
+            max_entry_ttl: 10_000_000,
+        });
+
+        // Refund should return only the unverified 70%
+        assert_eq!(f.token().balance(&f.poster), 900_000); // 1M - 100k posted
+        f.client().refund_bounty(&id);
+        assert_eq!(f.token().balance(&f.poster), 970_000); // 900k + 70k refund
+        assert_eq!(f.token().balance(&f.bounty_id), 0);
     }
 }
