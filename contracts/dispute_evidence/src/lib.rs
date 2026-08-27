@@ -38,8 +38,8 @@ use soroban_sdk::{
 };
 
 use shared::{
-    SessionRecording, RecordingStatus, ConsentRecord, AccessRole, RedactionRecord, AccessLogEntry, IntegrityVerificationResult,
-    create_recording, compute_merkle_root, verify_recording_integrity, grant_consent, revoke_consent,
+    SessionRecording, RecordingStatus, RecordingConsentRecord as ConsentRecord, AccessRole, RedactionRecord, AccessLogEntry, IntegrityVerificationResult,
+    create_recording, verify_recording_integrity, grant_consent, revoke_consent,
     check_access_authorized, apply_redaction, log_access, emergency_privacy_protection,
 };
 

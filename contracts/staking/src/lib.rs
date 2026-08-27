@@ -3142,7 +3142,7 @@ impl StakingContract {
     }
 
     /// Apply automatic interventions to restore platform health
-    pub fn apply_sustainability_intervention(env: Env) -> Result<(), Error> {
+    pub fn apply_sustainability_interv(env: Env) -> Result<(), Error> {
         let admin = Self::admin(&env)?;
         admin.require_auth();
 
