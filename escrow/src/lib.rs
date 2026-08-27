@@ -18,7 +18,7 @@ use shared::{
     EmergencyAuditRecord, EmergencyCircuitBreaker, EmergencyMultisig, MultisigValidation, SafeMath,
     EMERGENCY_ADMIN_TTL_SECS, EMERGENCY_MSIG_THRESHOLD, EmergencyRollback,
     ImmutableRollbackAuditRecord, RollbackAuthorization, RollbackJustification, RollbackScope,
-    SecureStorageAccess, STORAGE_DERIVE_CTX,
+    SecureStorageAccess, STORAGE_DERIVE_CTX, Pagination,
 };
 pub use shared::EscrowStatus;
 use soroban_sdk::{
@@ -3279,11 +3279,27 @@ impl EscrowContract {
         result
     }
 
-    pub fn get_escrows_by_status(env: Env, status: EscrowStatus) -> Vec<u64> {
+    /// Scan escrow ids `(offset, offset + limit]` (1-indexed against the
+    /// global escrow count) for ones matching `status`.
+    ///
+    /// `offset`/`limit` bound the *scan window*, not the match count: since
+    /// this filters an unindexed global range, capping only the number of
+    /// matches returned would still let a caller force a full-table scan by
+    /// asking for a status with few (or zero) hits. Capping the scan window
+    /// itself (to at most `MAX_PAGE_SIZE`, #831) is what actually bounds
+    /// the work this call can do. A caller wanting every match pages
+    /// through by repeatedly advancing `offset` by the count it scanned
+    /// (`min(limit, MAX_PAGE_SIZE)`) until it has covered `get_escrow_count()`.
+    pub fn get_escrows_by_status(env: Env, status: EscrowStatus, offset: u32, limit: u32) -> Vec<u64> {
         let count: u64 = env.storage().persistent().get(&DataKey::EscrowCount).unwrap_or(0u64);
         let mut result = Vec::new(&env);
 
-        for i in 1..=count {
+        let count_u32 = count.min(u32::MAX as u64) as u32;
+        let (start, end) = Pagination::new(offset, limit).bounds(count_u32);
+
+        // Escrow ids are 1-indexed; `start`/`end` are 0-indexed offsets
+        // into the id space [1, count].
+        for i in (start as u64 + 1)..=(end as u64) {
             let key = (symbol_short!("ESCROW"), i);
             if let Some(escrow) = env.storage().persistent().get::<_, Escrow>(&key) {
                 if escrow.status == status {
