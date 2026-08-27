@@ -1034,6 +1034,7 @@ impl TreasuryContract {
             recipient.clone(),
             amount,
         );
+        batch.validate().map_err(|_| Error::InvalidAmount)?;
 
         let token_ref = token.clone();
         let recipient_ref = recipient.clone();
@@ -1493,6 +1494,7 @@ impl TreasuryContract {
             staking_contract.clone(),
             Symbol::new(&env, "receive_treasury_distribution"),
         );
+        batch.validate().map_err(|_| Error::InvalidAmount)?;
 
         let staking_ref = staking_contract.clone();
         let token_ref = token.clone();

@@ -145,7 +145,7 @@ pub use privacy_protection::{
 };
 pub use reentrancy_guard::{
     validate_amount_limits, validate_caller_is_authorized, AtomicBatch, BatchOp,
-    ReentrancyAttemptLog, ReentrancyGuard, StateSnapshot,
+    BatchValidationError, ReentrancyAttemptLog, ReentrancyGuard, StateSnapshot, MAX_BATCH_SIZE,
 };
 pub use reputation::{
     analyze_review_pattern, detect_sybil, interaction_commitment, BehavioralAnalysis,
