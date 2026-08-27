@@ -557,66 +557,142 @@ mod test {
     extern crate std;
 
     use super::*;
-    use soroban_sdk::{symbol_short, Env};
+    use soroban_sdk::{contract, symbol_short, Address, Env};
+
+    #[contract]
+    struct TestStorageContract;
+
+    fn setup_env() -> (Env, Address) {
+        let env = Env::default();
+        let addr = env.register_contract(None, TestStorageContract);
+        (env, addr)
+    }
 
     #[test]
     fn test_instance_set_get() {
-        let env = Env::default();
-        EternalStorage::set_instance(&env, &InstanceKey::PlatformFee, &500u32);
-        let fee: Option<u32> = EternalStorage::get_instance(&env, &InstanceKey::PlatformFee);
-        assert_eq!(fee, Some(500u32));
+        let (env, addr) = setup_env();
+        env.as_contract(&addr, || {
+            EternalStorage::set_instance(&env, &InstanceKey::PlatformFee, &500u32);
+            let fee: Option<u32> = EternalStorage::get_instance(&env, &InstanceKey::PlatformFee);
+            assert_eq!(fee, Some(500u32));
+        });
     }
 
     #[test]
     fn test_instance_has_remove() {
-        let env = Env::default();
-        assert!(!EternalStorage::has_instance(&env, &InstanceKey::Paused));
-        EternalStorage::set_instance(&env, &InstanceKey::Paused, &true);
-        assert!(EternalStorage::has_instance(&env, &InstanceKey::Paused));
-        EternalStorage::remove_instance(&env, &InstanceKey::Paused);
-        assert!(!EternalStorage::has_instance(&env, &InstanceKey::Paused));
+        let (env, addr) = setup_env();
+        env.as_contract(&addr, || {
+            assert!(!EternalStorage::has_instance(&env, &InstanceKey::Paused));
+            EternalStorage::set_instance(&env, &InstanceKey::Paused, &true);
+            assert!(EternalStorage::has_instance(&env, &InstanceKey::Paused));
+            EternalStorage::remove_instance(&env, &InstanceKey::Paused);
+            assert!(!EternalStorage::has_instance(&env, &InstanceKey::Paused));
+        });
     }
 
     #[test]
     fn test_persistent_set_get() {
-        let env = Env::default();
-        EternalStorage::set_persistent(&env, &PersistentKey::Escrow(42u64), &9999i128);
-        let val: Option<i128> = EternalStorage::get_persistent(&env, &PersistentKey::Escrow(42u64));
-        assert_eq!(val, Some(9999i128));
+        let (env, addr) = setup_env();
+        env.as_contract(&addr, || {
+            EternalStorage::set_persistent(&env, &PersistentKey::Escrow(42u64), &9999i128);
+            let val: Option<i128> =
+                EternalStorage::get_persistent(&env, &PersistentKey::Escrow(42u64));
+            assert_eq!(val, Some(9999i128));
+        });
     }
 
     #[test]
     fn test_persistent_remove() {
-        let env = Env::default();
-        EternalStorage::set_persistent(&env, &PersistentKey::AllocHistory, &1u32);
-        assert!(EternalStorage::has_persistent(&env, &PersistentKey::AllocHistory));
-        EternalStorage::remove_persistent(&env, &PersistentKey::AllocHistory);
-        assert!(!EternalStorage::has_persistent(&env, &PersistentKey::AllocHistory));
+        let (env, addr) = setup_env();
+        env.as_contract(&addr, || {
+            EternalStorage::set_persistent(&env, &PersistentKey::AllocHistory, &1u32);
+            assert!(EternalStorage::has_persistent(&env, &PersistentKey::AllocHistory));
+            EternalStorage::remove_persistent(&env, &PersistentKey::AllocHistory);
+            assert!(!EternalStorage::has_persistent(&env, &PersistentKey::AllocHistory));
+        });
     }
 
     #[test]
     fn test_temporary_set_get() {
-        let env = Env::default();
-        let key = TempKey::ReentrancyLock(symbol_short!("escrow"));
-        EternalStorage::set_temporary(&env, &key, &true);
-        let val: Option<bool> = EternalStorage::get_temporary(&env, &key);
-        assert_eq!(val, Some(true));
+        let (env, addr) = setup_env();
+        env.as_contract(&addr, || {
+            let key = TempKey::ReentrancyLock(symbol_short!("escrow"));
+            EternalStorage::set_temporary(&env, &key, &true);
+            let val: Option<bool> = EternalStorage::get_temporary(&env, &key);
+            assert_eq!(val, Some(true));
+        });
     }
 
     #[test]
     fn test_schema_version_tracking() {
-        let env = Env::default();
-        // Default: no version stored
-        let v: Option<u32> = EternalStorage::get_instance(&env, &InstanceKey::SchemaVersion);
-        assert_eq!(v, None);
-        // Set version 1
-        EternalStorage::set_instance(&env, &InstanceKey::SchemaVersion, &1u32);
-        let v: Option<u32> = EternalStorage::get_instance(&env, &InstanceKey::SchemaVersion);
-        assert_eq!(v, Some(1u32));
-        // Upgrade to version 2
-        EternalStorage::set_instance(&env, &InstanceKey::SchemaVersion, &2u32);
-        let v: Option<u32> = EternalStorage::get_instance(&env, &InstanceKey::SchemaVersion);
-        assert_eq!(v, Some(2u32));
+        let (env, addr) = setup_env();
+        env.as_contract(&addr, || {
+            let v: Option<u32> = EternalStorage::get_instance(&env, &InstanceKey::SchemaVersion);
+            assert_eq!(v, None);
+            EternalStorage::set_instance(&env, &InstanceKey::SchemaVersion, &1u32);
+            let v: Option<u32> = EternalStorage::get_instance(&env, &InstanceKey::SchemaVersion);
+            assert_eq!(v, Some(1u32));
+            EternalStorage::set_instance(&env, &InstanceKey::SchemaVersion, &2u32);
+            let v: Option<u32> = EternalStorage::get_instance(&env, &InstanceKey::SchemaVersion);
+            assert_eq!(v, Some(2u32));
+        });
+    }
+
+    #[contracttype]
+    #[derive(Clone)]
+    enum TestRootKey {
+        NamespaceRoot,
+        Value,
+    }
+
+    #[test]
+    fn namespace_is_contract_specific() {
+        let (env, addr) = setup_env();
+        env.as_contract(&addr, || {
+            let scope = symbol_short!("test_ns");
+            let ns =
+                SecureStorageAccess::install_namespace(&env, &TestRootKey::NamespaceRoot, scope);
+            StorageAccessControl::validate_namespace(&env, &ns).unwrap();
+            SecureStorageAccess::set_persistent_checked(
+                &env,
+                &TestRootKey::NamespaceRoot,
+                STORAGE_DERIVE_CTX,
+                &TestRootKey::Value,
+                &42u32,
+            )
+            .unwrap();
+            let loaded: u32 = SecureStorageAccess::get_persistent_checked(
+                &env,
+                &TestRootKey::NamespaceRoot,
+                &TestRootKey::Value,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(loaded, 42);
+        });
+    }
+
+    #[test]
+    fn collision_detector_rejects_foreign_namespace() {
+        let (env, addr) = setup_env();
+        env.as_contract(&addr, || {
+            let scope = symbol_short!("test_ns");
+            let ns = StorageKeyDerivation::namespace(&env, scope.clone());
+            let foreign = StorageNamespace {
+                scope,
+                prefix: BytesN::from_array(&env, &[0xFFu8; 32]),
+            };
+            assert_eq!(
+                StorageAccessControl::reject_foreign_namespace(&env, &foreign),
+                Err(StorageSecurityError::CrossContractAccessDenied)
+            );
+            CollisionDetector::register(&env, &ns, STORAGE_DERIVE_CTX, &TestRootKey::Value)
+                .unwrap();
+            assert!(
+                CollisionDetector::register(&env, &ns, STORAGE_DERIVE_CTX, &TestRootKey::Value)
+                    .is_ok()
+            );
+        });
     }
 
     #[contracttype]

@@ -1,8 +1,8 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, IntoVal, Symbol, Vec,
+    contract, contractimpl, contracttype, symbol_short, vec, xdr::ToXdr, Address, BytesN, Env,
+    IntoVal, String, Symbol, Vec,
 };
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Vec};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -25,13 +25,41 @@ pub struct NFTMintedEvent {
     pub session_ids_hash: BytesN<32>,
 }
 
+/// Canonical on-chain NFT metadata for a minted session bundle (#759).
+///
+/// `metadata_hash` is a sha256 seal over the XDR-serialized
+/// `(name, skill, mentor, learner, completed_at, rating_snapshot)` tuple,
+/// letting any party later recompute and compare it against the stored
+/// hash via [`SessionBundleNFT::verify_metadata_integrity`] to detect
+/// tampering.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NftMetadata {
+    pub name: String,
+    pub skill: Symbol,
+    pub mentor: Address,
+    pub learner: Address,
+    pub completed_at: u64,
+    pub rating_snapshot: u32,
+    pub sessions_count: u32,
+    pub metadata_hash: BytesN<32>,
+}
+
 #[contracttype]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     TokenIdCounter,
     Bundle(u64),           // token_id -> BundleNFT
     OwnerBundles(Address), // owner -> Vec<u64>
     BundledSessions(u64),  // token_id -> Vec<Symbol>
+    Metadata(u64),          // token_id -> NftMetadata
 }
+
+/// Approximate Stellar ledger close time, used to convert the "sessions_count
+/// * 30 days" TTL requirement into a ledger-count `extend_ttl` bump.
+const SECONDS_PER_LEDGER: u32 = 5;
+const LEDGERS_PER_30_DAYS: u32 = (30 * 24 * 60 * 60) / SECONDS_PER_LEDGER;
 
 #[contract]
 pub struct SessionBundleNFT;
@@ -42,9 +70,12 @@ impl SessionBundleNFT {
         env: Env,
         learner: Address,
         session_registry: Address,
+        reputation: Address,
         session_ids: Vec<Symbol>,
         session_ids_hash: BytesN<32>,
         expiry: u64,
+        name: String,
+        skill: Symbol,
     ) -> u64 {
         learner.require_auth();
 
@@ -90,7 +121,7 @@ impl SessionBundleNFT {
         let bundle = BundleNFT {
             token_id,
             owner: learner.clone(),
-            mentor,
+            mentor: mentor.clone(),
             sessions_total: count,
             sessions_remaining: count,
             expiry,
@@ -105,6 +136,45 @@ impl SessionBundleNFT {
         env.storage()
             .persistent()
             .set(&DataKey::BundledSessions(token_id), &session_ids);
+
+        // Populate and seal canonical NFT metadata (#759).
+        let completed_at = env.ledger().timestamp();
+        let (rating_x100, _review_count): (u64, u64) = env.invoke_contract(
+            &reputation,
+            &Symbol::new(&env, "get_mentor_rating"),
+            (mentor.clone(),).into_val(&env),
+        );
+        let rating_snapshot = rating_x100 as u32;
+        let metadata_hash = Self::compute_metadata_hash(
+            &env,
+            &name,
+            &skill,
+            &mentor,
+            &learner,
+            completed_at,
+            rating_snapshot,
+        );
+        let metadata = NftMetadata {
+            name,
+            skill,
+            mentor: mentor.clone(),
+            learner: learner.clone(),
+            completed_at,
+            rating_snapshot,
+            sessions_count: count,
+            metadata_hash,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Metadata(token_id), &metadata);
+        // TTL proportional to sessions_count: more sessions bundled == a
+        // more valuable credential, so it's kept alive longer.
+        let ttl_bump = LEDGERS_PER_30_DAYS.saturating_mul(count.max(1));
+        env.storage().persistent().extend_ttl(
+            &DataKey::Metadata(token_id),
+            ttl_bump / 2,
+            ttl_bump,
+        );
 
         let mut owner_bundles: Vec<u64> = env
             .storage()
@@ -331,16 +401,113 @@ impl SessionBundleNFT {
             .get(&DataKey::BundledSessions(token_id))
             .unwrap_or(Vec::new(&env))
     }
+
+    /// Canonical on-chain metadata for a minted token.
+    pub fn get_token_metadata(env: Env, token_id: u64) -> NftMetadata {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Metadata(token_id))
+            .expect("Metadata not found")
+    }
+
+    /// Recomputes `metadata_hash` from the stored fields and compares it
+    /// against the sealed value, detecting any direct-storage tampering
+    /// with `name`, `skill`, `mentor`, `learner`, `completed_at`, or
+    /// `rating_snapshot`.
+    pub fn verify_metadata_integrity(env: Env, token_id: u64) -> bool {
+        let metadata: NftMetadata = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::Metadata(token_id))
+        {
+            Some(m) => m,
+            None => return false,
+        };
+        let recomputed = Self::compute_metadata_hash(
+            &env,
+            &metadata.name,
+            &metadata.skill,
+            &metadata.mentor,
+            &metadata.learner,
+            metadata.completed_at,
+            metadata.rating_snapshot,
+        );
+        recomputed == metadata.metadata_hash
+    }
+
+    fn compute_metadata_hash(
+        env: &Env,
+        name: &String,
+        skill: &Symbol,
+        mentor: &Address,
+        learner: &Address,
+        completed_at: u64,
+        rating_snapshot: u32,
+    ) -> BytesN<32> {
+        let tuple = (
+            name.clone(),
+            skill.clone(),
+            mentor.clone(),
+            learner.clone(),
+            completed_at,
+            rating_snapshot,
+        );
+        let bytes = tuple.to_xdr(env);
+        env.crypto().sha256(&bytes).into()
+    }
 }
 
 #[cfg(test)]
 mod test {
+    extern crate std;
+    use std::string::ToString;
+
     use super::*;
     use mentorminds_session_registry::{SessionRegistry, SessionRegistryClient, SessionStatus};
-    use soroban_sdk::testutils::{Address as _, Ledger};
+    use soroban_sdk::testutils::{Address as _, Events, Ledger};
 
     fn dummy_hash(env: &Env) -> BytesN<32> {
         BytesN::from_array(env, &[0u8; 32])
+    }
+
+    mod reputation_mock {
+        use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
+
+        #[contracttype]
+        #[derive(Clone)]
+        pub enum RatingKey {
+            Rating(Address),
+        }
+
+        #[contract]
+        pub struct MockReputationN;
+
+        #[contractimpl]
+        impl MockReputationN {
+            pub fn set_rating(env: Env, mentor: Address, rating_x100: u64) {
+                env.storage()
+                    .persistent()
+                    .set(&RatingKey::Rating(mentor), &rating_x100);
+            }
+
+            pub fn get_mentor_rating(env: Env, mentor: Address) -> (u64, u64) {
+                let rating: u64 = env
+                    .storage()
+                    .persistent()
+                    .get(&RatingKey::Rating(mentor))
+                    .unwrap_or(0);
+                (rating, 1u64)
+            }
+        }
+    }
+    use reputation_mock::{MockReputationN, MockReputationNClient};
+
+    fn default_name(env: &Env) -> String {
+        String::from_str(env, "Rust Fundamentals Bundle")
+    }
+
+    fn default_skill(env: &Env) -> Symbol {
+        Symbol::new(env, "rust")
     }
 
     fn compute_hash(env: &Env, session_ids: &Vec<Symbol>) -> BytesN<32> {
@@ -348,7 +515,7 @@ mod test {
         for i in 0..session_ids.len() {
             let sid = session_ids.get(i).unwrap();
             let s = sid.to_string();
-            let b: soroban_sdk::Bytes = s.into();
+            let b = soroban_sdk::Bytes::from_slice(env, s.as_bytes());
             for byte in b.iter() {
                 buf.push_back(byte);
             }
@@ -360,6 +527,7 @@ mod test {
         env: Env,
         nft_id: Address,
         registry_id: Address,
+        reputation_id: Address,
         backend: Address,
         learner: Address,
         mentor: Address,
@@ -377,6 +545,7 @@ mod test {
 
             let nft_id = env.register_contract(None, SessionBundleNFT);
             let registry_id = env.register_contract(None, SessionRegistry);
+            let reputation_id = env.register_contract(None, MockReputationN);
 
             let registry = SessionRegistryClient::new(&env, &registry_id);
             registry.initialize(&backend);
@@ -385,6 +554,7 @@ mod test {
                 env,
                 nft_id,
                 registry_id,
+                reputation_id,
                 backend,
                 learner,
                 mentor,
@@ -397,6 +567,29 @@ mod test {
 
         fn registry(&self) -> SessionRegistryClient {
             SessionRegistryClient::new(&self.env, &self.registry_id)
+        }
+
+        fn set_mentor_rating(&self, mentor: &Address, rating_x100: u64) {
+            MockReputationNClient::new(&self.env, &self.reputation_id)
+                .set_rating(mentor, &rating_x100);
+        }
+
+        fn mint_default(
+            &self,
+            session_ids: &Vec<Symbol>,
+            hash: &BytesN<32>,
+            expiry: u64,
+        ) -> u64 {
+            self.client().mint_bundle(
+                &self.learner,
+                &self.registry_id,
+                &self.reputation_id,
+                session_ids,
+                hash,
+                &expiry,
+                &default_name(&self.env),
+                &default_skill(&self.env),
+            )
         }
 
         fn register_completed_session(&self, id: &str) -> Symbol {
@@ -437,11 +630,10 @@ mod test {
         let sid2 = f.register_completed_session("s2");
         let sid3 = f.register_completed_session("s3");
 
-        let session_ids = vec![&f.env, sid1, sid2, sid3];
+        let session_ids = vec![&f.env, sid1.clone(), sid2.clone(), sid3.clone()];
         let hash = compute_hash(&f.env, &session_ids);
         let token_id =
-            f.client()
-                .mint_bundle(&f.learner, &f.registry_id, &session_ids, &hash, &2000u64);
+            f.mint_default(&session_ids, &hash, 2000u64);
         assert_eq!(token_id, 1);
 
         let bundle = f.client().get_bundle(&token_id);
@@ -465,8 +657,7 @@ mod test {
 
         let session_ids = vec![&f.env, sid];
         let hash = dummy_hash(&f.env);
-        f.client()
-            .mint_bundle(&f.learner, &f.registry_id, &session_ids, &hash, &2000u64);
+        f.mint_default(&session_ids, &hash, 2000u64);
     }
 
     #[test]
@@ -477,8 +668,7 @@ mod test {
 
         let session_ids = vec![&f.env, sid];
         let hash = dummy_hash(&f.env);
-        f.client()
-            .mint_bundle(&f.learner, &f.registry_id, &session_ids, &hash, &2000u64);
+        f.mint_default(&session_ids, &hash, 2000u64);
     }
 
     #[test]
@@ -501,8 +691,7 @@ mod test {
 
         let session_ids = vec![&f.env, sid];
         let hash = dummy_hash(&f.env);
-        f.client()
-            .mint_bundle(&f.learner, &f.registry_id, &session_ids, &hash, &2000u64);
+        f.mint_default(&session_ids, &hash, 2000u64);
     }
 
     #[test]
@@ -511,8 +700,7 @@ mod test {
         let f = TestFixture::setup();
         let session_ids: Vec<Symbol> = Vec::new(&f.env);
         let hash = dummy_hash(&f.env);
-        f.client()
-            .mint_bundle(&f.learner, &f.registry_id, &session_ids, &hash, &2000u64);
+        f.mint_default(&session_ids, &hash, 2000u64);
     }
 
     #[test]
@@ -524,8 +712,7 @@ mod test {
         let session_ids = vec![&f.env, sid1, sid2];
         let hash = compute_hash(&f.env, &session_ids);
         let token_id =
-            f.client()
-                .mint_bundle(&f.learner, &f.registry_id, &session_ids, &hash, &2000u64);
+            f.mint_default(&session_ids, &hash, 2000u64);
 
         let valid = f.client().verify_nft_provenance(&token_id, &f.registry_id);
         assert!(valid);
@@ -540,8 +727,7 @@ mod test {
         let session_ids = vec![&f.env, sid1.clone(), sid2];
         let hash = compute_hash(&f.env, &session_ids);
         let token_id =
-            f.client()
-                .mint_bundle(&f.learner, &f.registry_id, &session_ids, &hash, &2000u64);
+            f.mint_default(&session_ids, &hash, 2000u64);
 
         f.registry().update_status(&sid1, &SessionStatus::Cancelled);
 
@@ -563,8 +749,7 @@ mod test {
         let session_ids = vec![&f.env, sid];
         let hash = compute_hash(&f.env, &session_ids);
         let token_id =
-            f.client()
-                .mint_bundle(&f.learner, &f.registry_id, &session_ids, &hash, &2000u64);
+            f.mint_default(&session_ids, &hash, 2000u64);
 
         f.client().redeem(&f.learner, &token_id);
 
@@ -579,8 +764,7 @@ mod test {
         let session_ids = vec![&f.env, sid];
         let hash = compute_hash(&f.env, &session_ids);
         let token_id =
-            f.client()
-                .mint_bundle(&f.learner, &f.registry_id, &session_ids, &hash, &2000u64);
+            f.mint_default(&session_ids, &hash, 2000u64);
 
         let new_owner = Address::generate(&f.env);
         f.client().transfer(&f.learner, &new_owner, &token_id);
@@ -596,8 +780,7 @@ mod test {
         let session_ids = vec![&f.env, sid];
         let hash = compute_hash(&f.env, &session_ids);
         let token_id =
-            f.client()
-                .mint_bundle(&f.learner, &f.registry_id, &session_ids, &hash, &100u64);
+            f.mint_default(&session_ids, &hash, 100u64);
 
         f.env.ledger().with_mut(|li| li.timestamp = 200);
 
@@ -616,8 +799,7 @@ mod test {
         let session_ids = vec![&f.env, sid1, sid2];
         let hash = compute_hash(&f.env, &session_ids);
         let token_id =
-            f.client()
-                .mint_bundle(&f.learner, &f.registry_id, &session_ids, &hash, &2000u64);
+            f.mint_default(&session_ids, &hash, 2000u64);
 
         let events = f.env.events().all();
         let mint_event = events.get(0).unwrap();
@@ -626,5 +808,115 @@ mod test {
         assert_eq!(payload.learner, f.learner);
         assert_eq!(payload.session_count, 2);
         assert_eq!(payload.session_ids_hash, hash);
+    }
+
+    // ── #759: NFT metadata + integrity seal ─────────────────────────────────
+
+    #[test]
+    fn test_get_token_metadata_fully_populated_after_mint() {
+        let f = TestFixture::setup();
+        let sid1 = f.register_completed_session("s1");
+        let sid2 = f.register_completed_session("s2");
+        f.set_mentor_rating(&f.mentor, 480);
+
+        let session_ids = vec![&f.env, sid1, sid2];
+        let hash = compute_hash(&f.env, &session_ids);
+        let token_id = f.mint_default(&session_ids, &hash, 2000u64);
+
+        let metadata = f.client().get_token_metadata(&token_id);
+        assert_eq!(metadata.name, default_name(&f.env));
+        assert_eq!(metadata.skill, default_skill(&f.env));
+        assert_eq!(metadata.mentor, f.mentor);
+        assert_eq!(metadata.learner, f.learner);
+        assert_eq!(metadata.completed_at, f.env.ledger().timestamp());
+        assert_eq!(metadata.rating_snapshot, 480);
+        assert_eq!(metadata.sessions_count, 2);
+        assert_ne!(metadata.metadata_hash, dummy_hash(&f.env));
+    }
+
+    #[test]
+    fn test_verify_metadata_integrity_true_for_freshly_minted_token() {
+        let f = TestFixture::setup();
+        let sid1 = f.register_completed_session("s1");
+        let session_ids = vec![&f.env, sid1];
+        let hash = compute_hash(&f.env, &session_ids);
+        let token_id = f.mint_default(&session_ids, &hash, 2000u64);
+
+        assert!(f.client().verify_metadata_integrity(&token_id));
+    }
+
+    #[test]
+    fn test_verify_metadata_integrity_false_when_tampered() {
+        let f = TestFixture::setup();
+        let sid1 = f.register_completed_session("s1");
+        let session_ids = vec![&f.env, sid1];
+        let hash = compute_hash(&f.env, &session_ids);
+        let token_id = f.mint_default(&session_ids, &hash, 2000u64);
+
+        // Directly overwrite the stored metadata with a tampered rating,
+        // bypassing mint_bundle's hash computation.
+        f.env.as_contract(&f.nft_id, || {
+            let mut metadata: NftMetadata = f
+                .env
+                .storage()
+                .persistent()
+                .get(&DataKey::Metadata(token_id))
+                .unwrap();
+            metadata.rating_snapshot = 999;
+            f.env
+                .storage()
+                .persistent()
+                .set(&DataKey::Metadata(token_id), &metadata);
+        });
+
+        assert!(!f.client().verify_metadata_integrity(&token_id));
+    }
+
+    #[test]
+    fn test_verify_metadata_integrity_false_for_unknown_token() {
+        let f = TestFixture::setup();
+        assert!(!f.client().verify_metadata_integrity(&999u64));
+    }
+
+    #[test]
+    fn test_metadata_hash_is_deterministic() {
+        let env = Env::default();
+        let name = default_name(&env);
+        let skill = default_skill(&env);
+        let mentor = Address::generate(&env);
+        let learner = Address::generate(&env);
+
+        let h1 = SessionBundleNFT::compute_metadata_hash(
+            &env, &name, &skill, &mentor, &learner, 1_000, 480,
+        );
+        let h2 = SessionBundleNFT::compute_metadata_hash(
+            &env, &name, &skill, &mentor, &learner, 1_000, 480,
+        );
+        assert_eq!(h1, h2);
+
+        let h3 = SessionBundleNFT::compute_metadata_hash(
+            &env, &name, &skill, &mentor, &learner, 1_001, 480,
+        );
+        assert_ne!(h1, h3, "different inputs must not collide");
+    }
+
+    #[test]
+    fn test_integration_mint_then_read_metadata_matches_session_data() {
+        let f = TestFixture::setup();
+        let sid1 = f.register_completed_session("s1");
+        let sid2 = f.register_completed_session("s2");
+        let sid3 = f.register_completed_session("s3");
+        f.set_mentor_rating(&f.mentor, 450);
+
+        let session_ids = vec![&f.env, sid1, sid2, sid3];
+        let hash = compute_hash(&f.env, &session_ids);
+        let token_id = f.mint_default(&session_ids, &hash, 5000u64);
+
+        let metadata = f.client().get_token_metadata(&token_id);
+        assert_eq!(metadata.mentor, f.mentor);
+        assert_eq!(metadata.learner, f.learner);
+        assert_eq!(metadata.sessions_count, 3);
+        assert_eq!(metadata.rating_snapshot, 450);
+        assert!(f.client().verify_metadata_integrity(&token_id));
     }
 }

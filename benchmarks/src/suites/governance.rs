@@ -48,6 +48,28 @@ impl MockSnapshot {
     }
 }
 
+#[contract]
+pub struct MockDelegation;
+
+#[contractimpl]
+impl MockDelegation {
+    pub fn snapshot_delegations(_env: Env, _snapshot_id: u32) {}
+    pub fn get_delegation_at_snapshot(
+        _env: Env,
+        _snapshot_id: u32,
+        _delegator: Address,
+    ) -> Option<Address> {
+        None
+    }
+    pub fn get_delegated_power_at_snapshot(
+        _env: Env,
+        _delegate: Address,
+        _snapshot_id: u32,
+    ) -> i128 {
+        0
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fixture
 // ---------------------------------------------------------------------------
@@ -83,6 +105,7 @@ impl Fixture {
         let voter = Address::generate(&env);
         let mnt = Address::generate(&env);
         let snapshot = env.register(MockSnapshot, ());
+        let delegation = env.register(MockDelegation, ());
         let gov = env.register(GovernanceContract, ());
 
         let client = GovernanceContractClient::new(&env, &gov);
@@ -90,6 +113,7 @@ impl Fixture {
             &admin,
             &mnt,
             &snapshot,
+            &delegation,
             &Some(60u64),
             &Some(1_000u32),
         );
@@ -198,7 +222,7 @@ pub fn run() -> Vec<BenchResult> {
         let f = Fixture::new();
         let pid = f.make_proposal();
         let snap = measure(&f.env, || {
-            f.client().cancel_proposal(&pid);
+            f.client().cancel_proposal(&pid, &None);
         });
         results.push(BenchResult {
             contract: CONTRACT.into(),

@@ -8,6 +8,8 @@ use soroban_sdk::{
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     StakingContract,
     DelegationContract,
@@ -141,6 +143,14 @@ impl SnapshotContract {
             .unwrap_or(0)
     }
 
+    /// returns the staked balance for a staker at a specific snapshot
+    pub fn get_snapshot_balance(env: Env, snapshot_id: u32, staker: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Snapshot(snapshot_id, staker))
+            .unwrap_or(0)
+    }
+
     /// returns the total supply at a specific snapshot for quorum calculation
     pub fn get_total_supply_at(env: Env, snapshot_id: u32) -> i128 {
         env.storage()
@@ -251,6 +261,13 @@ mod test {
             _delegator: Address,
         ) -> Option<Address> {
             None // No delegations in mock
+        }
+        pub fn get_delegated_power_at_snapshot(
+            _env: Env,
+            _delegate: Address,
+            _snapshot_id: u32,
+        ) -> i128 {
+            0 // No delegated power in mock
         }
     }
 

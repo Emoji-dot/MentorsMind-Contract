@@ -1,7 +1,7 @@
 #![cfg(test)]
 use super::*;
 use soroban_sdk::testutils::{Address as _, Ledger};
-use soroban_sdk::{Address, BytesN, Env};
+use soroban_sdk::{Address, BytesN, Env, Symbol};
 
 #[test]
 fn test_kyc_lifecycle() {
@@ -182,3 +182,193 @@ fn test_expired_kyc_returns_none_and_expiry_query() {
     env.ledger().set_timestamp(1001);
     assert_eq!(client.get_kyc_level(&user), KycLevel::None);
 }
+
+#[test]
+fn test_enforce_access_controls_allows_consented_scope() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let subject = Address::generate(&env);
+    let accessor = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let contract_id = env.register_contract(None, KycRegistry);
+    let client = KycRegistryClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let purpose = Symbol::new(&env, "scheduling");
+    client.manage_data_privacy(&subject, &purpose, &shared::FIELD_IDENTITY, &3600);
+
+    let decision = client.enforce_access_controls(&accessor, &subject, &purpose, &shared::FIELD_IDENTITY);
+    assert!(decision.allowed);
+    assert_eq!(decision.allowed_fields, shared::FIELD_IDENTITY);
+    assert!(!client.is_privacy_isolated(&subject));
+}
+
+#[test]
+fn test_enforce_access_controls_denies_without_consent() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let subject = Address::generate(&env);
+    let accessor = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let contract_id = env.register_contract(None, KycRegistry);
+    let client = KycRegistryClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let purpose = Symbol::new(&env, "billing");
+    let decision = client.enforce_access_controls(&accessor, &subject, &purpose, &shared::FIELD_PAYMENT);
+    assert!(!decision.allowed);
+}
+
+#[test]
+fn test_enforce_access_controls_auto_isolates_on_excessive_access() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let subject = Address::generate(&env);
+    let accessor = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let contract_id = env.register_contract(None, KycRegistry);
+    let client = KycRegistryClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let purpose = Symbol::new(&env, "progress_review");
+    client.manage_data_privacy(&subject, &purpose, &shared::FIELD_LEARNING_HISTORY, &3_600_000);
+
+    // Repeated reads within the monitoring window exceed the allowed rate,
+    // even though every individual request is in-scope.
+    let mut last_decision = client.enforce_access_controls(&accessor, &subject, &purpose, &shared::FIELD_LEARNING_HISTORY);
+    for _ in 0..6 {
+        last_decision = client.enforce_access_controls(&accessor, &subject, &purpose, &shared::FIELD_LEARNING_HISTORY);
+    }
+
+    assert!(!last_decision.allowed);
+    assert!(client.is_privacy_isolated(&subject));
+
+    let usage = client.monitor_data_usage(&accessor, &subject);
+    assert!(usage.exploitative);
+
+    // Admin can restore fair access after review.
+    client.restore_privacy_access(&admin, &subject);
+    assert!(!client.is_privacy_isolated(&subject));
+}
+
+#[test]
+fn test_manage_data_privacy_minimizes_out_of_scope_fields() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let subject = Address::generate(&env);
+    let accessor = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let contract_id = env.register_contract(None, KycRegistry);
+    let client = KycRegistryClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    // Grant broad consent, but request access for a narrow purpose:
+    // need-to-know minimization should still restrict what's returned.
+    let purpose = Symbol::new(&env, "session_delivery");
+    client.manage_data_privacy(&subject, &purpose, &shared::ALL_FIELDS, &3600);
+
+    let decision = client.enforce_access_controls(
+        &accessor,
+        &subject,
+        &purpose,
+        &(shared::FIELD_IDENTITY | shared::FIELD_PAYMENT),
+    );
+    assert!(decision.allowed);
+    assert_eq!(decision.allowed_fields, shared::FIELD_IDENTITY);
+}
+
+// ---------------------------------------------------------------------------
+// Learner privacy, consent management & breach response (#899)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_handle_consent_grant_and_revoke() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let subject = Address::generate(&env);
+    let accessor = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let contract_id = env.register_contract(None, KycRegistry);
+    let client = KycRegistryClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let purpose = Symbol::new(&env, "session_delivery");
+    let record = client
+        .handle_consent(&subject, &purpose, &shared::FIELD_IDENTITY, &3600, &false)
+        .unwrap();
+    assert_eq!(record.granted_fields, shared::FIELD_IDENTITY);
+
+    let decision = client.enforce_access_controls(&accessor, &subject, &purpose, &shared::FIELD_IDENTITY);
+    assert!(decision.allowed);
+
+    // Revoking consent should deny subsequent access.
+    let revoked = client.handle_consent(&subject, &purpose, &0, &0, &true);
+    assert!(revoked.is_none());
+
+    let decision = client.enforce_access_controls(&accessor, &subject, &purpose, &shared::FIELD_IDENTITY);
+    assert!(!decision.allowed);
+}
+
+#[test]
+fn test_manage_learner_privacy_revoke_path() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let subject = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let contract_id = env.register_contract(None, KycRegistry);
+    let client = KycRegistryClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let purpose = Symbol::new(&env, "session_delivery");
+    let granted = client.manage_learner_privacy(&subject, &purpose, &shared::ALL_FIELDS, &3600, &false);
+    assert!(granted.is_some());
+
+    let revoked = client.manage_learner_privacy(&subject, &purpose, &0, &0, &true);
+    assert!(revoked.is_none());
+}
+
+#[test]
+fn test_enforce_data_protection_contains_breach_on_out_of_scope_access() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let subject = Address::generate(&env);
+    let accessor = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let contract_id = env.register_contract(None, KycRegistry);
+    let client = KycRegistryClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let purpose = Symbol::new(&env, "session_delivery");
+    client.manage_data_privacy(&subject, &purpose, &shared::ALL_FIELDS, &3600);
+
+    let mut decision = client.enforce_data_protection(
+        &accessor,
+        &subject,
+        &purpose,
+        &shared::FIELD_IDENTITY,
+        &true,
+    );
+    for _ in 0..5 {
+        decision = client.enforce_data_protection(
+            &accessor,
+            &subject,
+            &purpose,
+            &shared::FIELD_IDENTITY,
+            &true,
+        );
+    }
+
+    assert!(!decision.allowed);
+    assert!(client.is_breach_contained(&subject));
+
+    client.restore_privacy_access(&admin, &subject);
+    assert!(!client.is_breach_contained(&subject));
+}
+

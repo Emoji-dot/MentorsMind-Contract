@@ -1,6 +1,25 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Vec};
+use soroban_sdk::{contract, contractclient, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Vec};
+
+#[contractclient(name = "CertificatesClient")]
+pub trait CertificatesTrait {
+    fn verify_certificate(env: Env, cert_id: u64) -> (bool, CertificateRecord);
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CertificateRecord {
+    pub id: u64,
+    pub learner: Address,
+    pub mentor: Address,
+    pub skill: soroban_sdk::Symbol,
+    pub sessions_completed: u32,
+    pub issued_at: u64,
+    pub revoked: bool,
+    pub session_id: soroban_sdk::Symbol,
+    pub rating_at_time: u64,
+}
 
 // ---------------------------------------------------------------------------
 // Data Types
@@ -20,6 +39,8 @@ pub struct ShowcaseRecord {
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     CertificatesContract,
     Showcase(Address),
@@ -131,6 +152,26 @@ impl CertShowcase {
             .unwrap_or_else(|| Vec::new(&env));
 
         showcase.iter().any(|id| id == cert_id)
+    }
+
+    /// Feature a certificate in the showcase. Verifies the certificate is valid and unexpired.
+    pub fn feature(env: Env, learner: Address, cert_id: u64) {
+        learner.require_auth();
+
+        let cert_contract_addr: soroban_sdk::Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::CertificatesContract)
+            .expect("certificates contract not set");
+
+        let cert_client = CertificatesClient::new(&env, &cert_contract_addr);
+        let (is_valid, _cert) = cert_client.verify_certificate(&cert_id);
+
+        if !is_valid {
+            panic!("certificate is invalid or revoked");
+        }
+
+        self::CertShowcase::showcase(env.clone(), learner, cert_id);
     }
 
     /// Generate deterministic hash for QR code verification

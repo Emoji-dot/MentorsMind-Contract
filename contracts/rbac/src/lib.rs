@@ -14,9 +14,12 @@ pub enum Error {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     SuperAdmin,
     RoleMember(Symbol, Address),
     RoleMembers(Symbol),
+    RoleMemberCount(Symbol),
 }
 
 #[contract]
@@ -74,6 +77,12 @@ impl RbacContract {
             }
         }
         env.storage().persistent().set(&members_key, &next);
+
+        // Decrement member count
+        let count_key = DataKey::RoleMemberCount(role.clone());
+        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(1);
+        env.storage().persistent().set(&count_key, &(count.saturating_sub(1)));
+
         env.events()
             .publish((Symbol::new(&env, "role_revoked"), role), account);
         Ok(())
@@ -99,6 +108,13 @@ impl RbacContract {
             .persistent()
             .get(&DataKey::RoleMembers(role))
             .unwrap_or(Vec::new(&env))
+    }
+
+    pub fn get_role_member_count(env: Env, role: Symbol) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RoleMemberCount(role))
+            .unwrap_or(0)
     }
 
     pub fn super_admin_role(env: Env) -> Symbol {
@@ -150,6 +166,12 @@ impl RbacContract {
 
     fn grant_internal(env: &Env, role: &Symbol, account: &Address) {
         let member_key = DataKey::RoleMember(role.clone(), account.clone());
+
+        // O(1) deduplication via RoleMember key existence check
+        if env.storage().persistent().has(&member_key) {
+            return;
+        }
+
         env.storage().persistent().set(&member_key, &true);
 
         let members_key = DataKey::RoleMembers(role.clone());
@@ -158,10 +180,13 @@ impl RbacContract {
             .persistent()
             .get(&members_key)
             .unwrap_or(Vec::new(env));
-        if !members.contains(account.clone()) {
-            members.push_back(account.clone());
-        }
+        members.push_back(account.clone());
         env.storage().persistent().set(&members_key, &members);
+
+        // Increment member count
+        let count_key = DataKey::RoleMemberCount(role.clone());
+        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        env.storage().persistent().set(&count_key, &(count + 1));
 
         env.events().publish(
             (Symbol::new(env, "role_granted"), role.clone()),

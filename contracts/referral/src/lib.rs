@@ -1,8 +1,9 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Env, Symbol, Vec};
-use shared::ReentrancyGuard;
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, IntoVal, Symbol};
+use shared::{pause_guard::require_not_paused, ReentrancyGuard};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, vec, Address, Env, IntoVal, Symbol, Vec,
+};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -46,21 +47,23 @@ pub struct ReferralConfig {
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     MNTToken,
-    Referral(Address),                // referee -> ReferralInfo
-    ReferrerCount(Address),           // all-time referrer count
-    PendingReward(Address),           // referrer -> base reward amount
-    EpochReferralCount(u32, Address), // (epoch_id, referrer) -> count
-    EpochTopReferrers(u32),           // epoch_id -> Vec<(Address, u32)>
-    EpochBonusDistributed(u32),       // epoch_id -> bool
-    LeaderboardContract,
-    Config,
-    Referral(Address),       // referee -> ReferralInfo
+    Referral(Address),
     ReferrerCount(Address),
-    PendingReward(Address),  // referrer -> amount
-    LifetimeClaimed(Address), // referrer -> total ever claimed
-    GlobalMinted,            // i128: total minted through referrals
+    PendingReward(Address),
+    EpochReferralCount(u32, Address),
+    EpochTopReferrers(u32),
+    EpochBonusDistributed(u32),
+    LeaderboardContract,
+    /// Optional pause guardian contract for circuit-breaker functionality.
+    PauseGuardian,
+    Config,
+    LifetimeClaimed(Address),
+    GlobalMinted,
+    PendingAdmin,
 }
 
 const REWARD_MENTOR: i128 = 50 * 10_000_000; // 50 MNT (7 decimals)
@@ -79,6 +82,24 @@ const LEADERBOARD_MAX_SIZE: u32 = 10;
 const DEFAULT_MAX_MULTIPLIER_BPS: u32 = 20_000;
 const DEFAULT_MAX_LIFETIME_REWARD: i128 = 10_000 * 10_000_000;
 const DEFAULT_GLOBAL_REFERRAL_MINT_CAP: i128 = 5_000_000 * 10_000_000;
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAdminChange {
+    pub new_admin: Address,
+    pub effective_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminChangeProposedEvent {
+    pub contract: Address,
+    pub old_admin: Address,
+    pub new_admin: Address,
+    pub effective_at: u64,
+}
+
+const ADMIN_CHANGE_TIMELOCK: u64 = 48 * 60 * 60;
 
 #[contract]
 pub struct ReferralContract;
@@ -100,6 +121,76 @@ impl ReferralContract {
         };
         env.storage().instance().set(&DataKey::Config, &config);
         env.storage().instance().set(&DataKey::GlobalMinted, &0i128);
+    }
+
+    pub fn propose_admin_change(
+        env: Env,
+        current_admin: Address,
+        new_admin: Address,
+    ) {
+        Self::require_admin(&env, &current_admin);
+        let old_admin = Self::admin(&env);
+        let effective_at = env
+            .ledger()
+            .timestamp()
+            .checked_add(ADMIN_CHANGE_TIMELOCK)
+            .expect("timestamp overflow");
+        env.storage().persistent().set(
+            &DataKey::PendingAdmin,
+            &PendingAdminChange {
+                new_admin: new_admin.clone(),
+                effective_at,
+            },
+        );
+        env.events().publish(
+            (Symbol::new(&env, "admin"), Symbol::new(&env, "proposed")),
+            AdminChangeProposedEvent {
+                contract: env.current_contract_address(),
+                old_admin,
+                new_admin,
+                effective_at,
+            },
+        );
+    }
+
+    pub fn accept_admin_change(env: Env, new_admin: Address) {
+        new_admin.require_auth();
+        let pending: PendingAdminChange = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingAdmin)
+            .expect("no pending admin change");
+        if pending.new_admin != new_admin {
+            panic!("unauthorized");
+        }
+        if env.ledger().timestamp() < pending.effective_at {
+            panic!("admin change not yet effective");
+        }
+        env.storage().persistent().set(&DataKey::Admin, &new_admin);
+        env.storage().persistent().remove(&DataKey::PendingAdmin);
+    }
+
+    pub fn cancel_admin_change(env: Env, multisig: Address) {
+        multisig.require_auth();
+        if !env.storage().persistent().has(&DataKey::PendingAdmin) {
+            panic!("no pending admin change");
+        }
+        env.storage().persistent().remove(&DataKey::PendingAdmin);
+    }
+
+    pub fn get_pending_admin_change(env: Env) -> Option<PendingAdminChange> {
+        env.storage().persistent().get(&DataKey::PendingAdmin)
+    }
+
+    pub fn get_admin(env: Env) -> Address {
+        Self::admin(&env)
+    }
+
+    /// Set or update the pause guardian contract address (admin only).
+    pub fn set_pause_guardian(env: Env, guardian: Address) {
+        let admin: Address = Self::admin(&env);
+        admin.require_auth();
+        env.storage().persistent().set(&DataKey::PauseGuardian, &guardian);
     }
 
     /// Update referral config. Admin only.
@@ -235,6 +326,11 @@ impl ReferralContract {
     }
 
     pub fn claim_reward(env: Env, referrer: Address) {
+        // Check pause guardian before any state mutation
+        if let Some(guardian) = env.storage().persistent().get::<DataKey, Address>(&DataKey::PauseGuardian) {
+            require_not_paused(&env, &guardian);
+        }
+
         let _guard = ReentrancyGuard::enter(&env, Symbol::new(&env, "claim_reward"));
         referrer.require_auth();
 
@@ -247,17 +343,22 @@ impl ReferralContract {
             panic!("No rewards to claim");
         }
 
+        let config: ReferralConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .expect("Config not set");
+
         let multiplier = Self::get_multiplier_internal(&env, &referrer);
         let total = pending
             .checked_mul(multiplier as i128)
             .expect("reward overflow");
 
         let mnt_token: Address = env
-        let config: ReferralConfig = env
             .storage()
-            .instance()
-            .get(&DataKey::Config)
-            .expect("Config not set");
+            .persistent()
+            .get(&DataKey::MNTToken)
+            .expect("Token not set");
 
         // --- multiplier: clamp to max_multiplier_bps ---
         let leaderboard: Address = env
@@ -324,25 +425,12 @@ impl ReferralContract {
             .instance()
             .set(&DataKey::GlobalMinted, &(global_minted + actual_amount));
 
-        // --- mint (external call happens after all state is committed) ---
-        let mnt_token: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::MNTToken)
-            .expect("Token not set");
-        env.invoke_contract::<()>(
-            &mnt_token,
-            &Symbol::new(&env, "mint"),
-            (referrer.clone(), actual_amount).into_val(&env),
-        );
-
         env.events().publish(
             (
                 Symbol::new(&env, "Referral"),
                 Symbol::new(&env, "RewardClaimed"),
                 referrer.clone(),
             ),
-            RewardClaimedEventData { amount: total },
             RewardClaimedEventData { amount: actual_amount },
         );
     }
@@ -351,6 +439,21 @@ impl ReferralContract {
 
     fn current_epoch(env: &Env) -> u32 {
         (env.ledger().timestamp() / LEADERBOARD_EPOCH_SECS) as u32
+    }
+
+    fn admin(env: &Env) -> Address {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized")
+    }
+
+    fn require_admin(env: &Env, admin: &Address) {
+        admin.require_auth();
+        let stored_admin = Self::admin(env);
+        if stored_admin != *admin {
+            panic!("unauthorized");
+        }
     }
 
     fn record_epoch_referral(env: &Env, referrer: &Address) {
@@ -511,13 +614,6 @@ impl ReferralContract {
             .unwrap_or(0)
     }
 
-    pub fn get_admin(env: Env) -> Address {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .expect("Not initialized")
-    }
-
     /// Total MNT minted through referrals so far.
     pub fn get_global_referral_minted(env: Env) -> i128 {
         env.storage()
@@ -580,11 +676,9 @@ mod test {
     extern crate std;
     use super::*;
     use mentorminds_mnt_token::{MNTToken, MNTTokenClient};
-    use soroban_sdk::testutils::{Address as _, Ledger};
-    use soroban_sdk::IntoVal;
-    use mentorminds_referral_leaderboard::{ReferralLeaderboardContract, ReferralLeaderboardContractClient};
-    use soroban_sdk::testutils::{Address as _, Events};
+    use soroban_sdk::testutils::{Address as _, Events, Ledger};
     use soroban_sdk::{IntoVal, Symbol, TryFromVal};
+    use mentorminds_referral_leaderboard::{ReferralLeaderboardContract, ReferralLeaderboardContractClient};
 
     struct TestFixture {
         env: Env,
@@ -631,6 +725,21 @@ mod test {
         let f = TestFixture::setup();
         assert_eq!(f.client().get_referral_count(&Address::generate(&f.env)), 0);
         assert_eq!(f.client().get_global_referral_minted(), 0);
+    }
+
+    #[test]
+    fn test_admin_rotation_timelock_and_acceptance() {
+        let f = TestFixture::setup();
+        let new_admin = Address::generate(&f.env);
+
+        f.client().propose_admin_change(&f.admin, &new_admin);
+        let pending = f.client().get_pending_admin_change().unwrap();
+        assert_eq!(pending.new_admin, new_admin);
+
+        f.env.ledger().with_mut(|li| li.timestamp += ADMIN_CHANGE_TIMELOCK + 1);
+        f.client().accept_admin_change(&new_admin);
+
+        assert_eq!(f.client().get_admin(), new_admin);
     }
 
     #[test]
@@ -879,6 +988,8 @@ mod test {
         let expected = REWARD_MENTOR * (MAX_MULTIPLIER as i128);
         assert_eq!(f.mnt_client().balance(&top), expected);
         assert_eq!(f.client().get_pending_rewards(&top), 0);
+    }
+
     /// Multiplier above max_multiplier_bps is clamped, not accepted.
     #[test]
     fn test_multiplier_clamped_at_max() {

@@ -5,9 +5,13 @@ use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, Ve
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     Interface(Symbol),
     InterfaceIds,
+    InterfaceDescriptor(Symbol),
+    Quarantined(Address),
 }
 
 #[contracttype]
@@ -23,6 +27,12 @@ pub struct InterfaceEntry {
 pub struct InterfaceData {
     pub contract: Address,
     pub version: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterfaceDescriptor {
+    pub functions: Vec<(Symbol, u32)>,
 }
 
 #[contract]
@@ -72,6 +82,17 @@ impl InterfaceRegistryContract {
                 version,
             },
         );
+
+        // Store default empty descriptor if not already present
+        let descriptor_key = DataKey::InterfaceDescriptor(interface_id.clone());
+        if !env.storage().persistent().has(&descriptor_key) {
+            env.storage().persistent().set(
+                &descriptor_key,
+                &InterfaceDescriptor {
+                    functions: Vec::new(&env),
+                },
+            );
+        }
 
         if is_new {
             env.events().publish(
@@ -147,6 +168,100 @@ impl InterfaceRegistryContract {
 
     pub fn get_yield_contract_version(env: Env) -> u32 {
         Self::get_version(env.clone(), Symbol::new(&env, Self::YIELD_INTERFACE))
+    }
+
+    /// Verify that a contract at `address` is registered with the expected
+    /// interface and has not been quarantined.
+    pub fn verify(env: Env, address: Address, expected_interface: Symbol) -> bool {
+        if Self::is_quarantined(env.clone(), address.clone()) {
+            return false;
+        }
+        let key = DataKey::Interface(expected_interface);
+        match env.storage().persistent().get::<_, InterfaceData>(&key) {
+            Some(data) => data.contract == address,
+            None => false,
+        }
+    }
+
+    /// Emergency isolation: mark `contract` as quarantined so `verify` (and
+    /// therefore every consumer that gates cross-contract calls on it, e.g.
+    /// `CrossContractAuth::require_authorized_contract`) rejects it, even if
+    /// it remains registered under an interface. Admin-only.
+    pub fn quarantine_contract(env: Env, contract: Address) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Quarantined(contract.clone()), &true);
+
+        env.events()
+            .publish((Symbol::new(&env, "contract_quarantined"),), (contract, admin));
+    }
+
+    /// Lift a quarantine previously placed on `contract`. Admin-only.
+    pub fn unquarantine_contract(env: Env, contract: Address) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Quarantined(contract.clone()));
+
+        env.events().publish(
+            (Symbol::new(&env, "contract_unquarantined"),),
+            (contract, admin),
+        );
+    }
+
+    /// Whether `contract` is currently quarantined.
+    pub fn is_quarantined(env: Env, contract: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Quarantined(contract))
+            .unwrap_or(false)
+    }
+
+    /// Panics if the contract at `address` is not registered with the expected interface.
+    pub fn require_interface(env: Env, address: Address, expected_interface: Symbol) {
+        if !Self::verify(env.clone(), address, expected_interface) {
+            panic!("interface mismatch");
+        }
+    }
+
+    /// Store an interface descriptor for a given interface_id.
+    pub fn set_interface_descriptor(
+        env: Env,
+        interface_id: Symbol,
+        descriptor: InterfaceDescriptor,
+    ) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+        let descriptor_key = DataKey::InterfaceDescriptor(interface_id);
+        env.storage().persistent().set(&descriptor_key, &descriptor);
+    }
+
+    /// Get interface descriptor for a given interface_id.
+    pub fn get_interface_descriptor(env: Env, interface_id: Symbol) -> InterfaceDescriptor {
+        let descriptor_key = DataKey::InterfaceDescriptor(interface_id);
+        env.storage()
+            .persistent()
+            .get(&descriptor_key)
+            .unwrap_or(InterfaceDescriptor {
+                functions: Vec::new(&env),
+            })
     }
 }
 
@@ -243,5 +358,24 @@ mod tests {
 
         assert_eq!(registry.get_yield_contract(), yield_contract);
         assert_eq!(registry.get_yield_contract_version(), 3);
+    }
+
+    #[test]
+    fn test_verify_and_require_interface() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (registry, _admin, escrow) = setup(&env);
+        let interface = Symbol::new(&env, "escrow_v1");
+        registry.register_interface(&escrow, &interface, &1);
+        assert!(registry.verify(&escrow, &interface));
+        let other = Address::generate(&env);
+        assert!(!registry.verify(&other, &interface));
+        // require_interface should not panic for correct address
+        registry.require_interface(&escrow, &interface);
+        // require_interface should panic for wrong address
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            registry.require_interface(&other, &interface);
+        }));
+        assert!(result.is_err());
     }
 }

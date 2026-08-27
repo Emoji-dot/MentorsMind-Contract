@@ -1,6 +1,27 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol};
+use soroban_sdk::{
+    contract, contractclient, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec,
+};
+
+// ---------------------------------------------------------------------------
+// External contract interface: Credit Score
+//
+// The credit score contract exposes `get_score(env, address) -> u32`. We
+// describe it here as a trait so the SDK generates a strongly-typed
+// `CreditScoreClient` used for the cross-contract call in `borrow`.
+// ---------------------------------------------------------------------------
+
+#[contractclient(name = "CreditScoreClient")]
+pub trait CreditScoreContractTrait {
+    fn get_score(env: Env, address: Address) -> u32;
+}
+
+use shared::{
+    get_all_params, get_param, init_protocol_params, set_param,
+    key_interest_rate_bps, key_min_credit_score,
+    DEFAULT_INTEREST_RATE_BPS, DEFAULT_MIN_CREDIT_SCORE,
+};
 
 // ---------------------------------------------------------------------------
 // Storage Keys
@@ -9,6 +30,8 @@ use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, E
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
     UsdcToken,
     CreditScoreContract,
@@ -32,12 +55,8 @@ pub enum DataKey {
     RateModelKinkBps,          // kink utilization in bps
     RateModelSlope1Bps,        // slope1 below kink in bps
     RateModelSlope2Bps,        // slope2 above kink in bps
-    /// Active Dutch-auction liquidation for a defaulted borrower's loan.
-    LiquidationAuction(Address),
-    /// Cumulative unrecovered principal written off via `force_liquidate`.
-    BadDebt,
-    /// Regulatory reporting contract address
-    RegulatoryReporting,
+    /// Minimum credit score required to borrow (defaults to MIN_CREDIT_SCORE).
+    MinCreditScore,
 }
 
 // ---------------------------------------------------------------------------
@@ -122,6 +141,23 @@ const AUCTION_DURATION_SECS: u64 = 24 * 60 * 60; // 24 hours
 const MAX_AUCTION_DISCOUNT_BPS: i128 = 2_000; // 20%
 
 // ---------------------------------------------------------------------------
+// TTL constants for flash-loan guard entries (persistent storage)
+// ---------------------------------------------------------------------------
+
+/// Retention period for flash-loan guard entries: 7 days in ledgers
+/// (assuming ~5s per ledger).  This is the maximum time a ledger-guard
+/// entry should be kept before it is eligible for archival.
+const LEDGER_GUARD_TTL: u32 = 120_960; // 7 days at 5s/ledger
+/// TTL threshold: when remaining lifetime drops below this many ledgers,
+/// extend the TTL.  500k ledgers ≈ 29 days at 5s/ledger.
+const LEDGER_GUARD_TTL_THRESHOLD: u32 = 500_000;
+/// TTL bump amount in ledgers: extend lifetime by this amount.
+/// 1_209_600 ledgers ≈ 70 days (10 weeks) at 5s/ledger — well beyond the
+/// 7-day instance TTL default, guaranteeing the flash-loan guard cannot
+/// be silently expired.
+const LEDGER_GUARD_TTL_BUMP: u32 = 1_209_600;
+
+// ---------------------------------------------------------------------------
 // Contract
 // ---------------------------------------------------------------------------
 
@@ -136,6 +172,7 @@ impl LendingPool {
         admin: Address,
         usdc_token: Address,
         credit_score_contract: Address,
+        rbac_contract: Address,
     ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
@@ -164,6 +201,7 @@ impl LendingPool {
         // Initialize regulatory reporting with placeholder
         env.storage().instance().set(&DataKey::RegulatoryReporting, &Address::generate(&env));
 
+        init_protocol_params(&env, &rbac_contract);
         Ok(())
     }
 
@@ -216,6 +254,25 @@ impl LendingPool {
     }
 
     // -----------------------------------------------------------------------
+    // Protocol parameter registry
+    // -----------------------------------------------------------------------
+
+    /// Read a protocol parameter by key, with compile-time default fallback.
+    pub fn get_param(env: Env, key: Symbol, default: i128) -> i128 {
+        get_param(&env, &key, default)
+    }
+
+    /// Update a protocol parameter. Caller must hold `GOVERNANCE_ADMIN`.
+    pub fn set_param(env: Env, caller: Address, key: Symbol, value: i128) {
+        set_param(&env, &caller, &key, value);
+    }
+
+    /// Return all current `(Symbol, i128)` parameter pairs for monitoring.
+    pub fn get_all_params(env: Env) -> Vec<(Symbol, i128)> {
+        get_all_params(&env)
+    }
+
+    // -----------------------------------------------------------------------
     // Rate Model Admin
     // -----------------------------------------------------------------------
 
@@ -254,6 +311,38 @@ impl LendingPool {
         env.storage().instance().set(&DataKey::RateModelSlope2Bps, &slope2_bps);
 
         Ok(())
+    }
+
+    /// Update the minimum credit score required to borrow (admin only).
+    pub fn set_min_credit_score(env: Env, admin: Address, new_min: u32) -> Result<(), Error> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        if stored_admin != admin {
+            return Err(Error::NotAdmin);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MinCreditScore, &new_min);
+
+        env.events().publish(
+            (symbol_short!("min_score"),),
+            new_min,
+        );
+
+        Ok(())
+    }
+
+    /// Get the minimum credit score required to borrow (defaults to 600).
+    pub fn get_min_credit_score(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MinCreditScore)
+            .unwrap_or(MIN_CREDIT_SCORE)
     }
 
     /// Get current interest rate based on pool utilization
@@ -337,13 +426,31 @@ impl LendingPool {
 
     /// Pure fee computation (replaces cached version)
     /// fee = amount * current_rate / 10_000
+    ///
+    /// The interest rate is read from the protocol parameter registry first,
+    /// falling back to `DEFAULT_INTEREST_RATE_BPS` if governance hasn't acted.
     fn compute_fee(env: &Env, amount: i128) -> i128 {
-        let rate = Self::get_current_rate(env.clone());
+        // Use the governance-controlled interest rate if set, else the two-slope
+        // dynamic model rate.  Governance sets a flat override via INT_RATE;
+        // when that key is unset (== DEFAULT_INTEREST_RATE_BPS still at default),
+        // we fall through to the full model.
+        let gov_rate = env
+            .storage()
+            .persistent()
+            .get::<_, i128>(&shared::params::ParamKey::Param(key_interest_rate_bps()))
+            .unwrap_or(0);
+        let rate = if gov_rate > 0 { gov_rate } else { Self::get_current_rate(env.clone()) };
         amount
             .checked_mul(rate)
             .expect("Overflow")
             .checked_div(10_000)
             .expect("Division error")
+    }
+
+    /// Returns the minimum credit score required to borrow, sourced from
+    /// the protocol parameter registry with compile-time fallback.
+    pub fn min_credit_score(env: Env) -> i128 {
+        get_param(&env, &key_min_credit_score(), DEFAULT_MIN_CREDIT_SCORE)
     }
 
     // -----------------------------------------------------------------------
@@ -422,9 +529,16 @@ impl LendingPool {
 
         let deposit_ledger: u32 = env
             .storage()
-            .instance()
-            .get(&DataKey::LenderDepositLedger(lender.clone()))
+            .persistent()
+            .get(&deposit_ledger_key)
             .unwrap_or(0);
+        if deposit_ledger != 0 {
+            env.storage().persistent().extend_ttl(
+                &deposit_ledger_key,
+                LEDGER_GUARD_TTL_THRESHOLD,
+                LEDGER_GUARD_TTL_BUMP,
+            );
+        }
         if deposit_ledger == env.ledger().sequence() {
             return Err(Error::SameBlockDepositWithdraw);
         }
@@ -501,6 +615,24 @@ impl LendingPool {
 
         borrower.require_auth();
 
+        // --- Credit score gate ---
+        // Query the borrower's on-chain credit score via a cross-contract call
+        // and reject the borrow if it is below the configured minimum.
+        let credit_contract: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::CreditScoreContract)
+            .ok_or(Error::NotInitialized)?;
+        let min_credit_score: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinCreditScore)
+            .unwrap_or(MIN_CREDIT_SCORE);
+        let credit_score = CreditScoreClient::new(&env, &credit_contract).get_score(&borrower);
+        if credit_score < min_credit_score {
+            return Err(Error::LowCreditScore);
+        }
+
         let total_liquidity: i128 = env
             .storage()
             .instance()
@@ -541,14 +673,32 @@ impl LendingPool {
 
         let borrow_ledger: u32 = env
             .storage()
-            .instance()
-            .get(&DataKey::BlockBorrowLedger(borrower.clone()))
+            .persistent()
+            .get(&borrow_ledger_key)
             .unwrap_or(0);
+        if borrow_ledger != 0 {
+            env.storage().persistent().extend_ttl(
+                &borrow_ledger_key,
+                LEDGER_GUARD_TTL_THRESHOLD,
+                LEDGER_GUARD_TTL_BUMP,
+            );
+        }
+
+        let borrow_total_key = DataKey::BlockBorrowTotal(borrower.clone());
         let block_total: i128 = if borrow_ledger == current_seq {
-            env.storage()
-                .instance()
-                .get(&DataKey::BlockBorrowTotal(borrower.clone()))
-                .unwrap_or(0)
+            let total: i128 = env
+                .storage()
+                .persistent()
+                .get(&borrow_total_key)
+                .unwrap_or(0);
+            if total != 0 {
+                env.storage().persistent().extend_ttl(
+                    &borrow_total_key,
+                    LEDGER_GUARD_TTL_THRESHOLD,
+                    LEDGER_GUARD_TTL_BUMP,
+                );
+            }
+            total
         } else {
             0
         };
@@ -559,11 +709,21 @@ impl LendingPool {
         }
 
         env.storage()
-            .instance()
-            .set(&DataKey::BlockBorrowTotal(borrower.clone()), &new_block_total);
+            .persistent()
+            .set(&borrow_total_key, &new_block_total);
+        env.storage().persistent().extend_ttl(
+            &borrow_total_key,
+            LEDGER_GUARD_TTL_THRESHOLD,
+            LEDGER_GUARD_TTL_BUMP,
+        );
         env.storage()
-            .instance()
-            .set(&DataKey::BlockBorrowLedger(borrower.clone()), &current_seq);
+            .persistent()
+            .set(&borrow_ledger_key, &current_seq);
+        env.storage().persistent().extend_ttl(
+            &borrow_ledger_key,
+            LEDGER_GUARD_TTL_THRESHOLD,
+            LEDGER_GUARD_TTL_BUMP,
+        );
 
         // Check for large transaction and trigger regulatory reporting
         Self::_check_and_report_large_tx(&env, symbol_short!("lend_pool"), symbol_short!("borrow"), &borrower, amount);
@@ -666,16 +826,34 @@ impl LendingPool {
 
     pub fn get_block_borrow_total(env: Env, borrower: Address) -> i128 {
         let current_seq = env.ledger().sequence();
+        let borrow_ledger_key = DataKey::BlockBorrowLedger(borrower.clone());
         let borrow_ledger: u32 = env
             .storage()
-            .instance()
-            .get(&DataKey::BlockBorrowLedger(borrower.clone()))
+            .persistent()
+            .get(&borrow_ledger_key)
             .unwrap_or(0);
+        if borrow_ledger != 0 {
+            env.storage().persistent().extend_ttl(
+                &borrow_ledger_key,
+                LEDGER_GUARD_TTL_THRESHOLD,
+                LEDGER_GUARD_TTL_BUMP,
+            );
+        }
         if borrow_ledger == current_seq {
-            env.storage()
-                .instance()
-                .get(&DataKey::BlockBorrowTotal(borrower))
-                .unwrap_or(0)
+            let borrow_total_key = DataKey::BlockBorrowTotal(borrower);
+            let total: i128 = env
+                .storage()
+                .persistent()
+                .get(&borrow_total_key)
+                .unwrap_or(0);
+            if total != 0 {
+                env.storage().persistent().extend_ttl(
+                    &borrow_total_key,
+                    LEDGER_GUARD_TTL_THRESHOLD,
+                    LEDGER_GUARD_TTL_BUMP,
+                );
+            }
+            total
         } else {
             0
         }
@@ -1011,198 +1189,149 @@ impl LendingPool {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{
-        testutils::{Address as _, Ledger},
-        token::StellarAssetClient,
-        Env,
-    };
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::Env;
 
-    fn setup() -> (
-        Env,
-        LendingPoolClient<'static>,
-        Address,
-        Address,
-        soroban_sdk::token::Client<'static>,
-    ) {
+    // --- Mock USDC token (mint / balance / transfer) ---
+    #[contracttype]
+    #[derive(Clone)]
+    pub enum MockTokKey {
+        Balance(Address),
+    }
+
+    #[contract]
+    pub struct MockToken;
+
+    #[contractimpl]
+    impl MockToken {
+        pub fn mint(env: Env, to: Address, amount: i128) {
+            let bal: i128 = env
+                .storage()
+                .persistent()
+                .get(&MockTokKey::Balance(to.clone()))
+                .unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&MockTokKey::Balance(to), &(bal + amount));
+        }
+        pub fn balance(env: Env, id: Address) -> i128 {
+            env.storage()
+                .persistent()
+                .get(&MockTokKey::Balance(id))
+                .unwrap_or(0)
+        }
+        pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+            from.require_auth();
+            let from_bal = Self::balance(env.clone(), from.clone());
+            assert!(from_bal >= amount, "Insufficient balance");
+            let to_bal = Self::balance(env.clone(), to.clone());
+            env.storage()
+                .persistent()
+                .set(&MockTokKey::Balance(from), &(from_bal - amount));
+            env.storage()
+                .persistent()
+                .set(&MockTokKey::Balance(to), &(to_bal + amount));
+        }
+    }
+
+    // --- Mock CreditScore contract with a configurable global score ---
+    #[contract]
+    pub struct MockCreditScore;
+
+    #[contractimpl]
+    impl MockCreditScore {
+        pub fn set_score(env: Env, score: u32) {
+            env.storage().instance().set(&symbol_short!("score"), &score);
+        }
+        pub fn get_score(env: Env, _address: Address) -> u32 {
+            env.storage()
+                .instance()
+                .get(&symbol_short!("score"))
+                .unwrap_or(0u32)
+        }
+    }
+
+    struct Fixture {
+        env: Env,
+        admin: Address,
+        pool: LendingPoolClient<'static>,
+        score: MockCreditScoreClient<'static>,
+    }
+
+    fn setup() -> Fixture {
         let env = Env::default();
         env.mock_all_auths();
 
-        let contract_id = env.register_contract(None, LendingPool);
-        let client = LendingPoolClient::new(&env, &contract_id);
-
         let admin = Address::generate(&env);
-        let credit_score = Address::generate(&env);
 
-        let token_id = env.register_stellar_asset_contract_v2(admin.clone());
-        let usdc_address = token_id.address();
-        let usdc = soroban_sdk::token::Client::new(&env, &usdc_address);
-        let usdc_admin = StellarAssetClient::new(&env, &usdc_address);
+        let token_id = env.register_contract(None, MockToken);
+        let token = MockTokenClient::new(&env, &token_id);
 
-        client.initialize(&admin, &usdc_address, &credit_score);
+        let score_id = env.register_contract(None, MockCreditScore);
+        let score = MockCreditScoreClient::new(&env, &score_id);
 
-        // Fund the pool with liquidity via a lender deposit.
+        let pool_id = env.register_contract(None, LendingPool);
+        let pool = LendingPoolClient::new(&env, &pool_id);
+        pool.initialize(&admin, &token_id, &score_id);
+
+        // Seed the pool with liquidity from a lender.
         let lender = Address::generate(&env);
-        usdc_admin.mint(&lender, &10_000);
-        client.deposit(&lender, &10_000);
+        token.mint(&lender, &1_000_000);
+        pool.deposit(&lender, &1_000_000);
 
-        (env, client, admin, usdc_address, usdc)
+        Fixture { env, admin, pool, score }
     }
 
-    fn open_defaulted_loan(env: &Env, client: &LendingPoolClient, usdc_admin: &StellarAssetClient) -> Address {
-        let borrower = Address::generate(env);
-        usdc_admin.mint(&borrower, &1_000); // enough to fully repay if it wanted to
-        client.borrow(&borrower, &1_000i128, &symbol_short!("sess1"));
-
-        // Advance past the 30-day liquidation window.
-        env.ledger().with_mut(|li| {
-            li.timestamp += 30 * 86_400 + 1;
-        });
-
-        borrower
+    /// Attempt a borrow with a fresh borrower at the given credit score,
+    /// asserting it is rejected with `LowCreditScore`.
+    fn assert_borrow_rejected(f: &Fixture, score: u32) {
+        f.score.set_score(&score);
+        let borrower = Address::generate(&f.env);
+        let result = f.pool.try_borrow(&borrower, &1_000, &symbol_short!("s1"));
+        assert_eq!(result, Err(Ok(Error::LowCreditScore)));
     }
 
-    #[test]
-    fn test_anyone_can_start_auction_after_due() {
-        let (env, client, admin, usdc_address, _usdc) = setup();
-        let usdc_admin = StellarAssetClient::new(&env, &usdc_address);
-        let borrower = open_defaulted_loan(&env, &client, &usdc_admin);
-        let _ = admin; // admin not required to start the auction
-
-        // A random third party (not admin) can start liquidation.
-        let anyone = Address::generate(&env);
-        let _ = anyone;
-        client.start_liquidation_auction(&borrower);
-
-        let discount = client.get_auction_discount(&borrower);
-        assert_eq!(discount, 0);
+    /// Attempt a borrow with a fresh borrower at the given credit score,
+    /// asserting it succeeds.
+    fn assert_borrow_ok(f: &Fixture, score: u32) {
+        f.score.set_score(&score);
+        let borrower = Address::generate(&f.env);
+        let result = f.pool.try_borrow(&borrower, &1_000, &symbol_short!("s1"));
+        assert_eq!(result, Ok(Ok(())));
     }
 
     #[test]
-    fn test_auction_cannot_start_before_due() {
-        let (env, client, _admin, usdc_address, _usdc) = setup();
-        let usdc_admin = StellarAssetClient::new(&env, &usdc_address);
-
-        let borrower = Address::generate(&env);
-        usdc_admin.mint(&borrower, &1_000);
-        client.borrow(&borrower, &1_000i128, &symbol_short!("sess1"));
-
-        // Loan not yet due.
-        let result = client.try_start_liquidation_auction(&borrower);
-        assert_eq!(result, Err(Ok(Error::LoanNotDue)));
+    fn test_default_min_credit_score_is_600() {
+        let f = setup();
+        assert_eq!(f.pool.get_min_credit_score(), 600);
     }
 
     #[test]
-    fn test_discount_grows_linearly_over_24h() {
-        let (env, client, _admin, usdc_address, _usdc) = setup();
-        let usdc_admin = StellarAssetClient::new(&env, &usdc_address);
-        let borrower = open_defaulted_loan(&env, &client, &usdc_admin);
-
-        client.start_liquidation_auction(&borrower);
-        assert_eq!(client.get_auction_discount(&borrower), 0);
-
-        // Halfway through the 24h window: ~10% discount.
-        env.ledger().with_mut(|li| li.timestamp += 12 * 60 * 60);
-        let mid_discount = client.get_auction_discount(&borrower);
-        assert_eq!(mid_discount, 1_000);
-
-        // Past the full window: capped at 20%.
-        env.ledger().with_mut(|li| li.timestamp += 12 * 60 * 60 + 1);
-        let final_discount = client.get_auction_discount(&borrower);
-        assert_eq!(final_discount, MAX_AUCTION_DISCOUNT_BPS);
+    fn test_borrow_below_min_score_rejected() {
+        let f = setup();
+        assert_borrow_rejected(&f, 599); // 599 < 600
     }
 
     #[test]
-    fn test_execute_liquidation_restores_liquidity_and_pays_liquidator_profit() {
-        let (env, client, _admin, usdc_address, usdc) = setup();
-        let usdc_admin = StellarAssetClient::new(&env, &usdc_address);
-        let borrower = open_defaulted_loan(&env, &client, &usdc_admin);
-
-        client.start_liquidation_auction(&borrower);
-
-        // Jump to the 12h mark: 10% discount.
-        env.ledger().with_mut(|li| li.timestamp += 12 * 60 * 60);
-
-        let loan = client.get_loan(&borrower);
-        let total_owed = loan.amount + loan.fee;
-
-        let liquidator = Address::generate(&env);
-        usdc_admin.mint(&liquidator, &total_owed);
-
-        let liquidity_before = client.total_liquidity();
-
-        client.execute_liquidation(&liquidator, &borrower);
-
-        let discount_amount = total_owed * 1_000 / 10_000;
-        let payment = total_owed - discount_amount;
-
-        assert_eq!(usdc.balance(&liquidator), total_owed - payment);
-        assert_eq!(client.total_liquidity(), liquidity_before + payment);
-
-        let updated_loan = client.get_loan(&borrower);
-        assert!(updated_loan.repaid);
-
-        // Auction settled — cannot execute twice.
-        let result = client.try_execute_liquidation(&liquidator, &borrower);
-        assert_eq!(result, Err(Ok(Error::AuctionNotFound)));
+    fn test_borrow_at_min_score_allowed() {
+        let f = setup();
+        assert_borrow_ok(&f, 600); // 600 == 600
     }
 
     #[test]
-    fn test_force_liquidate_writes_bad_debt_without_restoring_liquidity() {
-        let (env, client, admin, usdc_address, _usdc) = setup();
-        let usdc_admin = StellarAssetClient::new(&env, &usdc_address);
-        let borrower = open_defaulted_loan(&env, &client, &usdc_admin);
-
-        let liquidity_before = client.total_liquidity();
-        assert_eq!(client.get_bad_debt(), 0);
-
-        let loan = client.get_loan(&borrower);
-        let total_owed = loan.amount + loan.fee;
-
-        client.force_liquidate(&admin, &borrower);
-
-        assert_eq!(client.get_bad_debt(), total_owed);
-        // Liquidity is not restored by an emergency write-off.
-        assert_eq!(client.total_liquidity(), liquidity_before);
-
-        let updated_loan = client.get_loan(&borrower);
-        assert!(updated_loan.repaid);
+    fn test_borrow_above_min_score_allowed() {
+        let f = setup();
+        assert_borrow_ok(&f, 601); // 601 > 600
     }
 
     #[test]
-    fn test_force_liquidate_requires_admin() {
-        let (env, client, _admin, usdc_address, _usdc) = setup();
-        let usdc_admin = StellarAssetClient::new(&env, &usdc_address);
-        let borrower = open_defaulted_loan(&env, &client, &usdc_admin);
-
-        let not_admin = Address::generate(&env);
-        let result = client.try_force_liquidate(&not_admin, &borrower);
-        assert_eq!(result, Err(Ok(Error::NotAdmin)));
-    }
-
-    /// Property: pool liquidity never goes negative across a sequence of
-    /// liquidations with varying discount timing.
-    #[test]
-    fn test_pool_liquidity_never_negative_after_liquidations() {
-        for discount_wait_secs in [0u64, 6 * 3600, 12 * 3600, 24 * 3600, 48 * 3600] {
-            let (env, client, _admin, usdc_address, _usdc) = setup();
-            let usdc_admin = StellarAssetClient::new(&env, &usdc_address);
-            let borrower = open_defaulted_loan(&env, &client, &usdc_admin);
-
-            client.start_liquidation_auction(&borrower);
-            env.ledger().with_mut(|li| li.timestamp += discount_wait_secs);
-
-            let loan = client.get_loan(&borrower);
-            let total_owed = loan.amount + loan.fee;
-            let liquidator = Address::generate(&env);
-            usdc_admin.mint(&liquidator, &total_owed);
-
-            client.execute_liquidation(&liquidator, &borrower);
-
-            assert!(
-                client.total_liquidity() >= 0,
-                "liquidity went negative at wait={}s",
-                discount_wait_secs
-            );
-        }
+    fn test_set_min_credit_score_changes_gate() {
+        let f = setup();
+        f.pool.set_min_credit_score(&f.admin, &700);
+        assert_eq!(f.pool.get_min_credit_score(), 700);
+        // 650 now fails against the raised minimum.
+        assert_borrow_rejected(&f, 650);
+        // 700 passes.
+        assert_borrow_ok(&f, 700);
     }
 }

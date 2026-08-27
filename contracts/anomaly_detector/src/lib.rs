@@ -62,28 +62,42 @@ pub struct UserMetrics {
 }
 
 // ---------------------------------------------------------------------------
+// Configurable thresholds
+// ---------------------------------------------------------------------------
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnomalyConfig {
+    pub escrow_warn_per_hour:  u32,
+    pub dispute_hold_per_day:  u32,
+    pub volume_hold_per_hour:  i128,
+}
+
+// ---------------------------------------------------------------------------
 // Storage Keys
 // ---------------------------------------------------------------------------
 
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     Admin,
+    Config,
     Metrics(Address),
     Hold(Address),
 }
 
 // ---------------------------------------------------------------------------
-// Thresholds
+// Constants
 // ---------------------------------------------------------------------------
-
-const ESCROW_WARN_PER_HOUR:   u32  = 10;
-const DISPUTE_HOLD_PER_DAY:   u32  = 3;
-/// $50k in micro-units (assuming 6 decimals like USDC: 50_000 * 1_000_000)
-const VOLUME_HOLD_PER_HOUR:   i128 = 50_000 * 1_000_000;
 
 const ONE_HOUR_SECS:  u64 = 3_600;
 const ONE_DAY_SECS:   u64 = 86_400;
+
+const DEFAULT_ESCROW_WARN_PER_HOUR:  u32  = 10;
+const DEFAULT_DISPUTE_HOLD_PER_DAY:  u32  = 3;
+const DEFAULT_VOLUME_HOLD_PER_HOUR:  i128 = 50_000 * 1_000_000;
 
 // ---------------------------------------------------------------------------
 // Contract
@@ -94,13 +108,44 @@ pub struct AnomalyDetectorContract;
 
 #[contractimpl]
 impl AnomalyDetectorContract {
-    /// Initialize with an admin address.
+    /// Initialize with an admin address and default thresholds.
     pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        // Store default thresholds in instance storage
+        let config = AnomalyConfig {
+            escrow_warn_per_hour: DEFAULT_ESCROW_WARN_PER_HOUR,
+            dispute_hold_per_day: DEFAULT_DISPUTE_HOLD_PER_DAY,
+            volume_hold_per_hour: DEFAULT_VOLUME_HOLD_PER_HOUR,
+        };
+        env.storage().instance().set(&DataKey::Config, &config);
         Ok(())
+    }
+
+    /// Admin updates thresholds atomically.
+    pub fn set_thresholds(env: Env, admin: Address, config: AnomalyConfig) -> Result<(), Error> {
+        Self::assert_initialized(&env)?;
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        if admin != stored_admin {
+            return Err(Error::NotAdmin);
+        }
+        env.storage().instance().set(&DataKey::Config, &config);
+        Ok(())
+    }
+
+    /// Returns the current threshold configuration.
+    pub fn get_thresholds(env: Env) -> AnomalyConfig {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config)
+            .unwrap_or(AnomalyConfig {
+                escrow_warn_per_hour: DEFAULT_ESCROW_WARN_PER_HOUR,
+                dispute_hold_per_day: DEFAULT_DISPUTE_HOLD_PER_DAY,
+                volume_hold_per_hour: DEFAULT_VOLUME_HOLD_PER_HOUR,
+            })
     }
 
     /// Check an action for anomalies and update metrics.
@@ -119,6 +164,12 @@ impl AnomalyDetectorContract {
             return Ok(AnomalyResult::Hold);
         }
 
+        let config: AnomalyConfig = env.storage().instance().get(&DataKey::Config).unwrap_or(AnomalyConfig {
+            escrow_warn_per_hour: DEFAULT_ESCROW_WARN_PER_HOUR,
+            dispute_hold_per_day: DEFAULT_DISPUTE_HOLD_PER_DAY,
+            volume_hold_per_hour: DEFAULT_VOLUME_HOLD_PER_HOUR,
+        });
+
         let now = env.ledger().timestamp();
         let mut metrics = Self::get_or_default_metrics(&env, &user, now);
         let mut result = AnomalyResult::Clear;
@@ -132,7 +183,7 @@ impl AnomalyDetectorContract {
                 }
                 metrics.escrows_created_1h = metrics.escrows_created_1h.saturating_add(1);
 
-                if metrics.escrows_created_1h > ESCROW_WARN_PER_HOUR {
+                if metrics.escrows_created_1h > config.escrow_warn_per_hour {
                     result = AnomalyResult::Warning;
                 }
             }
@@ -143,7 +194,7 @@ impl AnomalyDetectorContract {
                 }
                 metrics.disputes_opened_24h = metrics.disputes_opened_24h.saturating_add(1);
 
-                if metrics.disputes_opened_24h > DISPUTE_HOLD_PER_DAY {
+                if metrics.disputes_opened_24h > config.dispute_hold_per_day {
                     result = AnomalyResult::Hold;
                 }
             }
@@ -154,7 +205,7 @@ impl AnomalyDetectorContract {
                 }
                 metrics.volume_1h = metrics.volume_1h.saturating_add(amount);
 
-                if metrics.volume_1h > VOLUME_HOLD_PER_HOUR {
+                if metrics.volume_1h > config.volume_hold_per_hour {
                     result = AnomalyResult::Hold;
                 }
             }
@@ -307,7 +358,7 @@ mod tests {
         // $50k + 1 triggers Hold
         let result = f
             .client()
-            .check_anomaly(&f.user, &AnomalyAction::LargeTransfer, &(VOLUME_HOLD_PER_HOUR + 1));
+            .check_anomaly(&f.user, &AnomalyAction::LargeTransfer, &(DEFAULT_VOLUME_HOLD_PER_HOUR + 1));
         assert_eq!(result, AnomalyResult::Hold);
         assert!(f.client().is_on_hold(&f.user));
     }
@@ -331,7 +382,7 @@ mod tests {
         let f = Fixture::setup();
         // Place hold
         f.client()
-            .check_anomaly(&f.user, &AnomalyAction::LargeTransfer, &(VOLUME_HOLD_PER_HOUR + 1));
+            .check_anomaly(&f.user, &AnomalyAction::LargeTransfer, &(DEFAULT_VOLUME_HOLD_PER_HOUR + 1));
         assert!(f.client().is_on_hold(&f.user));
 
         // Admin clears
@@ -364,7 +415,27 @@ mod tests {
         // Trigger a hold — just verify no panic
         let result = f
             .client()
-            .check_anomaly(&f.user, &AnomalyAction::LargeTransfer, &(VOLUME_HOLD_PER_HOUR + 1));
+            .check_anomaly(&f.user, &AnomalyAction::LargeTransfer, &(DEFAULT_VOLUME_HOLD_PER_HOUR + 1));
         assert_eq!(result, AnomalyResult::Hold);
+    }
+
+    #[test]
+    fn test_set_thresholds_and_verify_updated() {
+        let f = Fixture::setup();
+        // Lower threshold to 2 escrows/hour
+        let new_config = AnomalyConfig {
+            escrow_warn_per_hour: 2,
+            dispute_hold_per_day: DEFAULT_DISPUTE_HOLD_PER_DAY,
+            volume_hold_per_hour: DEFAULT_VOLUME_HOLD_PER_HOUR,
+        };
+        f.client().set_thresholds(&f.admin, &new_config);
+
+        // 3 escrows should now trigger Warning
+        for _ in 0..2 {
+            let r = f.client().check_anomaly(&f.user, &AnomalyAction::CreateEscrow, &0);
+            assert_eq!(r, AnomalyResult::Clear);
+        }
+        let r = f.client().check_anomaly(&f.user, &AnomalyAction::CreateEscrow, &0);
+        assert_eq!(r, AnomalyResult::Warning);
     }
 }

@@ -51,13 +51,26 @@ pub struct ISARecord {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IsaStatus {
+    Active,
+    Completed,
+    Expired,
+    Defaulted,
+}
+
+#[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+    /// Contract-isolated storage namespace root (#826).
+    NamespaceRoot,
     NextIsaId,
     Isa(u32),
     IncomeOracle,
     Admin,
     ProcessedPeriod(u32, u32),
+    IsaStatus(u32),
+    IsaPaymentSchedule(u32),
 }
 
 #[contract]
@@ -82,6 +95,43 @@ impl ISAContract {
         env.storage()
             .instance()
             .set(&DataKey::IncomeOracle, &income_oracle);
+    }
+
+    pub fn check_expiry(env: Env, isa_id: u32) -> bool {
+        let mut isa: ISARecord = match env.storage().persistent().get(&DataKey::Isa(isa_id)) {
+            Some(record) => record,
+            None => panic!("ISA record not found"),
+        };
+
+        if !isa.active {
+            return false;
+        }
+
+        let now = env.ledger().timestamp();
+        if now >= isa.expires_at {
+            isa.active = false;
+            isa.completion_reason = CompletionReason::DurationExpired;
+            env.storage().persistent().set(&DataKey::Isa(isa_id), &isa);
+            env.storage().persistent().set(&DataKey::IsaStatus(isa_id), &IsaStatus::Expired);
+            return true;
+        }
+        false
+    }
+
+    pub fn get_remaining_obligation(env: Env, isa_id: u32) -> i128 {
+        let isa: ISARecord = match env.storage().persistent().get(&DataKey::Isa(isa_id)) {
+            Some(record) => record,
+            None => return 0,
+        };
+
+        if !isa.active || isa.completion_reason != CompletionReason::None {
+            return 0;
+        }
+
+        let cap_amount = isa.funded_amount
+            .checked_mul(isa.cap_multiple as i128)
+            .expect("cap overflow");
+        cap_amount.saturating_sub(isa.total_shared).max(0)
     }
 
     pub fn create_isa(

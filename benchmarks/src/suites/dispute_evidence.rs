@@ -80,6 +80,10 @@ impl MockEscrow {
     }
 }
 
+fn dummy_hash(env: &Env) -> BytesN<32> {
+    BytesN::from_array(env, &[0xab; 32])
+}
+
 // ---------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------
@@ -150,8 +154,8 @@ pub fn run() -> Vec<BenchResult> {
             f.client().submit_evidence(
                 &2u64,
                 &f.mentor,
-                &BytesN::from_array(&f.env, &[0u8; 32]),
-                &BytesN::from_array(&f.env, &[1u8; 32]),
+                &dummy_hash(&f.env),
+                &dummy_hash(&f.env),
                 &None,
             );
         });
@@ -173,8 +177,8 @@ pub fn run() -> Vec<BenchResult> {
         f.client().submit_evidence(
             &3u64,
             &f.mentor,
-            &BytesN::from_array(&f.env, &[2u8; 32]),
-            &BytesN::from_array(&f.env, &[3u8; 32]),
+            &dummy_hash(&f.env),
+            &dummy_hash(&f.env),
             &None,
         );
         
@@ -185,6 +189,7 @@ pub fn run() -> Vec<BenchResult> {
             f.client().submit_resolution(
                 &3u64,
                 &f.arbitrator,
+                &false,
                 &true,
                 &Symbol::new(&f.env, "resolved"),
             );
