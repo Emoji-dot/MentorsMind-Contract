@@ -164,7 +164,7 @@ fn referral_reward_consistent_with_escrow_fee() {
 
 // ─── Dynamic fee tiers (escrow) ───────────────────────────────────────────────
 
-/// Mirror of `_calculate_fee_from_price` in escrow/src/lib.rs.
+/// Mirror of `_legacy_fee_from_price` in escrow/src/lib.rs (used when no graduated FeeSchedule is configured).
 fn dynamic_fee_from_price(price: i128) -> u32 {
     if price <= 0 { return 500; }
     let t010 = 1_000_000_i128;

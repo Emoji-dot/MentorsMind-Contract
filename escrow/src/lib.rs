@@ -271,6 +271,14 @@ pub struct FeeAppliedEventData {
     pub fee_amount: i128,
 }
 
+/// Event data emitted when the graduated fee schedule is updated.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeScheduleUpdatedEventData {
+    pub old_schedule: Option<FeeSchedule>,
+    pub new_schedule: FeeSchedule,
+}
+
 /// Cross-contract view of the staking contract used to read a mentor's tier.
 #[soroban_sdk::contractclient(name = "StakingClient")]
 pub trait StakingTierTrait {
@@ -741,9 +749,12 @@ impl EscrowContract {
     }
 
     /// Get dynamic fee based on MNT/USDC price from liquidity pool.
-    /// Returns fee in basis points (bps).
     ///
-    /// Fee schedule:
+    /// When a graduated `FeeSchedule` is configured, returns the tier-0 base
+    /// rate adjusted by the dynamic price multiplier (compatible with legacy
+    /// callers that expect a single flat bps value).  When no schedule is set,
+    /// falls back to the historical hardcoded price tiers for backward
+    /// compatibility:
     /// - Price < $0.10 → 500 bps (5%)
     /// - Price $0.10–$0.50 → 400 bps (4%)
     /// - Price $0.50–$1.00 → 300 bps (3%)
@@ -766,21 +777,60 @@ impl EscrowContract {
             .get(&PRICE_CACHE_TIME)
             .unwrap_or(0);
 
-        if cached_ledger == current_ledger {
-            if let Some(cached_price) = env.storage().instance().get::<_, i128>(&PRICE_CACHE) {
-                return Self::_calculate_fee_from_price(cached_price);
+        let price = if cached_ledger == current_ledger {
+            env.storage().instance().get::<_, i128>(&PRICE_CACHE).unwrap_or(0)
+        } else {
+            let p = Self::_fetch_mnt_usdc_price(&env);
+            env.storage().instance().set(&PRICE_CACHE, &p);
+            env.storage().instance().set(&PRICE_CACHE_TIME, &current_ledger);
+            p
+        };
+
+        match env.storage().persistent().get::<_, FeeSchedule>(&DataKey::FeeSchedule) {
+            Some(schedule) => {
+                let multiplier = Self::_price_multiplier_bps(price);
+                schedule
+                    .tier0_bps
+                    .safe_mul(&env, multiplier as i128)
+                    .safe_div(&env, 10_000) as u32
             }
+            None => Self::_legacy_fee_from_price(price),
         }
-
-        let price = Self::_fetch_mnt_usdc_price(&env);
-
-        env.storage().instance().set(&PRICE_CACHE, &price);
-        env.storage().instance().set(&PRICE_CACHE_TIME, &current_ledger);
-
-        Self::_calculate_fee_from_price(price)
     }
 
-    fn _calculate_fee_from_price(price: i128) -> u32 {
+    /// Returns the price-tier multiplier in basis points applied on top of
+    /// graduated FeeSchedule rates.  A low MNT price raises the multiplier
+    /// (higher fees to compensate for token depreciation); a high MNT price
+    /// lowers it (fees become cheaper as the token appreciates).
+    ///
+    /// Multiplier schedule:
+    /// - Price < $0.10 → 125% (12_500 bps)
+    /// - Price $0.10–$0.50 → 110% (11_000 bps)
+    /// - Price $0.50–$1.00 → 100% (10_000 bps, neutral)
+    /// - Price > $1.00 → 90%  ( 9_000 bps)
+    fn _price_multiplier_bps(price: i128) -> u32 {
+        if price <= 0 {
+            return 10_000;
+        }
+
+        let threshold_010 = 1_000_000;
+        let threshold_050 = 5_000_000;
+        let threshold_100 = 10_000_000;
+
+        if price < threshold_010 {
+            12_500
+        } else if price < threshold_050 {
+            11_000
+        } else if price < threshold_100 {
+            10_000
+        } else {
+            9_000
+        }
+    }
+
+    /// Legacy hardcoded flat-fee price tiers preserved for backward
+    /// compatibility when no graduated FeeSchedule is configured.
+    fn _legacy_fee_from_price(price: i128) -> u32 {
         if price <= 0 {
             return DEFAULT_FEE_BPS;
         }
@@ -895,6 +945,9 @@ impl EscrowContract {
 
     /// Set the graduated fee schedule (admin only). Once set, releases use the
     /// tier-based rates instead of the flat `FeeBps`.
+    ///
+    /// Emits a `FeeScheduleUpdated` event so off-chain indexers can track
+    /// schedule changes.
     pub fn set_fee_schedule(env: Env, admin: Address, schedule: FeeSchedule) {
         let stored_admin: Address = env
             .storage()
@@ -909,7 +962,99 @@ impl EscrowContract {
             panic!("Caller not authorized");
         }
 
-        // Each tier rate is capped at the same maximum as the flat fee.
+        Self::_validate_fee_schedule(&schedule);
+
+        let old_schedule = env.storage().persistent().get::<_, FeeSchedule>(&DataKey::FeeSchedule);
+
+        env.storage().persistent().set(&DataKey::FeeSchedule, &schedule);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::FeeSchedule, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+
+        env.events().publish(
+            (Symbol::new(&env, "Escrow"), Symbol::new(&env, "FeeScheduleUpdated")),
+            FeeScheduleUpdatedEventData {
+                old_schedule,
+                new_schedule: schedule,
+            },
+        );
+    }
+
+    /// Update individual fields of the existing graduated fee schedule (admin
+    /// only).  Pass `None` for any field you want to leave unchanged.  This
+    /// avoids requiring callers to re-send the entire schedule for a single
+    /// parameter tweak.
+    ///
+    /// Panics if no schedule exists yet — use `set_fee_schedule` first.
+    pub fn update_fee_schedule(
+        env: Env,
+        admin: Address,
+        tier0_bps: Option<u32>,
+        tier1_bps: Option<u32>,
+        tier2_bps: Option<u32>,
+        tier3_bps: Option<u32>,
+        volume_discount_threshold: Option<i128>,
+        volume_discount_bps: Option<u32>,
+    ) {
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Admin, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("Caller not authorized");
+        }
+
+        let mut schedule: FeeSchedule = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FeeSchedule)
+            .expect("No fee schedule set; call set_fee_schedule first");
+
+        let old_schedule = schedule.clone();
+
+        if let Some(v) = tier0_bps {
+            schedule.tier0_bps = v;
+        }
+        if let Some(v) = tier1_bps {
+            schedule.tier1_bps = v;
+        }
+        if let Some(v) = tier2_bps {
+            schedule.tier2_bps = v;
+        }
+        if let Some(v) = tier3_bps {
+            schedule.tier3_bps = v;
+        }
+        if let Some(v) = volume_discount_threshold {
+            schedule.volume_discount_threshold = v;
+        }
+        if let Some(v) = volume_discount_bps {
+            schedule.volume_discount_bps = v;
+        }
+
+        Self::_validate_fee_schedule(&schedule);
+
+        env.storage().persistent().set(&DataKey::FeeSchedule, &schedule);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::FeeSchedule, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+
+        env.events().publish(
+            (Symbol::new(&env, "Escrow"), Symbol::new(&env, "FeeScheduleUpdated")),
+            FeeScheduleUpdatedEventData {
+                old_schedule: Some(old_schedule),
+                new_schedule: schedule,
+            },
+        );
+    }
+
+    /// Validate that all fee-schedule parameters respect the configured
+    /// economic bounds (`MAX_FEE_BPS` ceiling, non-negative discount, etc.).
+    fn _validate_fee_schedule(schedule: &FeeSchedule) {
         if schedule.tier0_bps > MAX_FEE_BPS
             || schedule.tier1_bps > MAX_FEE_BPS
             || schedule.tier2_bps > MAX_FEE_BPS
@@ -917,11 +1062,12 @@ impl EscrowContract {
         {
             panic!("Fee exceeds maximum (1000 bps)");
         }
-
-        env.storage().persistent().set(&DataKey::FeeSchedule, &schedule);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::FeeSchedule, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        if schedule.volume_discount_bps > MAX_FEE_BPS {
+            panic!("Volume discount exceeds maximum (1000 bps)");
+        }
+        if schedule.volume_discount_threshold < 0 {
+            panic!("Volume discount threshold must be non-negative");
+        }
     }
 
     /// Get the current fee schedule, if one has been set.
@@ -1065,9 +1211,12 @@ impl EscrowContract {
     /// Compute the graduated platform fee for `mentor` on a session worth
     /// `amount`, returning `(fee, tier, base_bps, effective_bps)`.
     ///
-    /// The mentor's tier selects the base rate; a session whose value exceeds
-    /// the schedule's `volume_discount_threshold` receives an additional
-    /// `volume_discount_bps` reduction (never below zero).
+    /// The mentor's tier selects the base rate.  When dynamic pricing is
+    /// enabled, the MNT/USDC price applies a multiplier on top of the tier
+    /// rate.  Finally, a session whose value exceeds the schedule's
+    /// `volume_discount_threshold` receives an additional
+    /// `volume_discount_bps` reduction (never below zero, capped at
+    /// `MAX_FEE_BPS`).
     fn _compute_fee_with_meta(
         env: &Env,
         schedule: &FeeSchedule,
@@ -1075,15 +1224,76 @@ impl EscrowContract {
         amount: i128,
     ) -> (i128, u32, u32, u32) {
         let tier = Self::_mentor_tier(env, mentor);
-        let base_bps = Self::_tier_bps(schedule, tier);
-        let effective_bps = if amount > schedule.volume_discount_threshold {
+        let tier_base = Self::_tier_bps(schedule, tier);
+
+        let dynamic_enabled: bool = env
+            .storage()
+            .instance()
+            .get(&DYNAMIC_FEE_ENABLED)
+            .unwrap_or(true);
+
+        let base_bps = if dynamic_enabled {
+            let current_ledger = env.ledger().sequence();
+            let cached_ledger: u32 = env
+                .storage()
+                .instance()
+                .get(&PRICE_CACHE_TIME)
+                .unwrap_or(0);
+
+            let price = if cached_ledger == current_ledger {
+                env.storage().instance().get::<_, i128>(&PRICE_CACHE).unwrap_or(0)
+            } else {
+                let p = Self::_fetch_mnt_usdc_price(env);
+                env.storage().instance().set(&PRICE_CACHE, &p);
+                env.storage().instance().set(&PRICE_CACHE_TIME, &current_ledger);
+                p
+            };
+
+            let multiplier = Self::_price_multiplier_bps(price);
+            let scaled = tier_base
+                .safe_mul(env, multiplier as i128)
+                .safe_div(env, 10_000) as u32;
+            scaled.min(MAX_FEE_BPS)
+        } else {
+            tier_base
+        };
+
+        let discounted = if amount > schedule.volume_discount_threshold {
             base_bps.saturating_sub(schedule.volume_discount_bps)
         } else {
             base_bps
         };
+        let effective_bps = discounted.min(MAX_FEE_BPS);
+
         let fee = amount
             .safe_mul(&env, effective_bps as i128)
             .safe_div(&env, 10_000);
+        (fee, tier, base_bps, effective_bps)
+    }
+
+    /// Test-only pure-arithmetic version of `_compute_fee_with_meta` that
+    /// bypasses the `Env`-dependent dynamic-pricing cache and staking-tier
+    /// cross-call.  Accepts a literal tier instead of looking it up.  Used by
+    /// unit tests to verify the tier-mapping + volume-discount math in
+    /// isolation without a full `TestFixture`.
+    #[cfg(test)]
+    fn _compute_fee_with_meta_no_dynamic(
+        schedule: &FeeSchedule,
+        tier: u32,
+        amount: i128,
+    ) -> (i128, u32, u32, u32) {
+        let tier_base = Self::_tier_bps(schedule, tier);
+        let base_bps = tier_base;
+        let discounted = if amount > schedule.volume_discount_threshold {
+            base_bps.saturating_sub(schedule.volume_discount_bps)
+        } else {
+            base_bps
+        };
+        let effective_bps = discounted.min(MAX_FEE_BPS);
+        let fee = amount
+            .checked_mul(effective_bps as i128)
+            .and_then(|v| v.checked_div(10_000))
+            .expect("fee arithmetic overflow in test helper");
         (fee, tier, base_bps, effective_bps)
     }
 
@@ -1091,14 +1301,34 @@ impl EscrowContract {
     ///
     /// Falls back to the flat `FeeBps` rate when no fee schedule is configured.
     pub fn compute_platform_fee(env: Env, mentor: Address, amount: i128) -> i128 {
+        Self::_compute_fee_unified(&env, &mentor, amount).0
+    }
+
+    /// Unified fee computation used by all release paths.
+    ///
+    /// Resolves the effective rate using either the graduated FeeSchedule
+    /// (with staking-tier + volume discount) or the legacy flat FeeBps.
+    ///
+    /// Returns `(platform_fee, Option<(tier, base_bps, effective_bps)>)` —
+    /// the meta tuple is `Some` only when the graduated schedule was used,
+    /// allowing callers to emit `FeeApplied` events consistently.
+    fn _compute_fee_unified(
+        env: &Env,
+        mentor: &Address,
+        amount: i128,
+    ) -> (i128, Option<(u32, u32, u32)>) {
         match env
             .storage()
             .persistent()
             .get::<_, FeeSchedule>(&DataKey::FeeSchedule)
         {
             Some(schedule) => {
-                let (fee, _, _, _) = Self::_compute_fee_with_meta(&env, &schedule, &mentor, amount);
-                fee
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&DataKey::FeeSchedule, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+                let (fee, tier, base_bps, effective_bps) =
+                    Self::_compute_fee_with_meta(env, &schedule, mentor, amount);
+                (fee, Some((tier, base_bps, effective_bps)))
             }
             None => {
                 let fee_bps: u32 = env
@@ -1106,9 +1336,13 @@ impl EscrowContract {
                     .persistent()
                     .get(&DataKey::FeeBps)
                     .unwrap_or(DEFAULT_FEE_BPS);
-                amount
-                    .safe_mul(&env, fee_bps as i128)
-                    .safe_div(&env, 10_000)
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&DataKey::FeeBps, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+                let fee = amount
+                    .safe_mul(env, fee_bps as i128)
+                    .safe_div(env, 10_000);
+                (fee, None)
             }
         }
     }
@@ -1244,21 +1478,30 @@ impl EscrowContract {
                 .safe_div(&env, escrow.total_sessions as i128)
         };
 
-        let fee_bps: u32 = env.storage().persistent().get(&DataKey::FeeBps).unwrap_or(0u32);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::FeeBps, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-
-        let platform_fee: i128 = amount_to_release
-            .safe_mul(&env, fee_bps as i128)
-            .safe_div(&env, 10_000);
+        let (platform_fee, fee_meta) = Self::_compute_fee_unified(&env, &escrow.mentor, amount_to_release);
         let net_amount: i128 = amount_to_release
             .safe_sub(&env, platform_fee);
 
+        let effective_bps = fee_meta
+            .map(|(_, _, ebps)| ebps)
+            .unwrap_or_else(|| env.storage().persistent().get(&DataKey::FeeBps).unwrap_or(0u32));
         env.events().publish(
             (Symbol::new(&env, "Escrow"), Symbol::new(&env, "FeeAudit")),
-            (amount_to_release, fee_bps, platform_fee, net_amount),
+            (amount_to_release, effective_bps, platform_fee, net_amount),
         );
+
+        if let Some((tier, base_bps, effective_bps)) = fee_meta {
+            env.events().publish(
+                (Symbol::new(&env, "Escrow"), Symbol::new(&env, "FeeApplied"), escrow_id),
+                FeeAppliedEventData {
+                    mentor: escrow.mentor.clone(),
+                    tier,
+                    base_bps,
+                    effective_bps,
+                    fee_amount: platform_fee,
+                },
+            );
+        }
 
         let treasury: Address = env
             .storage()
@@ -1348,21 +1591,30 @@ impl EscrowContract {
                 .safe_mul(&env, sessions_to_release as i128)
         };
 
-        let fee_bps: u32 = env.storage().persistent().get(&DataKey::FeeBps).unwrap_or(0u32);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::FeeBps, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-
-        let platform_fee: i128 = amount_to_release
-            .safe_mul(&env, fee_bps as i128)
-            .safe_div(&env, 10_000);
+        let (platform_fee, fee_meta) = Self::_compute_fee_unified(&env, &escrow.mentor, amount_to_release);
         let net_amount: i128 = amount_to_release
             .safe_sub(&env, platform_fee);
 
+        let effective_bps = fee_meta
+            .map(|(_, _, ebps)| ebps)
+            .unwrap_or_else(|| env.storage().persistent().get(&DataKey::FeeBps).unwrap_or(0u32));
         env.events().publish(
             (Symbol::new(&env, "Escrow"), Symbol::new(&env, "FeeAudit")),
-            (amount_to_release, fee_bps, platform_fee, net_amount),
+            (amount_to_release, effective_bps, platform_fee, net_amount),
         );
+
+        if let Some((tier, base_bps, effective_bps)) = fee_meta {
+            env.events().publish(
+                (Symbol::new(&env, "Escrow"), Symbol::new(&env, "FeeApplied"), escrow_id),
+                FeeAppliedEventData {
+                    mentor: escrow.mentor.clone(),
+                    tier,
+                    base_bps,
+                    effective_bps,
+                    fee_amount: platform_fee,
+                },
+            );
+        }
 
         let treasury: Address = env
             .storage()
@@ -2892,20 +3144,35 @@ impl EscrowContract {
         let key = (symbol_short!("ESCROW"), escrow_id);
         let exists = env.storage().persistent().has(&key);
 
-        // release_funds' own reads: escrow, admin, fee_bps, treasury.
+        // release_funds' own reads: escrow, admin, fee config, treasury.
+        // Fee config is either FeeBps or FeeSchedule; both count as one read
+        // plus the staking-contract tier lookup when the schedule is active.
         let mut storage_reads: u32 = 4;
         // _do_release's own write: updated escrow status/amounts.
         let storage_writes: u32 = if exists { 1 } else { 0 };
 
-        let fee_bps: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::FeeBps)
-            .unwrap_or(DEFAULT_FEE_BPS);
+        let has_schedule = env.storage().persistent().has(&DataKey::FeeSchedule);
+        let effective_fee_bps: u32 = if has_schedule {
+            storage_reads += 1;
+            if env.storage().persistent().has(&DataKey::StakingContract) {
+                storage_reads += 1;
+            }
+            if let Some(schedule) = env.storage().persistent().get::<_, FeeSchedule>(&DataKey::FeeSchedule) {
+                schedule.tier0_bps
+            } else {
+                DEFAULT_FEE_BPS
+            }
+        } else {
+            env.storage()
+                .persistent()
+                .get(&DataKey::FeeBps)
+                .unwrap_or(DEFAULT_FEE_BPS)
+        };
+
         // Net-amount transfer to mentor always happens; the platform-fee
         // transfer to treasury is conditional on a non-zero fee.
         let mut cross_contract_calls: u32 = 1;
-        if fee_bps > 0 {
+        if effective_fee_bps > 0 {
             cross_contract_calls += 1;
         }
 
@@ -3299,25 +3566,33 @@ impl EscrowContract {
         milestone_escrow.learner.require_auth();
 
         let milestone = milestone_escrow.milestones.get(milestone_index).unwrap();
-        let fee_bps: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::FeeBps)
-            .unwrap_or(0u32);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::FeeBps, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-
-        let platform_fee: i128 = milestone
-            .amount
-            .safe_mul(&env, fee_bps as i128)
-            .safe_div(&env, 10_000);
+        let (platform_fee, fee_meta) = Self::_compute_fee_unified(
+            &env,
+            &milestone_escrow.mentor,
+            milestone.amount,
+        );
         let net_amount: i128 = milestone.amount.safe_sub(&env, platform_fee);
 
+        let effective_bps = fee_meta
+            .map(|(_, _, ebps)| ebps)
+            .unwrap_or_else(|| env.storage().persistent().get(&DataKey::FeeBps).unwrap_or(0u32));
         env.events().publish(
             (Symbol::new(&env, "Escrow"), Symbol::new(&env, "FeeAudit")),
-            (milestone.amount, fee_bps, platform_fee, net_amount),
+            (milestone.amount, effective_bps, platform_fee, net_amount),
         );
+
+        if let Some((tier, base_bps, effective_bps)) = fee_meta {
+            env.events().publish(
+                (Symbol::new(&env, "Escrow"), Symbol::new(&env, "FeeApplied"), escrow_id),
+                FeeAppliedEventData {
+                    mentor: milestone_escrow.mentor.clone(),
+                    tier,
+                    base_bps,
+                    effective_bps,
+                    fee_amount: platform_fee,
+                },
+            );
+        }
 
         let treasury: Address = env
             .storage()
@@ -3439,35 +3714,7 @@ impl EscrowContract {
     fn _do_release(env: &Env, escrow: &mut Escrow, key: &(Symbol, u64), actor: &Address) {
         let release_amount = escrow.amount;
 
-        // Prefer the graduated fee schedule (Issue #676) when configured;
-        // otherwise fall back to the flat FeeBps rate for backward compat.
-        let platform_fee: i128;
-        let mut fee_meta: Option<(u32, u32, u32)> = None; // (tier, base_bps, effective_bps)
-        if let Some(schedule) = env
-            .storage()
-            .persistent()
-            .get::<_, FeeSchedule>(&DataKey::FeeSchedule)
-        {
-            env.storage()
-                .persistent()
-                .extend_ttl(&DataKey::FeeSchedule, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-            let (fee, tier, base_bps, effective_bps) =
-                Self::_compute_fee_with_meta(env, &schedule, &escrow.mentor, release_amount);
-            platform_fee = fee;
-            fee_meta = Some((tier, base_bps, effective_bps));
-        } else {
-            let fee_bps: u32 = env
-                .storage()
-                .persistent()
-                .get(&DataKey::FeeBps)
-                .unwrap_or(DEFAULT_FEE_BPS);
-            env.storage()
-                .persistent()
-                .extend_ttl(&DataKey::FeeBps, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
-            platform_fee = release_amount
-                .safe_mul(&env, fee_bps as i128)
-                .safe_div(&env, 10_000);
-        }
+        let (platform_fee, fee_meta) = Self::_compute_fee_unified(env, &escrow.mentor, release_amount);
 
         let net_amount: i128 = release_amount
             .safe_sub(&env, platform_fee);
@@ -5157,37 +5404,192 @@ mod test {
     }
 
     // -----------------------------------------------------------------------
-    // Dynamic fee tests
+    // Dynamic fee tests (legacy flat tiers)
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_dynamic_fee_price_below_10_cents() {
-        let fee = EscrowContract::_calculate_fee_from_price(500_000);
+        let fee = EscrowContract::_legacy_fee_from_price(500_000);
         assert_eq!(fee, 500);
     }
 
     #[test]
     fn test_dynamic_fee_price_10_to_50_cents() {
-        let fee = EscrowContract::_calculate_fee_from_price(3_000_000);
+        let fee = EscrowContract::_legacy_fee_from_price(3_000_000);
         assert_eq!(fee, 400);
     }
 
     #[test]
     fn test_dynamic_fee_price_50_to_100_cents() {
-        let fee = EscrowContract::_calculate_fee_from_price(7_500_000);
+        let fee = EscrowContract::_legacy_fee_from_price(7_500_000);
         assert_eq!(fee, 300);
     }
 
     #[test]
     fn test_dynamic_fee_price_above_100_cents() {
-        let fee = EscrowContract::_calculate_fee_from_price(15_000_000);
+        let fee = EscrowContract::_legacy_fee_from_price(15_000_000);
         assert_eq!(fee, 200);
     }
 
     #[test]
     fn test_dynamic_fee_fallback_when_price_zero() {
-        let fee = EscrowContract::_calculate_fee_from_price(0);
+        let fee = EscrowContract::_legacy_fee_from_price(0);
         assert_eq!(fee, 500);
+    }
+
+    // -----------------------------------------------------------------------
+    // Graduated price-multiplier tests (FeeSchedule integration)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_price_multiplier_low_price_penalizes() {
+        let mult = EscrowContract::_price_multiplier_bps(500_000); // < $0.10
+        assert_eq!(mult, 12_500); // 125% of base tier rate
+    }
+
+    #[test]
+    fn test_price_multiplier_mid_low_slight_penalty() {
+        let mult = EscrowContract::_price_multiplier_bps(3_000_000); // $0.10-$0.50
+        assert_eq!(mult, 11_000); // 110%
+    }
+
+    #[test]
+    fn test_price_multiplier_mid_high_neutral() {
+        let mult = EscrowContract::_price_multiplier_bps(7_500_000); // $0.50-$1.00
+        assert_eq!(mult, 10_000); // 100% (no change)
+    }
+
+    #[test]
+    fn test_price_multiplier_high_price_discounts() {
+        let mult = EscrowContract::_price_multiplier_bps(15_000_000); // > $1.00
+        assert_eq!(mult, 9_000); // 90% of base tier rate
+    }
+
+    #[test]
+    fn test_price_multiplier_zero_price_is_neutral() {
+        let mult = EscrowContract::_price_multiplier_bps(0);
+        assert_eq!(mult, 10_000); // no penalty when price unavailable
+    }
+
+    #[test]
+    fn test_tier_bps_maps_correctly() {
+        let schedule = FeeSchedule {
+            tier0_bps: 500,
+            tier1_bps: 400,
+            tier2_bps: 300,
+            tier3_bps: 200,
+            volume_discount_threshold: 1_000_000,
+            volume_discount_bps: 50,
+        };
+        assert_eq!(EscrowContract::_tier_bps(&schedule, 0), 500);
+        assert_eq!(EscrowContract::_tier_bps(&schedule, 1), 400);
+        assert_eq!(EscrowContract::_tier_bps(&schedule, 2), 300);
+        assert_eq!(EscrowContract::_tier_bps(&schedule, 3), 200);
+        assert_eq!(EscrowContract::_tier_bps(&schedule, 99), 500); // unknown → tier0
+    }
+
+    #[test]
+    fn test_volume_discount_applies_when_threshold_exceeded() {
+        let schedule = FeeSchedule {
+            tier0_bps: 500,
+            tier1_bps: 400,
+            tier2_bps: 300,
+            tier3_bps: 200,
+            volume_discount_threshold: 10_000,
+            volume_discount_bps: 50,
+        };
+        // Below threshold: no discount applied
+        assert_eq!(
+            EscrowContract::_compute_fee_with_meta_no_dynamic(
+                &schedule, 0, 5_000,
+            ),
+            (250, 0, 500, 500)
+        );
+        // Above threshold: 50 bps discount
+        assert_eq!(
+            EscrowContract::_compute_fee_with_meta_no_dynamic(
+                &schedule, 0, 20_000,
+            ),
+            (900, 0, 500, 450)
+        );
+    }
+
+    #[test]
+    fn test_volume_discount_saturates_at_zero() {
+        let schedule = FeeSchedule {
+            tier0_bps: 100,
+            tier1_bps: 100,
+            tier2_bps: 100,
+            tier3_bps: 100,
+            volume_discount_threshold: 10_000,
+            volume_discount_bps: 500, // larger than base 100
+        };
+        // saturating_sub ensures we never go below 0 bps effective rate
+        let (fee, _, _, effective) =
+            EscrowContract::_compute_fee_with_meta_no_dynamic(&schedule, 0, 50_000);
+        assert_eq!(effective, 0);
+        assert_eq!(fee, 0);
+    }
+
+    #[test]
+    fn test_fee_schedule_validation_rejects_over_cap_tiers() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let bad = FeeSchedule {
+                tier0_bps: 1_001, // > MAX_FEE_BPS (1000)
+                tier1_bps: 400,
+                tier2_bps: 300,
+                tier3_bps: 200,
+                volume_discount_threshold: 0,
+                volume_discount_bps: 0,
+            };
+            EscrowContract::_validate_fee_schedule(&bad);
+        }));
+        assert!(result.is_err(), "tier0 over cap should panic");
+    }
+
+    #[test]
+    fn test_fee_schedule_validation_rejects_negative_threshold() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let bad = FeeSchedule {
+                tier0_bps: 500,
+                tier1_bps: 400,
+                tier2_bps: 300,
+                tier3_bps: 200,
+                volume_discount_threshold: -1,
+                volume_discount_bps: 0,
+            };
+            EscrowContract::_validate_fee_schedule(&bad);
+        }));
+        assert!(result.is_err(), "negative threshold should panic");
+    }
+
+    #[test]
+    fn test_fee_schedule_validation_rejects_excessive_discount_bps() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let bad = FeeSchedule {
+                tier0_bps: 500,
+                tier1_bps: 400,
+                tier2_bps: 300,
+                tier3_bps: 200,
+                volume_discount_threshold: 0,
+                volume_discount_bps: 1_001, // > MAX_FEE_BPS
+            };
+            EscrowContract::_validate_fee_schedule(&bad);
+        }));
+        assert!(result.is_err(), "volume discount over cap should panic");
+    }
+
+    #[test]
+    fn test_fee_schedule_validation_accepts_valid_schedule() {
+        let good = FeeSchedule {
+            tier0_bps: 500,
+            tier1_bps: 400,
+            tier2_bps: 300,
+            tier3_bps: 200,
+            volume_discount_threshold: 1_000_000,
+            volume_discount_bps: 50,
+        };
+        EscrowContract::_validate_fee_schedule(&good); // must not panic
     }
 
     // -----------------------------------------------------------------------
