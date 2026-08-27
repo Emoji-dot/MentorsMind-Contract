@@ -214,6 +214,8 @@ pub fn evt_escrow_resolved(env: &Env)     -> Symbol { Symbol::new(env, "resolved
 pub fn evt_escrow_refunded(env: &Env)     -> Symbol { Symbol::new(env, "refunded") }
 pub fn evt_escrow_partial(env: &Env)      -> Symbol { Symbol::new(env, "partial_rel") }
 pub fn evt_escrow_adm_release(env: &Env)  -> Symbol { Symbol::new(env, "admin_rel") }
+pub fn evt_escrow_stuck_reported(env: &Env) -> Symbol { Symbol::new(env, "stuck_reported") }
+pub fn evt_escrow_emergency_release(env: &Env) -> Symbol { Symbol::new(env, "emergency_release") }
 pub fn evt_token_approved(env: &Env)      -> Symbol { Symbol::new(env, "tok_approved") }
 pub fn evt_fee_distributed(env: &Env)     -> Symbol { Symbol::new(env, "fee_distrib") }
 
@@ -225,6 +227,7 @@ pub fn evt_gov_proposal_failed(env: &Env)   -> Symbol { Symbol::new(env, "prop_f
 pub fn evt_gov_proposal_queued(env: &Env)   -> Symbol { Symbol::new(env, "prop_queued") }
 pub fn evt_gov_proposal_executed(env: &Env) -> Symbol { Symbol::new(env, "prop_executed") }
 pub fn evt_gov_proposal_cancelled(env: &Env)-> Symbol { Symbol::new(env, "prop_cancelled") }
+pub fn evt_gov_proposal_cancelled_w_cooldown(env: &Env) -> Symbol { Symbol::new(env, "prop_cxl_cd") }
 pub fn evt_gov_timelock_set(env: &Env)      -> Symbol { Symbol::new(env, "timelock_set") }
 pub fn evt_gov_call_allowed(env: &Env)      -> Symbol { Symbol::new(env, "call_allowed") }
 pub fn evt_gov_arb_registered(env: &Env)    -> Symbol { Symbol::new(env, "arb_registered") }
@@ -242,6 +245,8 @@ pub fn evt_timelock_sched(env: &Env)    -> Symbol { Symbol::new(env, "scheduled"
 pub fn evt_timelock_exec(env: &Env)     -> Symbol { Symbol::new(env, "executed") }
 pub fn evt_timelock_cancel(env: &Env)   -> Symbol { Symbol::new(env, "cancelled") }
 pub fn evt_timelock_adm_xfr(env: &Env)  -> Symbol { Symbol::new(env, "admin_xfr") }
+pub fn evt_timelock_emerg_cancel(env: &Env) -> Symbol { Symbol::new(env, "em_cancel") }
+pub fn evt_timelock_guardian_set(env: &Env) -> Symbol { Symbol::new(env, "guard_set") }
 
 // --- bounty ---
 pub fn evt_bounty_posted(env: &Env)    -> Symbol { Symbol::new(env, "posted") }
