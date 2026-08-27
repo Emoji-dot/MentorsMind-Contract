@@ -217,6 +217,44 @@ impl PauseGuardian {
         let validated: bool = env.storage().instance().get(&IFACE_VALID).unwrap_or(false);
         paused || !validated
     }
+
+    // ── System health monitoring & service disruption detection (#901) ──────
+
+    /// Monitor overall system health by checking failure rates and
+    /// circuit breaker status.
+    pub fn monitor_system_health(env: Env) -> bool {
+        let paused: bool = env.storage().instance().get(&PAUSED).unwrap_or(false);
+        let failures: u32 = env.storage().instance().get(&FAILURES).unwrap_or(0);
+        let validated: bool = env.storage().instance().get(&IFACE_VALID).unwrap_or(false);
+
+        // System is healthy when: not paused, failures below threshold, and
+        // yield interface has been validated.
+        !paused && failures < CIRCUIT_THRESHOLD && validated
+    }
+
+    /// Detect whether a service disruption is occurring by analyzing
+    /// the recent failure pattern.
+    pub fn detect_service_disruption(env: Env) -> bool {
+        let failures: u32 = env.storage().instance().get(&FAILURES).unwrap_or(0);
+        let paused: bool = env.storage().instance().get(&PAUSED).unwrap_or(false);
+
+        // Disruption detected when circuit is tripped or failures are
+        // approaching the threshold.
+        paused || failures >= CIRCUIT_THRESHOLD.saturating_sub(1)
+    }
+
+    /// Activate additional protections by engaging the circuit breaker
+    /// and recording the disruption event.
+    pub fn activate_protections(env: Env) {
+        let was_paused: bool = env.storage().instance().get(&PAUSED).unwrap_or(false);
+        if !was_paused {
+            env.storage().instance().set(&PAUSED, &true);
+            env.events().publish(
+                (symbol_short!("guardian"), symbol_short!("prot_on")),
+                env.ledger().timestamp(),
+            );
+        }
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -396,5 +434,47 @@ mod tests {
         let yield_addr = Address::generate(&env);
         client.set_yield_contract(&yield_addr);
         assert_eq!(client.get_yield_contract(), Some(yield_addr));
+    }
+
+    // ── System health monitoring (#901) ─────────────────────────────────────
+
+    #[test]
+    fn test_monitor_system_health_healthy_initially() {
+        let (_env, _admin, client) = setup();
+        // Initially not paused, 0 failures, but interface not validated.
+        // System is NOT healthy because validated is false.
+        assert!(!client.monitor_system_health());
+    }
+
+    #[test]
+    fn test_monitor_system_health_healthy_when_validated() {
+        let (env, _admin, client) = setup();
+        let yield_addr = Address::generate(&env);
+        client.set_yield_contract(&yield_addr);
+        client.validate_yield_interface(&yield_addr);
+        // Now: not paused, 0 failures, validated = true
+        assert!(client.monitor_system_health());
+    }
+
+    #[test]
+    fn test_detect_service_disruption_no_disruption_initially() {
+        let (_env, _admin, client) = setup();
+        // 0 failures, not paused → no disruption.
+        assert!(!client.detect_service_disruption());
+    }
+
+    #[test]
+    fn test_detect_service_disruption_when_paused() {
+        let (_env, _admin, client) = setup();
+        client.set_paused(&true);
+        assert!(client.detect_service_disruption());
+    }
+
+    #[test]
+    fn test_activate_protections_engages_circuit_breaker() {
+        let (_env, _admin, client) = setup();
+        assert!(!client.is_paused());
+        client.activate_protections();
+        assert!(client.is_paused());
     }
 }

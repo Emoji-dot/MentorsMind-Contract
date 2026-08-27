@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{Address, Env, Symbol, Vec, BytesN, contracterror};
+use soroban_sdk::{contracttype, Address, Env, Symbol, Vec, BytesN, contracterror};
 
 /// Transfer Security Error Types
 #[contracterror]
@@ -38,6 +38,7 @@ pub enum CredentialFraudType {
 }
 
 /// Credential transfer record
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct CredentialTransfer {
     pub from_user: Address,
@@ -50,6 +51,7 @@ pub struct CredentialTransfer {
 }
 
 /// Cross-platform verification record
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct CrossPlatformVerification {
     pub credential_id: Symbol,
@@ -60,6 +62,7 @@ pub struct CrossPlatformVerification {
 }
 
 /// Credit inflation detection record
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct CreditInflationRecord {
     pub user: Address,
@@ -71,6 +74,7 @@ pub struct CreditInflationRecord {
 }
 
 /// Fraud detection result
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct FraudDetectionResult {
     pub is_fraudulent: bool,
@@ -81,6 +85,7 @@ pub struct FraudDetectionResult {
 }
 
 /// Transfer integrity verification result
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct TransferIntegrityResult {
     pub is_valid: bool,
@@ -90,6 +95,7 @@ pub struct TransferIntegrityResult {
 }
 
 /// Credential authenticity proof
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct CredentialAuthenticityProof {
     pub credential_id: Symbol,
@@ -100,6 +106,7 @@ pub struct CredentialAuthenticityProof {
 }
 
 /// Verification step in authenticity chain
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct VerificationStep {
     pub verifier: Address,
@@ -182,7 +189,7 @@ impl TransferSecurity {
         verification_statuses.push_back(target_valid);
 
         // Verify credential consistency across platforms
-        let is_consistent = source_valid && target_valid && 
+        let is_consistent = source_valid && target_valid &&
             Self::verify_cross_platform_consistency(env, &credential_id);
 
         let integrity_score = if is_consistent {

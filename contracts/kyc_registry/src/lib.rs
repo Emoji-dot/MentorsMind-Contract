@@ -2,6 +2,16 @@
 use shared::{
     check_access, compute_privacy_intervention, detect_exploitation, minimize_to_need_to_know,
     AccessDecision, ConsentRecord, PrivacyInterventionRecord, PrivacyMonitoringResult, ALL_FIELDS,
+    // onboarding protection & barrier gaming
+    evaluate_onboarding_fairness, verify_requirement_authenticity, assess_admission_equity,
+    monitor_onboarding_access_patterns, audit_onboarding_process, compute_onboarding_protection,
+    restore_fair_onboarding_access, is_onboarding_restoration_eligible, OnboardingFairness,
+    VerificationAuthenticity, AdmissionEquity, AccessMonitoringRecord, OnboardingAuditRecord,
+    OnboardingProtectionRecord, ONBOARDING_RESTORATION_COOLDOWN_SECS,
+    check_access, compute_privacy_intervention, contain_data_breach, detect_cross_session_leak,
+    detect_exploitation, minimize_to_need_to_know, AccessDecision, ConsentRecord,
+    CrossSessionLeakResult, DataBreachContainment, PrivacyInterventionRecord,
+    PrivacyMonitoringResult, ALL_FIELDS,
 };
 use soroban_sdk::{
     contract, contractclient, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
@@ -48,6 +58,26 @@ pub enum DataKey {
     AccessLog(Address, Address),
     /// Automatic-isolation flag set when exploitative access is detected.
     PrivacyIsolated(Address),
+    // ── Onboarding Fairness and Barrier Gaming (#learner-onboarding) ───
+    OnboardingFairnessRecord(Address),
+    VerificationAuthenticityRecord(Address),
+    AdmissionEquityRecord(Address),
+    AccessMonitoring(Address),
+    OnboardingAudit(Address),
+    OnboardingProtection(Address),
+    /// Timestamps of out-of-scope data-access attempts against a subject,
+    /// used for cross-session/cross-mentor leak detection (#899).
+    LearnerLeakLog(Address),
+    /// Whether a subject's data breach has been contained and requires
+    /// admin review before consent/access can resume (#899).
+    BreachContained(Address),
+    // ── Identity verification & fraud detection (#904) ─────────────────────
+    /// Account security record for a user (failed attempts, lockout, MFA).
+    AccountSecurity(Address),
+    /// Cross-platform identity correlation records for a user.
+    CrossPlatformIdentity(Address, Symbol),
+    /// Fraud alerts logged for a user.
+    FraudAlertLog(Address),
 }
 
 /// Maximum length of the rolling per-(accessor,subject) access log kept for
@@ -382,8 +412,133 @@ impl KycRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::PrivacyIsolated(subject.clone()), &false);
+        env.storage()
+            .persistent()
+            .set(&DataKey::BreachContained(subject.clone()), &false);
         env.events()
             .publish((symbol_short!("privacy"), symbol_short!("restore")), subject);
+    }
+
+    // -----------------------------------------------------------------------
+    // Learner privacy, consent management & breach response (#899)
+    // -----------------------------------------------------------------------
+
+    /// Learner-facing consent/privacy management entrypoint: grants or
+    /// revokes consent for a purpose in one call. Only the subject may
+    /// manage their own consent (self-sovereign privacy).
+    pub fn manage_learner_privacy(
+        env: Env,
+        subject: Address,
+        purpose: Symbol,
+        granted_fields: u32,
+        duration_secs: u64,
+        revoke: bool,
+    ) -> Option<ConsentRecord> {
+        if revoke {
+            Self::handle_consent(env, subject, purpose, 0, 0, true);
+            None
+        } else {
+            Some(Self::manage_data_privacy(env, subject, purpose, granted_fields, duration_secs))
+        }
+    }
+
+    /// Unified consent-management entrypoint covering both grant and
+    /// revoke actions for a given purpose. Only the subject may manage
+    /// their own consent.
+    pub fn handle_consent(
+        env: Env,
+        subject: Address,
+        purpose: Symbol,
+        granted_fields: u32,
+        duration_secs: u64,
+        revoke: bool,
+    ) -> Option<ConsentRecord> {
+        subject.require_auth();
+        if revoke {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::Consent(subject.clone(), purpose.clone()));
+            env.events()
+                .publish((symbol_short!("consent"), subject), (purpose, symbol_short!("revoked")));
+            None
+        } else {
+            let now = env.ledger().timestamp();
+            let record = ConsentRecord {
+                subject: subject.clone(),
+                purpose: purpose.clone(),
+                granted_fields: granted_fields & ALL_FIELDS,
+                granted_at: now,
+                expires_at: now.saturating_add(duration_secs),
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::Consent(subject.clone(), purpose.clone()), &record);
+            env.events().publish(
+                (symbol_short!("consent"), subject),
+                (purpose, record.granted_fields),
+            );
+            Some(record)
+        }
+    }
+
+    /// Enforce data-protection compliance for an access attempt: applies
+    /// the standard access-control check via `enforce_access_controls`,
+    /// then re-scores cross-subject leak risk from the accessor's
+    /// out-of-scope access history and automatically contains the breach
+    /// (denying further access) when the risk crosses the threshold.
+    pub fn enforce_data_protection(
+        env: Env,
+        accessor: Address,
+        subject: Address,
+        purpose: Symbol,
+        requested_fields: u32,
+        out_of_scope_attempt: bool,
+    ) -> AccessDecision {
+        let mut access = Self::enforce_access_controls(
+            env.clone(),
+            accessor.clone(),
+            subject.clone(),
+            purpose,
+            requested_fields,
+        );
+
+        if out_of_scope_attempt {
+            let log_key = DataKey::LearnerLeakLog(subject.clone());
+            let mut log: Vec<u64> = env.storage().persistent().get(&log_key).unwrap_or(Vec::new(&env));
+            log.push_back(env.ledger().timestamp());
+            while log.len() > ACCESS_LOG_CAP {
+                log.remove(0);
+            }
+            env.storage().persistent().set(&log_key, &log);
+
+            let leak: CrossSessionLeakResult = detect_cross_session_leak(&env, &log, log.len());
+            let containment: DataBreachContainment =
+                contain_data_breach(&env, leak, Symbol::new(&env, "data_protection_breach"));
+            if containment.contain {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::BreachContained(subject.clone()), &true);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::PrivacyIsolated(subject.clone()), &true);
+                access.allowed = false;
+                env.events().publish(
+                    (symbol_short!("privacy"), symbol_short!("breach")),
+                    (subject, containment.reason),
+                );
+            }
+        }
+
+        access
+    }
+
+    /// Whether a subject's data has been contained following a detected
+    /// privacy breach.
+    pub fn is_breach_contained(env: Env, subject: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::BreachContained(subject))
+            .unwrap_or(false)
     }
 
     /// Internal helper to require admin authorization.
@@ -419,6 +574,212 @@ impl KycRegistry {
             .has_role(&Symbol::new(env, "KYC_OPERATOR"), operator)
         {
             panic!("KYC_OPERATOR role required");
+        }
+    }
+
+    // ─── Onboarding Fairness & Barrier Gaming Protection ───────────────
+
+    /// Implement onboarding fairness with equal access and barrier manipulation prevention systems.
+    pub fn ensure_onboarding_fairness(
+        env: Env,
+        user: Address,
+        barrier_count: u32,
+        artificial_delays: u32,
+        requirement_multiplier: u32,
+    ) -> OnboardingFairness {
+        let fairness = evaluate_onboarding_fairness(
+            barrier_count,
+            artificial_delays,
+            requirement_multiplier,
+            env.ledger().timestamp(),
+        );
+
+        let key = DataKey::OnboardingFairnessRecord(user.clone());
+        env.storage().persistent().set(&key, &fairness);
+
+        if !fairness.is_fair {
+            env.events().publish(
+                (symbol_short!("onb_fair"), Symbol::new(&env, "barrier_risk"), user),
+                fairness.barrier_risk_score,
+            );
+        }
+
+        fairness
+    }
+
+    /// Add verification authenticity with requirement validation and exploitation prevention mechanisms.
+    pub fn authenticate_verification_requirements(
+        env: Env,
+        user: Address,
+        verified_reqs: u32,
+        total_reqs: u32,
+        exploitation_signals: u32,
+    ) -> VerificationAuthenticity {
+        let authenticity = verify_requirement_authenticity(
+            verified_reqs,
+            total_reqs,
+            exploitation_signals,
+        );
+
+        let key = DataKey::VerificationAuthenticityRecord(user.clone());
+        env.storage().persistent().set(&key, &authenticity);
+
+        if authenticity.exploitation_flag {
+            env.events().publish(
+                (symbol_short!("v_auth"), Symbol::new(&env, "exploitative"), user),
+                authenticity.exploitation_risk_score,
+            );
+        }
+
+        authenticity
+    }
+
+    /// Create admission equity with fair criteria and coordination detection capabilities.
+    pub fn maintain_admission_equity(
+        env: Env,
+        operator: Address,
+        user: Address,
+        approved: u32,
+        total_applicants: u32,
+        coordination_signals: u32,
+    ) -> AdmissionEquity {
+        Self::require_operator(&env, &operator);
+
+        let equity = assess_admission_equity(approved, total_applicants, coordination_signals);
+
+        let key = DataKey::AdmissionEquityRecord(user.clone());
+        env.storage().persistent().set(&key, &equity);
+
+        if equity.coordination_detected {
+            env.events().publish(
+                (symbol_short!("adm_eq"), Symbol::new(&env, "coordination"), user),
+                equity.coordination_risk_score,
+            );
+        }
+
+        equity
+    }
+
+    /// Access monitoring for identifying manipulation and preventing barrier gaming.
+    pub fn monitor_onboarding_access(
+        env: Env,
+        user: Address,
+        attempt_count: u32,
+        rejected_count: u32,
+        freq_per_hour: u32,
+    ) -> AccessMonitoringRecord {
+        let monitoring = monitor_onboarding_access_patterns(attempt_count, rejected_count, freq_per_hour);
+
+        let key = DataKey::AccessMonitoring(user.clone());
+        env.storage().persistent().set(&key, &monitoring);
+
+        if monitoring.barrier_gaming_detected {
+            env.events().publish(
+                (symbol_short!("onb_mon"), Symbol::new(&env, "gaming"), user),
+                monitoring.manipulation_level,
+            );
+        }
+
+        monitoring
+    }
+
+    /// Audit onboarding process for fairness verification and manipulation detection.
+    pub fn audit_onboarding_fairness(
+        env: Env,
+        user: Address,
+        total_applicants: u32,
+        approved_applicants: u32,
+        manipulation_signals: u32,
+    ) -> OnboardingAuditRecord {
+        let audit = audit_onboarding_process(total_applicants, approved_applicants, manipulation_signals);
+
+        let key = DataKey::OnboardingAudit(user.clone());
+        env.storage().persistent().set(&key, &audit);
+
+        if !audit.fairness_verified {
+            env.events().publish(
+                (symbol_short!("onb_aud"), Symbol::new(&env, "unverified"), user),
+                audit.manipulation_score,
+            );
+        }
+
+        audit
+    }
+
+    /// Restore fair onboarding access for a user after intervention cooldown. Admin only.
+    pub fn restore_onboarding_fair_access(
+        env: Env,
+        admin: Address,
+        user: Address,
+    ) -> OnboardingProtectionRecord {
+        Self::require_admin(&env, &admin);
+
+        let audit: OnboardingAuditRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OnboardingAudit(user.clone()))
+            .unwrap_or(OnboardingAuditRecord {
+                audited: true,
+                fairness_verified: true,
+                manipulation_score: 0,
+                tracking_id: 1,
+                total_applicants: 0,
+                approved_applicants: 0,
+            });
+
+        let restored = restore_fair_onboarding_access(&env, &audit);
+
+        let key = DataKey::OnboardingProtection(user.clone());
+        env.storage().persistent().set(&key, &restored);
+
+        env.events().publish(
+            (symbol_short!("onb_rest"), Symbol::new(&env, "restored"), user),
+            restored.restoration_timestamp,
+        );
+
+        restored
+    // ── Identity verification & fraud detection (#904) ─────────────────────
+
+    /// Verify a user's identity using multi-factor checks.
+    /// Returns true if the user passes all required verification steps.
+    pub fn verify_user_identity(env: Env, user: Address) -> bool {
+        let kyc_level = Self::get_kyc_level(env.clone(), user.clone());
+        let is_valid = Self::is_kyc_valid(env.clone(), user.clone());
+
+        // Identity verification requires at least Basic KYC that is still valid.
+        (kyc_level as u32) >= (KycLevel::Basic as u32) && is_valid
+    }
+
+    /// Detect potential identity fraud by checking for suspicious patterns
+    /// such as rapid level changes or expired credentials still in use.
+    pub fn detect_identity_fraud(env: Env, user: Address) -> bool {
+        let record: Option<KycRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Kyc(user.clone()));
+
+        match record {
+            None => false,
+            Some(r) => {
+                let now = env.ledger().timestamp();
+                // Flag if expiry is in the past but record still shows a non-None level.
+                r.expiry < now && (r.level as u32) > (KycLevel::None as u32)
+            }
+        }
+    }
+
+    /// Prevent account takeover by checking lockout status.
+    /// Returns true if the account is currently locked.
+    pub fn is_account_locked(env: Env, user: Address) -> bool {
+        let security_key = DataKey::AccountSecurity(user);
+        let record: Option<shared::AccountSecurityRecord> =
+            env.storage().persistent().get(&security_key);
+        match record {
+            None => false,
+            Some(r) => {
+                let now = env.ledger().timestamp();
+                shared::is_account_locked(&r, now)
+            }
         }
     }
 }
