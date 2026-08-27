@@ -39,6 +39,9 @@ use shared::{
     TimeSlotInfo,
     VulnerabilityAssessment,
     PERFORMANCE_RESTORATION_COOLDOWN_SECS,
+    validate_curriculum_standards, optimize_learning_path, CurriculumValidation, LearningPathOptimization, OutcomeAssessment, CurriculumDispute,
+    generate_mentoring_proof, check_session_authenticity, ProofOfMentoring, SessionAuthenticity, ReputationIntegrity,
+    trigger_rollback, execute_with_recovery, RecoveryState, RollbackProtector,
 };
 
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol, Vec, Map};
@@ -2618,6 +2621,45 @@ impl SessionRegistry {
             (symbol_short!("session"), symbol_short!("outcome")),
             (session_id, session.mentor, session.learner, outcome_score),
         );
+    }
+
+    // ── Curriculum Gaming & Mentoring Proofs (#888, #883) ──────────────────
+
+    pub fn create_learning_path(env: Env, mentor: Address, learner: Address, curriculum_hash: BytesN<32>) -> Symbol {
+        let backend = Self::require_backend(&env);
+        backend.require_auth();
+        let path_id = Symbol::new(&env, "lpath");
+        env.events().publish((symbol_short!("lpath"), Symbol::new(&env, "created")), (mentor, learner, curriculum_hash));
+        path_id
+    }
+
+    pub fn validate_curriculum(_env: Env, _mentor: Address, industry_score: u32, competency: bool) -> CurriculumValidation {
+        validate_curriculum_standards(industry_score, competency)
+    }
+
+    pub fn optimize_learning_sequence(_env: Env, extensions: u32) -> LearningPathOptimization {
+        optimize_learning_path(extensions)
+    }
+
+    pub fn complete_session(env: Env, session_id: Symbol, mentor: Address, learner: Address, session_hash: BytesN<32>) -> ProofOfMentoring {
+        let proof = generate_mentoring_proof(&env, session_id.clone(), mentor, learner, session_hash);
+        let current_addr = env.current_contract_address();
+        let session_id_clone = session_id.clone();
+        let _ = execute_with_recovery(current_addr, Symbol::new(&env, "complete_session"), || {
+            Self::update_status(env.clone(), session_id_clone, SessionStatus::Completed);
+            Ok(())
+        });
+        proof
+    }
+
+    pub fn mark_session_delivered(env: Env, session_id: Symbol) {
+        let backend = Self::require_backend(&env);
+        backend.require_auth();
+        Self::update_status(env, session_id, SessionStatus::Completed);
+    }
+
+    pub fn validate_deliverables(_env: Env, fraud_probability: u32) -> SessionAuthenticity {
+        check_session_authenticity(fraud_probability)
     }
 }
 

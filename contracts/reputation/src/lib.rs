@@ -36,6 +36,9 @@ use shared::{
     SuccessMetricProtection,
     VulnerabilityAssessment,
     OUTCOME_RESTORATION_COOLDOWN_SECS,
+    OutcomeAssessment, CurriculumValidation, LearningPathOptimization, CurriculumDispute,
+    generate_mentoring_proof, check_session_authenticity, ProofOfMentoring, SessionAuthenticity, ReputationIntegrity,
+    trigger_rollback, execute_with_recovery, RecoveryState, RollbackProtector,
 };
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal,
@@ -2006,6 +2009,52 @@ impl ReputationContract {
             false_negative_rate: 4,
             prediction_confidence: 83,
             drift_detected: false,
+        }
+    }
+
+    // ── Curriculum Quality & Reputation Updating (#888, #883) ──────────────
+
+    pub fn assess_learning_outcomes(_env: Env, _mentor: Address, outcome_score: u32) -> OutcomeAssessment {
+        OutcomeAssessment {
+            outcome_score,
+            mentor_incentive_aligned: outcome_score >= 6000,
+            manipulation_detected: false,
+        }
+    }
+
+    pub fn track_curriculum_effectiveness(env: Env, mentor: Address, metric: u32) {
+        env.events().publish((symbol_short!("curric"), Symbol::new(&env, "tracked")), (mentor, metric));
+    }
+
+    pub fn update_mentor_rating(env: Env, mentor: Address, rating: u32) {
+        let current_addr = env.current_contract_address();
+        let mentor_clone = mentor.clone();
+        let _ = execute_with_recovery(current_addr, Symbol::new(&env, "update_mentor_rating"), || {
+            let sum_key = DataKey::MentorRatingSum(mentor_clone.clone());
+            let cnt_key = DataKey::MentorReviewCount(mentor_clone.clone());
+
+            let current_sum: u64 = env.storage().persistent().get(&sum_key).unwrap_or(0u64);
+            let current_count: u64 = env.storage().persistent().get(&cnt_key).unwrap_or(0u64);
+
+            let new_sum = current_sum.checked_add(rating as u64).unwrap_or(current_sum);
+            let new_count = current_count.checked_add(1).unwrap_or(current_count);
+
+            env.storage().persistent().set(&sum_key, &new_sum);
+            env.storage().persistent().set(&cnt_key, &new_count);
+            Ok(())
+        });
+    }
+
+    pub fn calculate_reputation_score(env: Env, mentor: Address) -> u32 {
+        let sum_key = DataKey::MentorRatingSum(mentor.clone());
+        let cnt_key = DataKey::MentorReviewCount(mentor);
+        let current_sum: u64 = env.storage().persistent().get(&sum_key).unwrap_or(0u64);
+        let current_count: u64 = env.storage().persistent().get(&cnt_key).unwrap_or(0u64);
+        
+        if current_count == 0 {
+            0
+        } else {
+            (current_sum * 2000 / current_count) as u32
         }
     }
 }

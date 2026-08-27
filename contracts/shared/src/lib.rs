@@ -39,6 +39,10 @@ pub mod storage_compatibility;
 pub mod threat_intelligence;
 pub mod ttl_utils;
 pub mod validation;
+pub mod curriculum_validation;
+pub mod qualification_verification;
+pub mod proof_of_mentoring;
+pub mod cross_contract_recovery;
 
 pub use admin::{
     AdminChangeProposal, AdminTransfer, ADMIN_COOLING_OFF_SECS, MIN_ADMIN_TIMELOCK_SECS,
@@ -195,6 +199,18 @@ pub use ttl_utils::{
     WARNING_THRESHOLD_LEDGERS,
 };
 pub use validation::{require_auth_and_validate, ValidationError, Validator};
+pub use curriculum_validation::{
+    validate_curriculum_standards, optimize_learning_path, CurriculumValidation, LearningPathOptimization, OutcomeAssessment, CurriculumDispute
+};
+pub use qualification_verification::{
+    verify_credential_validity, assess_skill_level, CredentialVerification, IdentityValidation, SkillAssessment
+};
+pub use proof_of_mentoring::{
+    generate_mentoring_proof, check_session_authenticity, ProofOfMentoring, SessionAuthenticity, ReputationIntegrity
+};
+pub use cross_contract_recovery::{
+    trigger_rollback, execute_with_recovery, RecoveryState, RollbackProtector
+};
 
 /// Economic sanity ceiling for a single financial amount (token smallest units).
 pub const MAX_FINANCIAL_AMOUNT: i128 = 1_000_000_000_000_000;

@@ -11,6 +11,8 @@ use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, B
     SpecializationGovernanceRecord,
     // Cross-platform identity validation (#904)
     CrossPlatformIdentity, is_identity_match,
+    verify_credential_validity, assess_skill_level, CredentialVerification, IdentityValidation, SkillAssessment,
+    trigger_rollback, execute_with_recovery, RecoveryState, RollbackProtector,
 };
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol, Vec,
@@ -711,6 +713,48 @@ impl VerificationContract {
             .get(&DataKey::AccountMonitoringLog(mentor))
             .unwrap_or(Vec::new(&env));
         log.len()
+    }
+
+    // ── Qualification Verification (#887) ──────────────────────────
+
+    pub fn verify_mentor_credentials(env: Env, mentor: Address, credential_hash: BytesN<32>, provider: Address) -> CredentialVerification {
+        let verification = verify_credential_validity(credential_hash, provider);
+        // Persist the status or emit event
+        env.events().publish((symbol_short!("cred"), Symbol::new(&env, "verified")), mentor);
+        verification
+    }
+
+    pub fn validate_identity(_env: Env, _mentor: Address, kyc_verified: bool, fraud_risk_score: u32, identity_hash: BytesN<32>) -> IdentityValidation {
+        IdentityValidation {
+            kyc_verified,
+            fraud_risk_score,
+            identity_hash,
+        }
+    }
+
+    pub fn assess_mentor_skills(env: Env, mentor: Address, skill_score: u32) -> SkillAssessment {
+        let assessment = assess_skill_level(mentor.clone(), skill_score);
+        env.events().publish((symbol_short!("skill"), Symbol::new(&env, "assessed")), (mentor, skill_score));
+        assessment
+    }
+
+    pub fn remove_mentor_qualification(env: Env, mentor: Address) {
+        let admin: Address = env.storage().persistent().get(&DataKey::Admin).expect("Not initialized");
+        admin.require_auth();
+        
+        let current_addr = env.current_contract_address();
+        let mentor_clone = mentor.clone();
+        
+        let _ = execute_with_recovery(current_addr, Symbol::new(&env, "remove_mentor_qualification"), || {
+            let key = DataKey::Verification(mentor_clone.clone());
+            if let Some(mut rec) = env.storage().persistent().get::<DataKey, VerificationRecord>(&key) {
+                rec.is_active = false;
+                env.storage().persistent().set(&key, &rec);
+            }
+            Ok(())
+        });
+        
+        env.events().publish((symbol_short!("Verify"), Symbol::new(&env, "QualRev")), mentor);
     }
 }
 
