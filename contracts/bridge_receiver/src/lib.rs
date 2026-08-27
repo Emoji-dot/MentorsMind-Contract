@@ -3,6 +3,7 @@
 use soroban_sdk::{
     contract, contractimpl, contracttype, token, Address, BytesN, Env, IntoVal, Symbol, Vec,
 };
+use shared::{l2_finality_reached, record_cross_layer_audit, L2Integration};
 
 #[derive(Clone)]
 #[contracttype]
@@ -18,6 +19,8 @@ pub enum DataKey {
     /// Contract-isolated storage namespace root (#826).
     NamespaceRoot,
     Config,
+    L2Config,
+    L2Audit(BytesN<32>),
     ProcessedVAA(BytesN<32>),
     WrappedToken,
     TrustedRelayer(Address),
@@ -91,6 +94,8 @@ impl BridgeReceiver {
         amount: i128,
         source_chain: u32,
     ) {
+        Self::ensure_l2_finality(&env);
+
         // Validate amount is positive
         if amount <= 0 {
             panic!("Amount must be positive");
@@ -131,6 +136,7 @@ impl BridgeReceiver {
 
         // Mark VAA as processed to prevent replay
         env.storage().instance().set(&processed_key, &true);
+        Self::record_audit(&env, &vaa_hash, source_chain);
 
         // Also store in config's processed_vaas list for audit
         let mut config = Self::get_config(&env);
@@ -146,6 +152,35 @@ impl BridgeReceiver {
             source_chain,
             &token_address,
         );
+    }
+
+    pub fn configure_l2(env: Env, admin: Address, network_id: u32, finality_delay_secs: u64, challenge_period_secs: u64) {
+        Self::require_admin(&env, &admin);
+        env.storage().instance().set(
+            &DataKey::L2Config,
+            &L2Integration {
+                network_id,
+                finality_delay_secs,
+                challenge_period_secs,
+                last_l2_block: env.ledger().sequence() as u64,
+                last_l1_commitment: env.ledger().timestamp(),
+                emergency_shutdown: false,
+            },
+        );
+    }
+
+    pub fn shutdown_l2(env: Env, admin: Address, emergency: bool) {
+        Self::require_admin(&env, &admin);
+        let mut cfg: L2Integration = env.storage().instance().get(&DataKey::L2Config).unwrap_or(L2Integration {
+            network_id: 0,
+            finality_delay_secs: 0,
+            challenge_period_secs: 0,
+            last_l2_block: 0,
+            last_l1_commitment: 0,
+            emergency_shutdown: false,
+        });
+        cfg.emergency_shutdown = emergency;
+        env.storage().instance().set(&DataKey::L2Config, &cfg);
     }
 
     /// Verify VAA hash against approved list
@@ -312,6 +347,26 @@ impl BridgeReceiver {
             .unwrap_or_else(|| {
                 panic!("Bridge not initialized");
             })
+    }
+
+    fn ensure_l2_finality(env: &Env) {
+        if let Some(cfg) = env.storage().instance().get::<_, L2Integration>(&DataKey::L2Config) {
+            if !l2_finality_reached(env, &cfg, env.ledger().timestamp().saturating_sub(cfg.last_l1_commitment)) {
+                panic!("L2 finality window not satisfied");
+            }
+        }
+    }
+
+    fn record_audit(env: &Env, op: &BytesN<32>, source_chain: u32) {
+        let contract_id = env.current_contract_address();
+        let _ = record_cross_layer_audit(
+            env,
+            &contract_id,
+            op,
+            Symbol::new(env, "l2"),
+            Symbol::new(env, "l1"),
+            source_chain != 0,
+        );
     }
 
     fn escrow_registry(env: &Env) -> Address {

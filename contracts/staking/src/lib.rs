@@ -12,6 +12,7 @@ use shared::{
     SuspiciousPatternFlag, Validator, EMERGENCY_THRESHOLD, MAX_SNAPSHOTS,
     MIN_STAKING_DURATION_SECS, PATTERN_DETECTION_WINDOW, REWARD_LOCKUP_SECS,
     REWARD_MULTIPLIER_MIN_BPS,
+    CollusionDetection, GameTheoryState, IncentiveCompatibilityResult,
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
@@ -220,6 +221,9 @@ pub enum DataKey {
     /// The highest epoch for which a RewardLockup has already been
     /// recorded for `staker` — avoids double-writing on re-settlement.
     StakerLockupSettledUntil(Address),
+    CollusionSignal(Address),
+    GameTheoryState,
+    IncentiveCompatibility(Address),
     /// Accumulated penalty pool from early unstakers. Distributed to all
     /// remaining eligible stakers on the next epoch close.
     PenaltyRedistributionPool,
@@ -595,6 +599,34 @@ impl StakingContract {
         env.storage()
             .instance()
             .set(&DataKey::TierRequirements, &requirements);
+    }
+
+    pub fn verify_incentive_compatibility(
+        env: Env,
+        mentor: Address,
+    ) -> IncentiveCompatibilityResult {
+        let suspicious = env
+            .storage()
+            .instance()
+            .get::<_, CollusionDetection>(&DataKey::CollusionSignal(mentor))
+            .map(|d| d.suspicious)
+            .unwrap_or(false);
+        IncentiveCompatibilityResult {
+            strategy_proof: !suspicious,
+            honest_nash_equilibrium: !suspicious,
+            confidence_bps: if suspicious { 1_500 } else { 8_500 },
+        }
+    }
+
+    pub fn adjust_game_theory_parameters(env: Env, collusion_score_bps: u32) {
+        env.storage().instance().set(
+            &DataKey::GameTheoryState,
+            &GameTheoryState {
+                collusion_score_bps,
+                audit_sample_rate_bps: if collusion_score_bps > 5_000 { 8_000 } else { 2_500 },
+                penalty_multiplier_bps: if collusion_score_bps > 5_000 { 12_000 } else { 5_000 },
+            },
+        );
     }
 
     /// Current stake/rating/session thresholds for each tier.
