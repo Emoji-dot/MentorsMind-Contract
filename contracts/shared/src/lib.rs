@@ -16,6 +16,7 @@ pub mod cross_chain_sync;
 pub mod disaster_recovery;
 pub mod emergency;
 pub mod emergency_rollback;
+pub mod error_context;
 pub mod escrow;
 pub mod events;
 pub mod failure_tracking;
@@ -26,6 +27,7 @@ pub mod justice_protection;
 pub mod key_management;
 pub mod learner_protection;
 pub mod outcome_authenticity;
+pub mod pagination;
 pub mod pause_guard;
 pub mod pricing_protection;
 pub mod privacy_protection;
@@ -84,6 +86,7 @@ pub use emergency_rollback::{
     RollbackScope, ROLLBACK_COMMUNITY_REVIEW_SECS, ROLLBACK_GOVERNANCE_QUORUM_BPS,
     ROLLBACK_MAX_WINDOW_SECS,
 };
+pub use error_context::{log_contract_error, ContractErrorContext};
 pub use escrow::{EscrowRecord, EscrowStatus, EscrowTransitionLog};
 pub use failure_tracking::{
     calculate_backoff_delay, calculate_next_retry, classify_failure, compute_failure_hash,
@@ -127,6 +130,9 @@ pub use outcome_authenticity::{
     OUTCOME_BURST_WINDOW_SECS, OUTCOME_INTERVENTION_THRESHOLD, OUTCOME_MIN_DISTINCT_BPS,
     OUTCOME_RESTORATION_COOLDOWN_SECS, OUTCOME_RISK_THRESHOLD,
 };
+pub use pagination::{
+    BoundedIteration, BudgetExceeded, OperationBudget, Pagination, MAX_PAGE_SIZE,
+};
 pub use pause_guard::{is_paused, require_not_paused, ContractPaused};
 pub use pricing_protection::{
     compute_pricing_intervention, detect_price_coordination, enforce_fair_pricing,
@@ -145,7 +151,7 @@ pub use privacy_protection::{
 };
 pub use reentrancy_guard::{
     validate_amount_limits, validate_caller_is_authorized, AtomicBatch, BatchOp,
-    ReentrancyAttemptLog, ReentrancyGuard, StateSnapshot,
+    BatchValidationError, ReentrancyAttemptLog, ReentrancyGuard, StateSnapshot, MAX_BATCH_SIZE,
 };
 pub use reputation::{
     analyze_review_pattern, detect_sybil, interaction_commitment, BehavioralAnalysis,

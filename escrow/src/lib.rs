@@ -9,16 +9,16 @@ use shared::{
     compute_checksum, push_snapshot_index, CrossContractAuth, EscrowRecord,
     RollbackProposal, SnapshotMeta, StateVerificationReport,
     MAX_SNAPSHOTS, EscrowTransitionLog, GasEstimate, Validator, StateMachine,
-    EMERGENCY_THRESHOLD, ReleaseFailure, FailureClassification, RecoveryState,
-    calculate_backoff_delay, classify_failure, calculate_next_retry, compute_failure_hash,
+    ReleaseFailure, FailureClassification, RecoveryState,
+    calculate_next_retry,
     MAX_AUTO_RELEASE_ATTEMPTS, MANUAL_RECOVERY_THRESHOLD, StateTransitionContext,
-    PreConditionCheck, PostConditionCheck, CrossContractStateCheck, StateTransitionProof,
-    InvalidStateRecord, compute_transition_proof_hash, all_checkpoints_passed,
+    CrossContractStateCheck,
+    InvalidStateRecord,
     is_transition_expired, STATE_TRANSITION_TIMEOUT_SECS, EmergencyAction, EmergencyAdminRole,
     EmergencyAuditRecord, EmergencyCircuitBreaker, EmergencyMultisig, MultisigValidation, SafeMath,
     EMERGENCY_ADMIN_TTL_SECS, EMERGENCY_MSIG_THRESHOLD, EmergencyRollback,
     ImmutableRollbackAuditRecord, RollbackAuthorization, RollbackJustification, RollbackScope,
-    SecureStorageAccess, STORAGE_DERIVE_CTX,
+    SecureStorageAccess, STORAGE_DERIVE_CTX, Pagination, log_contract_error,
 };
 pub use shared::EscrowStatus;
 use soroban_sdk::{
@@ -1430,7 +1430,17 @@ impl EscrowContract {
         // Auth check: caller must be learner OR admin
         caller.require_auth();
         if caller != escrow.learner && caller != admin {
-            panic!("Caller not authorized");
+            log_contract_error(
+                &env,
+                Symbol::new(&env, "release_funds"),
+                Symbol::new(&env, "unauthorized"),
+                escrow_id as i128,
+                Some(caller.clone()),
+            );
+            panic!(
+                "release_funds: caller is neither the learner nor the admin for escrow {}",
+                escrow_id
+            );
         }
 
         Self::_do_release(&env, &mut escrow, &key, &caller);
@@ -3279,11 +3289,27 @@ impl EscrowContract {
         result
     }
 
-    pub fn get_escrows_by_status(env: Env, status: EscrowStatus) -> Vec<u64> {
+    /// Scan escrow ids `(offset, offset + limit]` (1-indexed against the
+    /// global escrow count) for ones matching `status`.
+    ///
+    /// `offset`/`limit` bound the *scan window*, not the match count: since
+    /// this filters an unindexed global range, capping only the number of
+    /// matches returned would still let a caller force a full-table scan by
+    /// asking for a status with few (or zero) hits. Capping the scan window
+    /// itself (to at most `MAX_PAGE_SIZE`, #831) is what actually bounds
+    /// the work this call can do. A caller wanting every match pages
+    /// through by repeatedly advancing `offset` by the count it scanned
+    /// (`min(limit, MAX_PAGE_SIZE)`) until it has covered `get_escrow_count()`.
+    pub fn get_escrows_by_status(env: Env, status: EscrowStatus, offset: u32, limit: u32) -> Vec<u64> {
         let count: u64 = env.storage().persistent().get(&DataKey::EscrowCount).unwrap_or(0u64);
         let mut result = Vec::new(&env);
 
-        for i in 1..=count {
+        let count_u32 = count.min(u32::MAX as u64) as u32;
+        let (start, end) = Pagination::new(offset, limit).bounds(count_u32);
+
+        // Escrow ids are 1-indexed; `start`/`end` are 0-indexed offsets
+        // into the id space [1, count].
+        for i in (start as u64 + 1)..=(end as u64) {
             let key = (symbol_short!("ESCROW"), i);
             if let Some(escrow) = env.storage().persistent().get::<_, Escrow>(&key) {
                 if escrow.status == status {
@@ -3813,6 +3839,39 @@ impl EscrowContract {
             .persistent()
             .get::<_, bool>(&key)
             .unwrap_or(false)
+    }
+
+    /// Require `caller` to be the contract admin for an escrow-scoped admin
+    /// operation, with contextual panic messages and a structured error
+    /// event on failure (#988). Replaces the repeated
+    /// `.expect("Not initialized")` / bare `panic!("Unauthorized")` pair
+    /// that gave no indication of which operation or escrow failed.
+    fn _require_admin_for_escrow(env: &Env, caller: &Address, escrow_id: u64, operation: &str) {
+        let stored_admin: Option<Address> = env.storage().persistent().get(&DataKey::Admin);
+        let stored_admin = match stored_admin {
+            Some(a) => a,
+            None => {
+                log_contract_error(
+                    env,
+                    Symbol::new(env, operation),
+                    Symbol::new(env, "not_init"),
+                    escrow_id as i128,
+                    None,
+                );
+                panic!("{}: escrow contract not initialized (no admin set)", operation);
+            }
+        };
+        caller.require_auth();
+        if *caller != stored_admin {
+            log_contract_error(
+                env,
+                Symbol::new(env, operation),
+                Symbol::new(env, "unauthorized"),
+                escrow_id as i128,
+                Some(caller.clone()),
+            );
+            panic!("{}: caller is not the admin for escrow {}", operation, escrow_id);
+        }
     }
 
     /// Shared escrow creation logic with strict token whitelist validation.
@@ -4875,11 +4934,7 @@ impl EscrowContract {
     /// (mirrored from the dispute-evidence contract by the admin) so that
     /// `resolve_dispute_secure` can validate evidence sufficiency on-chain.
     pub fn record_evidence_count(env: Env, admin: Address, escrow_id: u64, evidence_count: u32) {
-        let stored_admin: Address = env.storage().persistent().get(&DataKey::Admin).expect("Not initialized");
-        admin.require_auth();
-        if admin != stored_admin {
-            panic!("Unauthorized");
-        }
+        Self::_require_admin_for_escrow(&env, &admin, escrow_id, "record_evidence_count");
         env.storage().persistent().set(&DataKey::DisputeEvidenceCount(escrow_id), &evidence_count);
     }
 
@@ -4890,11 +4945,7 @@ impl EscrowContract {
     ///
     /// Falls back to the same split logic as `resolve_dispute`.
     pub fn resolve_dispute_secure(env: Env, admin: Address, escrow_id: u64, mentor_pct: u32) {
-        let stored_admin: Address = env.storage().persistent().get(&DataKey::Admin).expect("Not initialized");
-        admin.require_auth();
-        if admin != stored_admin {
-            panic!("Unauthorized");
-        }
+        Self::_require_admin_for_escrow(&env, &admin, escrow_id, "resolve_dispute_secure");
 
         if Self::is_isolated(env.clone(), escrow_id) {
             panic!("Escrow isolated pending manual review");
@@ -4942,11 +4993,7 @@ impl EscrowContract {
     /// known incident, or by automation after `assess_payment_manipulation_risk`
     /// reports a suspected attack.
     pub fn emergency_isolate_escrow(env: Env, admin: Address, escrow_id: u64, reason: Symbol) -> EmergencyFundLock {
-        let stored_admin: Address = env.storage().persistent().get(&DataKey::Admin).expect("Not initialized");
-        admin.require_auth();
-        if admin != stored_admin {
-            panic!("Unauthorized");
-        }
+        Self::_require_admin_for_escrow(&env, &admin, escrow_id, "emergency_isolate_escrow");
 
         let lock = EmergencyFundLock {
             isolate: true,
@@ -4979,11 +5026,7 @@ impl EscrowContract {
     /// Lift emergency isolation on an escrow after manual admin review,
     /// allowing normal release/resolution flows to resume.
     pub fn recover_isolated_escrow(env: Env, admin: Address, escrow_id: u64) {
-        let stored_admin: Address = env.storage().persistent().get(&DataKey::Admin).expect("Not initialized");
-        admin.require_auth();
-        if admin != stored_admin {
-            panic!("Unauthorized");
-        }
+        Self::_require_admin_for_escrow(&env, &admin, escrow_id, "recover_isolated_escrow");
         env.storage().persistent().set(&DataKey::IsolatedEscrow(escrow_id), &false);
         env.events().publish(
             (Symbol::new(&env, "Escrow"), Symbol::new(&env, "Recovered"), escrow_id),
