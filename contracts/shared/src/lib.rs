@@ -16,6 +16,7 @@ pub mod cross_chain_sync;
 pub mod disaster_recovery;
 pub mod emergency;
 pub mod emergency_rollback;
+pub mod error_context;
 pub mod escrow;
 pub mod events;
 pub mod failure_tracking;
@@ -85,6 +86,7 @@ pub use emergency_rollback::{
     RollbackScope, ROLLBACK_COMMUNITY_REVIEW_SECS, ROLLBACK_GOVERNANCE_QUORUM_BPS,
     ROLLBACK_MAX_WINDOW_SECS,
 };
+pub use error_context::{log_contract_error, ContractErrorContext};
 pub use escrow::{EscrowRecord, EscrowStatus, EscrowTransitionLog};
 pub use failure_tracking::{
     calculate_backoff_delay, calculate_next_retry, classify_failure, compute_failure_hash,
