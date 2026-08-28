@@ -245,6 +245,7 @@ pub fn is_deadline_valid(env: &Env, deadline: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use soroban_sdk::testutils::Address as _;
     extern crate std;
     use super::*;
     use soroban_sdk::{
