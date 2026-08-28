@@ -2,8 +2,7 @@
 
 use shared::{
     require_not_paused, AtomicBatch, BatchOp, ReentrancyGuard, StateSnapshot, Validator,
-    validate_amount_limits, validate_caller_is_authorized,
-    MIN_STAKING_DURATION_SECS, REWARD_LOCKUP_SECS, BASIS_POINTS, SuspiciousPatternFlag,
+    validate_amount_limits, validate_caller_is_authorized, MAX_BATCH_SIZE,
     detect_price_coordination, validate_market_rate,
     enforce_fair_pricing as shared_enforce_fair_pricing, FairPricingResult, MarketRateValidation,
     PriceCoordinationFlag, DEFAULT_MAX_MARKET_DEVIATION_BPS,
@@ -145,6 +144,15 @@ pub struct AllocationHistory {
     pub recipient: Address,
     pub amount: i128,
     pub timestamp: u64,
+}
+
+/// A single item in a [`TreasuryContract::batch_allocate`] request.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AllocationRequest {
+    pub token: Address,
+    pub recipient: Address,
+    pub amount: i128,
 }
 
 #[contracttype]
@@ -1111,6 +1119,7 @@ impl TreasuryContract {
             recipient.clone(),
             amount,
         );
+        batch.validate().map_err(|_| Error::InvalidAmount)?;
 
         let token_ref = token.clone();
         let recipient_ref = recipient.clone();
@@ -1169,6 +1178,163 @@ impl TreasuryContract {
             (symbol_short!("allocate"), recipient.clone(), token.clone()),
             amount,
         );
+        Ok(())
+    }
+
+    /// Allocate to multiple recipients atomically (#830).
+    ///
+    /// Every request is fully pre-validated (token approved, amount sane,
+    /// per-tx cap respected, sufficient balance for the batch's total)
+    /// *before* a single transfer runs, so a request that would fail never
+    /// leaves the contract partway through a payout. Execution then runs
+    /// through [`AtomicBatch`], which stops at the first failing transfer;
+    /// since this function propagates that failure as `Err`, Soroban
+    /// reverts every transfer already made in this call — the batch either
+    /// lands in full or not at all.
+    ///
+    /// Unlike [`allocate`](Self::allocate), items above `MultisigThreshold`
+    /// are rejected outright rather than queued for approval — batch
+    /// requests are for below-threshold, routine payouts; a large transfer
+    /// should go through the single-item `allocate` pending-approval path.
+    pub fn batch_allocate(
+        env: Env,
+        requests: Vec<AllocationRequest>,
+    ) -> Result<(), Error> {
+        if let Some(guardian) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::PauseGuardian)
+        {
+            require_not_paused(&env, &guardian);
+        }
+
+        let lock_sym = Symbol::new(&env, "batch_allocate");
+        Self::_require_not_rg_paused(&env, &lock_sym)?;
+        let _guard = ReentrancyGuard::enter(&env, lock_sym);
+
+        let admin = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+
+        if requests.is_empty() || requests.len() > MAX_BATCH_SIZE {
+            return Err(Error::InvalidAmount);
+        }
+
+        let threshold: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultisigThreshold)
+            .unwrap_or(50_000);
+
+        // --- Pre-execution validation: every request must be individually
+        // valid, and the batch's total must not exceed the contract's
+        // current balance per token, before any transfer is attempted. ---
+        let mut totals_by_first_use: Vec<(Address, i128)> = Vec::new(&env);
+        for req in requests.iter() {
+            if !Self::_is_token_approved(&env, &req.token) {
+                return Err(Error::TokenNotApproved);
+            }
+            Validator::new(&env)
+                .require_positive(req.amount, "amount")
+                .require_max(req.amount, MAX_FINANCIAL_AMOUNT, "amount")
+                .validate()
+                .map_err(|_| Error::InvalidAmount)?;
+            if !validate_amount_limits(req.amount, 1, MAX_PER_TX_ALLOCATE) {
+                return Err(Error::AmountExceedsLimit);
+            }
+            if req.amount > threshold {
+                return Err(Error::AmountExceedsLimit);
+            }
+
+            let mut found = false;
+            for i in 0..totals_by_first_use.len() {
+                let (tok, running) = totals_by_first_use.get(i).unwrap();
+                if tok == req.token {
+                    totals_by_first_use.set(
+                        i,
+                        (tok, running.checked_add(req.amount).ok_or(Error::InvalidAmount)?),
+                    );
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                totals_by_first_use.push_back((req.token.clone(), req.amount));
+            }
+        }
+        for (tok, total) in totals_by_first_use.iter() {
+            let balance: i128 = token::Client::new(&env, &tok).balance(&env.current_contract_address());
+            if balance < total {
+                return Err(Error::InsufficientBalance);
+            }
+        }
+
+        // --- Execution: queue every transfer, then run them in order,
+        // aborting (and letting Soroban revert everything) at the first
+        // failure. ---
+        let mut batch = AtomicBatch::new(&env);
+        for req in requests.iter() {
+            batch.add_transfer(
+                req.token.clone(),
+                env.current_contract_address(),
+                req.recipient.clone(),
+                req.amount,
+            );
+        }
+        batch.validate().map_err(|_| Error::InvalidAmount)?;
+
+        batch
+            .execute_all(|e, op| -> Result<(), Error> {
+                match op {
+                    BatchOp::Transfer { token, from, to, amount, .. } => {
+                        token::Client::new(e, token).transfer(from, to, amount);
+                        Ok(())
+                    }
+                    _ => Ok(()),
+                }
+            })
+            .map_err(|_e| Error::StateValidationFailed)?;
+
+        // --- Audit trail: one AllocationHistory + operation log entry per
+        // request, plus a summary event for the whole batch. ---
+        for req in requests.iter() {
+            let count: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::AllocationCount)
+                .unwrap_or(0u32);
+            env.storage().persistent().set(
+                &DataKey::Allocation(count),
+                &AllocationHistory {
+                    token: req.token.clone(),
+                    recipient: req.recipient.clone(),
+                    amount: req.amount,
+                    timestamp: env.ledger().timestamp(),
+                },
+            );
+            env.storage()
+                .persistent()
+                .set(&DataKey::AllocationCount, &(count + 1));
+
+            Self::_log_operation(
+                &env,
+                Symbol::new(&env, "batch_allocate"),
+                admin.clone(),
+                req.token.clone(),
+                req.amount,
+                Some(req.recipient.clone()),
+                true,
+            );
+        }
+
+        env.events().publish(
+            (symbol_short!("batch"), symbol_short!("alloc_ok")),
+            (requests.len(), env.ledger().timestamp()),
+        );
+
         Ok(())
     }
 
@@ -1576,6 +1742,7 @@ impl TreasuryContract {
             staking_contract.clone(),
             Symbol::new(&env, "receive_treasury_distribution"),
         );
+        batch.validate().map_err(|_| Error::InvalidAmount)?;
 
         let staking_ref = staking_contract.clone();
         let token_ref = token.clone();

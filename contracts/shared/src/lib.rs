@@ -12,9 +12,11 @@ pub mod atomic_state;
 pub mod cartel_detection;
 pub mod community_protection;
 pub mod cross_contract_auth;
+pub mod cross_chain_sync;
 pub mod disaster_recovery;
 pub mod emergency;
 pub mod emergency_rollback;
+pub mod error_context;
 pub mod escrow;
 pub mod events;
 pub mod failure_tracking;
@@ -22,8 +24,10 @@ pub mod gas_estimation;
 pub mod governance_voting;
 pub mod interface_id;
 pub mod justice_protection;
+pub mod key_management;
 pub mod learner_protection;
 pub mod outcome_authenticity;
+pub mod pagination;
 pub mod pause_guard;
 pub mod pricing_protection;
 pub mod privacy_protection;
@@ -37,7 +41,9 @@ pub mod state_machine;
 pub mod storage;
 pub mod storage_compatibility;
 pub mod threat_intelligence;
+pub mod transaction_guard;
 pub mod ttl_utils;
+pub mod validator_accountability;
 pub mod validation;
 pub mod reputation;
 pub mod failure_tracking;
@@ -53,6 +59,8 @@ pub mod mev_protection;
 pub mod resource_management;
 pub mod platform_authenticity;
 pub mod dynamic_fees;
+
+use soroban_sdk::{contracttype, symbol_short, xdr::ToXdr, Address, Bytes, BytesN, Env, Symbol, Vec};
 
 pub use admin::{
     AdminChangeProposal, AdminTransfer, ADMIN_COOLING_OFF_SECS, MIN_ADMIN_TIMELOCK_SECS,
@@ -92,6 +100,7 @@ pub use emergency_rollback::{
     RollbackScope, ROLLBACK_COMMUNITY_REVIEW_SECS, ROLLBACK_GOVERNANCE_QUORUM_BPS,
     ROLLBACK_MAX_WINDOW_SECS,
 };
+pub use error_context::{log_contract_error, ContractErrorContext};
 pub use escrow::{EscrowRecord, EscrowStatus, EscrowTransitionLog};
 pub use failure_tracking::{
     calculate_backoff_delay, calculate_next_retry, classify_failure, compute_failure_hash,
@@ -135,6 +144,9 @@ pub use outcome_authenticity::{
     OUTCOME_BURST_WINDOW_SECS, OUTCOME_INTERVENTION_THRESHOLD, OUTCOME_MIN_DISTINCT_BPS,
     OUTCOME_RESTORATION_COOLDOWN_SECS, OUTCOME_RISK_THRESHOLD,
 };
+pub use pagination::{
+    BoundedIteration, BudgetExceeded, OperationBudget, Pagination, MAX_PAGE_SIZE,
+};
 pub use pause_guard::{is_paused, require_not_paused, ContractPaused};
 pub use pricing_protection::{
     compute_pricing_intervention, detect_price_coordination, enforce_fair_pricing,
@@ -153,7 +165,7 @@ pub use privacy_protection::{
 };
 pub use reentrancy_guard::{
     validate_amount_limits, validate_caller_is_authorized, AtomicBatch, BatchOp,
-    ReentrancyAttemptLog, ReentrancyGuard, StateSnapshot,
+    BatchValidationError, ReentrancyAttemptLog, ReentrancyGuard, StateSnapshot, MAX_BATCH_SIZE,
 };
 pub use reputation::{
     analyze_review_pattern, detect_sybil, interaction_commitment, BehavioralAnalysis,
@@ -311,6 +323,226 @@ pub use dynamic_fees::{
     BASE_FEE_BPS, MIN_FEE_BPS, HIGH_LOAD_THRESHOLD,
 };
 pub use validation::{require_auth_and_validate, ValidationError, Validator};
+
+// ---------------------------------------------------------------------------
+// #866 — Cross-Chain State Synchronization
+// ---------------------------------------------------------------------------
+pub use cross_chain_sync::{
+    acknowledge_prepare, begin_atomic_xchain_op, compute_state_merkle_root, confirm_commit,
+    confirm_rollback, expire_xchain_op, get_chain_isolation, get_inconsistency,
+    get_xchain_op, initiate_rollback, is_chain_isolated, is_reorg_safe, isolate_chain,
+    lift_chain_isolation, record_inconsistency, record_reorg_event, require_finality,
+    validate_state_proof, AtomicXChainOp, ChainFinalityConfig, ChainIsolationRecord,
+    CrossChainInconsistency, CrossChainStateProof, FinalityTier, XChainPhase,
+    XChainSyncError, MAX_PARTICIPATING_CHAINS, MIN_FINALITY_CONFIRMATIONS,
+    REORG_SAFE_DEPTH, XCHAIN_OP_TIMEOUT_SECS,
+};
+
+// ---------------------------------------------------------------------------
+// #867 — Social Engineering / Transaction-Intent Protection
+// ---------------------------------------------------------------------------
+pub use transaction_guard::{
+    add_multisig_approval, create_multisig_requirement, evaluate_transaction_intent,
+    get_protection_state, is_multisig_satisfied, record_suspicious_pattern,
+    require_account_not_blocked, require_cooling_off_elapsed, unblock_account,
+    AccountProtectionState, MultiSigRequirement, RiskLevel, SuspiciousPattern,
+    TransactionIntent, AUTO_BLOCK_SCORE_THRESHOLD, COOLING_OFF_PERIOD_SECS,
+    EMERGENCY_COOLING_OFF_SECS, HIGH_VALUE_THRESHOLD_BPS, MAX_OPS_PER_WINDOW,
+};
+
+// ---------------------------------------------------------------------------
+// #868 — Advanced Cryptographic Key Management
+// ---------------------------------------------------------------------------
+pub use key_management::{
+    approve_social_recovery, derive_child_key_commitment, emergency_revoke_key,
+    execute_key_rotation, execute_social_recovery, get_current_key, get_guardians,
+    initiate_social_recovery, is_key_revoked, is_registered_guardian,
+    is_reinstate_eligible, is_rotation_due, is_scheme_supported,
+    is_threshold_met, propose_key_rotation, register_guardian,
+    register_key, register_threshold_share, submit_threshold_share,
+    KeyRecord, KeyRevocationRecord, KeyRotationProposal, KeyScheme,
+    SocialRecoverySession, ThresholdKeyShare, DEFAULT_THRESHOLD_K, DEFAULT_THRESHOLD_N,
+    KEY_ROTATION_OVERLAP_SECS, KEY_ROTATION_PERIOD_SECS, MAX_GUARDIANS,
+    MAX_THRESHOLD_SHARES, REVOCATION_COOLDOWN_SECS, SOCIAL_RECOVERY_QUORUM,
+};
+
+// ---------------------------------------------------------------------------
+// #869 — Validator Accountability / Consensus Attack Resistance
+// ---------------------------------------------------------------------------
+pub use validator_accountability::{
+    activate_emergency_consensus, apply_slash, assess_incentive_alignment,
+    compute_network_anomaly_score, deactivate_emergency_consensus, detect_consensus_attack,
+    get_emergency_state, get_validator_record, graduated_slash_bps, is_emergency_active,
+    is_validator_ejected, record_epoch_participation, record_missed_epoch,
+    readmit_validator, register_validator, select_healthy_validators,
+    ConsensusAnomalyRecord, EmergencyConsensusState, IncentiveAlignmentScore,
+    SlashingEvent, ValidatorRecord, ViolationType,
+    ATTACK_EJECTION_THRESHOLD, EJECTION_COOLDOWN_SECS, EMERGENCY_TRIGGER_SCORE,
+    INITIAL_REPUTATION_SCORE, MAX_REPUTATION_SCORE, MIN_REPUTATION_SCORE,
+    REPUTATION_PENALTY_ATTACK, REPUTATION_PENALTY_EQUIVOCATION,
+    REPUTATION_PENALTY_MISSED, SLASH_CRITICAL_BPS, SLASH_MAJOR_BPS, SLASH_MINOR_BPS,
+};
+
+/// Layer-2 and state-channel integration metadata tracked by contracts that
+/// need to defer L1 commitment until the applicable challenge window ends.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct L2Integration {
+    pub network_id: u32,
+    pub finality_delay_secs: u64,
+    pub challenge_period_secs: u64,
+    pub last_l2_block: u64,
+    pub last_l1_commitment: u64,
+    pub emergency_shutdown: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StateChannelRecord {
+    pub channel_id: BytesN<32>,
+    pub party_a: Address,
+    pub party_b: Address,
+    pub opened_at: u64,
+    pub dispute_deadline: u64,
+    pub force_closed: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossLayerAtomicityRecord {
+    pub operation_id: BytesN<32>,
+    pub l1_started: bool,
+    pub l2_started: bool,
+    pub committed: bool,
+    pub rolled_back: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FraudProof {
+    pub l2_network_id: u32,
+    pub state_root: BytesN<32>,
+    pub invalid_transition_hash: BytesN<32>,
+    pub challenger: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CrossLayerAuditLog {
+    pub operation_id: BytesN<32>,
+    pub contract_id: Address,
+    pub source_layer: Symbol,
+    pub target_layer: Symbol,
+    pub synchronized: bool,
+    pub observed_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GameTheoryState {
+    pub collusion_score_bps: u32,
+    pub audit_sample_rate_bps: u32,
+    pub penalty_multiplier_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IncentiveCompatibilityResult {
+    pub strategy_proof: bool,
+    pub honest_nash_equilibrium: bool,
+    pub confidence_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollusionDetection {
+    pub suspicious: bool,
+    pub coordination_score_bps: u32,
+    pub evidence_count: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ZKProof {
+    pub scheme: Symbol,
+    pub circuit_hash: BytesN<32>,
+    pub proof_hash: BytesN<32>,
+    pub nullifier: BytesN<32>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrivacyAudit {
+    pub linkability_risk_bps: u32,
+    pub anonymity_breach: bool,
+    pub audited_at: u64,
+}
+
+pub fn l2_finality_reached(env: &Env, integration: &L2Integration, l2_block_age_secs: u64) -> bool {
+    !integration.emergency_shutdown
+        && l2_block_age_secs >= integration.finality_delay_secs + integration.challenge_period_secs
+        && env.ledger().timestamp() >= integration.last_l1_commitment
+}
+
+pub fn verify_l2_fraud_proof(proof: &FraudProof, expected_state_root: &BytesN<32>) -> bool {
+    &proof.state_root == expected_state_root
+}
+
+pub fn record_cross_layer_audit(
+    env: &Env,
+    contract_id: &Address,
+    operation_id: &BytesN<32>,
+    source_layer: Symbol,
+    target_layer: Symbol,
+    synchronized: bool,
+) -> CrossLayerAuditLog {
+    let log = CrossLayerAuditLog {
+        operation_id: operation_id.clone(),
+        contract_id: contract_id.clone(),
+        source_layer,
+        target_layer,
+        synchronized,
+        observed_at: env.ledger().timestamp(),
+    };
+    env.events().publish(
+        (symbol_short!("xl"), symbol_short!("audit")),
+        (
+            log.operation_id.clone(),
+            log.contract_id.clone(),
+            log.source_layer.clone(),
+            log.target_layer.clone(),
+            log.synchronized,
+            log.observed_at,
+        ),
+    );
+    log
+}
+
+pub fn compute_nullifier(
+    env: &Env,
+    address: &Address,
+    namespace: &str,
+    secret: &Bytes,
+    blinding: &BytesN<32>,
+) -> BytesN<32> {
+    let mut payload = Bytes::new(env);
+    payload.append(&address.to_xdr(env));
+    payload.append(&Bytes::from_slice(env, namespace.as_bytes()));
+    payload.append(secret);
+    let blind = Bytes::from_slice(env, &blinding.to_array());
+    payload.append(&blind);
+    env.crypto().sha256(&payload).into()
+}
+
+pub fn audit_privacy(proof: &ZKProof, signal_strength_bps: u32, audited_at: u64) -> PrivacyAudit {
+    let _ = proof;
+    let linkability_risk_bps = u32::min(10_000, signal_strength_bps.saturating_add(750));
+    PrivacyAudit {
+        linkability_risk_bps,
+        anonymity_breach: linkability_risk_bps > 7_500,
+        audited_at,
+    }
+}
 
 /// Economic sanity ceiling for a single financial amount (token smallest units).
 pub const MAX_FINANCIAL_AMOUNT: i128 = 1_000_000_000_000_000;

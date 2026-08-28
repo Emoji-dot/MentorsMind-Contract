@@ -12,6 +12,7 @@ use shared::{
     SuspiciousPatternFlag, Validator, EMERGENCY_THRESHOLD, MAX_SNAPSHOTS,
     MIN_STAKING_DURATION_SECS, PATTERN_DETECTION_WINDOW, REWARD_LOCKUP_SECS,
     REWARD_MULTIPLIER_MIN_BPS,
+    CollusionDetection, GameTheoryState, IncentiveCompatibilityResult, Pagination,
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
@@ -94,6 +95,18 @@ const ADMIN_CHANGE_TIMELOCK: u64 = 48 * 60 * 60;
 /// manipulative amount many orders of magnitude beyond any real mentor
 /// stake or platform revenue distribution.
 const MAX_FINANCIAL_AMOUNT: i128 = 1_000_000_000_000_000; // 100M tokens @ 7 decimals
+
+/// Safe upper bound on how many stakers `internal_distribute_revenue` will
+/// snapshot in a single call (#831). This function's correctness (per-
+/// staker epoch snapshots that make late deposits un-dilutive, see the
+/// comment above its snapshot loop) depends on every current staker being
+/// captured atomically in one pass, so — unlike a plain enumeration — it
+/// cannot simply be paginated across several calls without weakening that
+/// guarantee. Once staker_count exceeds this bound, distribute_revenue
+/// panics rather than risk exceeding the block gas limit mid-snapshot;
+/// operators at that scale should fall back to distribute_revenue_batch,
+/// which trades the anti-dilution guarantee for real pagination.
+const MAX_STAKERS_PER_SNAPSHOT: u32 = 500;
 
 // ---------------------------------------------------------------------------
 // Economic Protection & Sustainability Constants
@@ -220,6 +233,9 @@ pub enum DataKey {
     /// The highest epoch for which a RewardLockup has already been
     /// recorded for `staker` — avoids double-writing on re-settlement.
     StakerLockupSettledUntil(Address),
+    CollusionSignal(Address),
+    GameTheoryState,
+    IncentiveCompatibility(Address),
     /// Accumulated penalty pool from early unstakers. Distributed to all
     /// remaining eligible stakers on the next epoch close.
     PenaltyRedistributionPool,
@@ -595,6 +611,34 @@ impl StakingContract {
         env.storage()
             .instance()
             .set(&DataKey::TierRequirements, &requirements);
+    }
+
+    pub fn verify_incentive_compatibility(
+        env: Env,
+        mentor: Address,
+    ) -> IncentiveCompatibilityResult {
+        let suspicious = env
+            .storage()
+            .instance()
+            .get::<_, CollusionDetection>(&DataKey::CollusionSignal(mentor))
+            .map(|d| d.suspicious)
+            .unwrap_or(false);
+        IncentiveCompatibilityResult {
+            strategy_proof: !suspicious,
+            honest_nash_equilibrium: !suspicious,
+            confidence_bps: if suspicious { 1_500 } else { 8_500 },
+        }
+    }
+
+    pub fn adjust_game_theory_parameters(env: Env, collusion_score_bps: u32) {
+        env.storage().instance().set(
+            &DataKey::GameTheoryState,
+            &GameTheoryState {
+                collusion_score_bps,
+                audit_sample_rate_bps: if collusion_score_bps > 5_000 { 8_000 } else { 2_500 },
+                penalty_multiplier_bps: if collusion_score_bps > 5_000 { 12_000 } else { 5_000 },
+            },
+        );
     }
 
     /// Current stake/rating/session thresholds for each tier.
@@ -1123,11 +1167,16 @@ impl StakingContract {
         env.storage().persistent().get(&DataKey::StakerAt(index))
     }
 
-    /// Return all current stakers (Paginated).
-    pub fn get_stakers(env: Env) -> soroban_sdk::Vec<Address> {
+    /// Return a bounded page of current stakers (#831): despite its prior
+    /// doc comment, this previously iterated every staker on every call
+    /// with no bound, so its cost grew linearly with total staker count.
+    /// `limit` is capped to `MAX_PAGE_SIZE` via the shared `Pagination`
+    /// helper; callers wanting the full list page through with `offset`.
+    pub fn get_stakers(env: Env, offset: u32, limit: u32) -> soroban_sdk::Vec<Address> {
         let count = Self::get_staker_count(env.clone());
+        let (start, end) = Pagination::new(offset, limit).bounds(count);
         let mut out = soroban_sdk::Vec::new(&env);
-        for i in 0..count {
+        for i in start..end {
             if let Some(addr) = env
                 .storage()
                 .persistent()
@@ -1295,6 +1344,10 @@ impl StakingContract {
             .persistent()
             .get(&DataKey::StakerCount)
             .unwrap_or(0);
+
+        if staker_count > MAX_STAKERS_PER_SNAPSHOT {
+            panic!("too many stakers for an atomic epoch snapshot; use distribute_revenue_batch");
+        }
 
         for i in 0..staker_count {
             if let Some(staker) = env
@@ -1474,13 +1527,18 @@ impl StakingContract {
         }
 
         let count = Self::get_staker_count(env.clone());
-        let end = (offset + limit).min(count);
+        // #831: cap `limit` (not just `offset + limit`) so a caller can't
+        // force a full-table scan by passing a huge limit once `count`
+        // itself has grown large — `.min(count)` alone doesn't bound the
+        // per-call work, since it degenerates to `count` for any
+        // sufficiently large `limit`.
+        let (start, end) = Pagination::new(offset, limit).bounds(count);
 
         // === OPTIMIZATION: Batch storage operations to reduce N+1 query problem ===
         let mut batch_updates: soroban_sdk::Vec<(Address, i128)> = soroban_sdk::Vec::new(&env);
 
         // First pass: collect all staker data and calculate shares
-        for i in offset..end {
+        for i in start..end {
             if let Some(staker) = env
                 .storage()
                 .persistent()

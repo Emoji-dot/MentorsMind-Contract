@@ -3,6 +3,22 @@
 use soroban_sdk::{
     contract, contractimpl, contracttype, token, Address, BytesN, Env, IntoVal, Symbol, Vec,
 };
+use shared::{
+    l2_finality_reached,
+    record_cross_layer_audit,
+    L2Integration,
+    // #866 — Cross-chain state synchronization
+    begin_atomic_xchain_op,
+    acknowledge_prepare,
+    confirm_commit,
+    initiate_rollback,
+    is_chain_isolated,
+    isolate_chain,
+    lift_chain_isolation,
+    validate_state_proof,
+    CrossChainStateProof,
+    XChainPhase,
+};
 
 #[derive(Clone)]
 #[contracttype]
@@ -18,12 +34,18 @@ pub enum DataKey {
     /// Contract-isolated storage namespace root (#826).
     NamespaceRoot,
     Config,
+    L2Config,
+    L2Audit(BytesN<32>),
     ProcessedVAA(BytesN<32>),
     WrappedToken,
     TrustedRelayer(Address),
     ProcessedNonce(u32, u64),
     BridgeFundedEscrow(u64),
     EscrowRegistrySlot,
+    /// Active atomic cross-chain operation for a given escrow (#866).
+    ActiveXChainOp(u64),
+    /// Emergency isolation override flag (#866).
+    EmergencyIsolated,
 }
 
 #[contracttype]
@@ -91,9 +113,16 @@ impl BridgeReceiver {
         amount: i128,
         source_chain: u32,
     ) {
+        Self::ensure_l2_finality(&env);
+
         // Validate amount is positive
         if amount <= 0 {
             panic!("Amount must be positive");
+        }
+
+        // #866 — Block bridging from isolated source chains.
+        if is_chain_isolated(&env, source_chain) {
+            panic!("Source chain is currently isolated from bridge operations");
         }
 
         // Check if source chain is supported
@@ -131,6 +160,7 @@ impl BridgeReceiver {
 
         // Mark VAA as processed to prevent replay
         env.storage().instance().set(&processed_key, &true);
+        Self::record_audit(&env, &vaa_hash, source_chain);
 
         // Also store in config's processed_vaas list for audit
         let mut config = Self::get_config(&env);
@@ -146,6 +176,35 @@ impl BridgeReceiver {
             source_chain,
             &token_address,
         );
+    }
+
+    pub fn configure_l2(env: Env, admin: Address, network_id: u32, finality_delay_secs: u64, challenge_period_secs: u64) {
+        Self::require_admin(&env, &admin);
+        env.storage().instance().set(
+            &DataKey::L2Config,
+            &L2Integration {
+                network_id,
+                finality_delay_secs,
+                challenge_period_secs,
+                last_l2_block: env.ledger().sequence() as u64,
+                last_l1_commitment: env.ledger().timestamp(),
+                emergency_shutdown: false,
+            },
+        );
+    }
+
+    pub fn shutdown_l2(env: Env, admin: Address, emergency: bool) {
+        Self::require_admin(&env, &admin);
+        let mut cfg: L2Integration = env.storage().instance().get(&DataKey::L2Config).unwrap_or(L2Integration {
+            network_id: 0,
+            finality_delay_secs: 0,
+            challenge_period_secs: 0,
+            last_l2_block: 0,
+            last_l1_commitment: 0,
+            emergency_shutdown: false,
+        });
+        cfg.emergency_shutdown = emergency;
+        env.storage().instance().set(&DataKey::L2Config, &cfg);
     }
 
     /// Verify VAA hash against approved list
@@ -194,6 +253,11 @@ impl BridgeReceiver {
 
         if message.amount <= 0 {
             panic!("Amount must be positive");
+        }
+
+        // #866 — Block messages from isolated source chains.
+        if is_chain_isolated(&env, message.source_chain_id) {
+            panic!("Source chain is currently isolated from bridge operations");
         }
 
         let nonce_key = DataKey::ProcessedNonce(message.source_chain_id, message.nonce);
@@ -314,6 +378,26 @@ impl BridgeReceiver {
             })
     }
 
+    fn ensure_l2_finality(env: &Env) {
+        if let Some(cfg) = env.storage().instance().get::<_, L2Integration>(&DataKey::L2Config) {
+            if !l2_finality_reached(env, &cfg, env.ledger().timestamp().saturating_sub(cfg.last_l1_commitment)) {
+                panic!("L2 finality window not satisfied");
+            }
+        }
+    }
+
+    fn record_audit(env: &Env, op: &BytesN<32>, source_chain: u32) {
+        let contract_id = env.current_contract_address();
+        let _ = record_cross_layer_audit(
+            env,
+            &contract_id,
+            op,
+            Symbol::new(env, "l2"),
+            Symbol::new(env, "l1"),
+            source_chain != 0,
+        );
+    }
+
     fn escrow_registry(env: &Env) -> Address {
         env.storage()
             .instance()
@@ -355,6 +439,161 @@ impl BridgeReceiver {
         config.supported_chains = chains;
         env.storage().instance().set(&DataKey::Config, &config);
     }
+
+    // -----------------------------------------------------------------------
+    // #866 — Atomic cross-chain operations and emergency isolation
+    // -----------------------------------------------------------------------
+
+    /// Initiate an atomic two-phase-commit cross-chain operation for a
+    /// bridge transfer.
+    ///
+    /// Returns the `op_id` of the registered operation. The relayer must
+    /// call `acknowledge_bridge_prepare` on each participating chain, then
+    /// `confirm_bridge_commit` once all chains are ready.
+    pub fn begin_bridge_atomic_op(
+        env: Env,
+        relayer: Address,
+        source_chain_id: u32,
+        dest_chain_id: u32,
+        expected_state_root: BytesN<32>,
+    ) -> BytesN<32> {
+        relayer.require_auth();
+
+        if !Self::is_trusted_relayer(env.clone(), relayer.clone()) {
+            panic!("Untrusted relayer");
+        }
+
+        // Verify neither chain is isolated.
+        if is_chain_isolated(&env, source_chain_id) {
+            panic!("Source chain is currently isolated");
+        }
+        if is_chain_isolated(&env, dest_chain_id) {
+            panic!("Destination chain is currently isolated");
+        }
+
+        let mut chains = Vec::new(&env);
+        chains.push_back(source_chain_id);
+        chains.push_back(dest_chain_id);
+
+        let op_id = begin_atomic_xchain_op(&env, &relayer, chains, expected_state_root)
+            .unwrap_or_else(|e| panic!("Failed to begin atomic op: {}", e as u32));
+
+        env.events().publish(
+            ("bridge", "AtomicOpStarted"),
+            (op_id.clone(), source_chain_id, dest_chain_id),
+        );
+
+        op_id
+    }
+
+    /// Acknowledge the prepare phase for a chain in an atomic bridge op.
+    pub fn acknowledge_bridge_prepare(
+        env: Env,
+        relayer: Address,
+        op_id: BytesN<32>,
+        chain_id: u32,
+    ) -> u32 {
+        relayer.require_auth();
+        if !Self::is_trusted_relayer(env.clone(), relayer) {
+            panic!("Untrusted relayer");
+        }
+
+        let phase = acknowledge_prepare(&env, &op_id, chain_id)
+            .unwrap_or_else(|e| panic!("Prepare ack failed: {}", e as u32));
+
+        phase as u32
+    }
+
+    /// Confirm commit for a chain in an atomic bridge op.
+    ///
+    /// Validates the chain's state root against the expected root.
+    /// Triggers automatic rollback if roots diverge.
+    pub fn confirm_bridge_commit(
+        env: Env,
+        relayer: Address,
+        op_id: BytesN<32>,
+        chain_id: u32,
+        chain_state_root: BytesN<32>,
+    ) -> u32 {
+        relayer.require_auth();
+        if !Self::is_trusted_relayer(env.clone(), relayer) {
+            panic!("Untrusted relayer");
+        }
+
+        let phase = confirm_commit(&env, &op_id, chain_id, chain_state_root)
+            .unwrap_or_else(|e| panic!("Commit failed: {}", e as u32));
+
+        phase as u32
+    }
+
+    /// Manually trigger rollback for an in-flight atomic bridge operation.
+    pub fn rollback_bridge_op(env: Env, admin: Address, op_id: BytesN<32>) {
+        Self::require_admin(&env, &admin);
+        initiate_rollback(&env, &op_id)
+            .unwrap_or_else(|e| panic!("Rollback failed: {}", e as u32));
+
+        env.events().publish(("bridge", "AtomicOpRolledBack"), op_id);
+    }
+
+    /// Validate a cross-chain state proof before executing a bridge transfer.
+    ///
+    /// Returns `true` if the proof is valid.
+    pub fn validate_bridge_state_proof(
+        env: Env,
+        proof_chain_id: u32,
+        state_root: BytesN<32>,
+        proof_path: Vec<BytesN<32>>,
+        generated_at: u64,
+        expected_root: BytesN<32>,
+    ) -> bool {
+        let proof = CrossChainStateProof {
+            chain_id: proof_chain_id,
+            state_root,
+            proof_path,
+            generated_at,
+            validated: false,
+        };
+        validate_state_proof(&env, &proof, &expected_root)
+    }
+
+    /// Emergency: isolate a source chain from bridge operations.
+    ///
+    /// All VAA-based and relayer-based bridge operations from `chain_id`
+    /// will be blocked until the isolation is lifted.
+    pub fn emergency_isolate_chain(
+        env: Env,
+        admin: Address,
+        chain_id: u32,
+        reason: Symbol,
+    ) {
+        Self::require_admin(&env, &admin);
+        isolate_chain(&env, chain_id, reason, 1, 24 * 60 * 60);
+
+        env.events().publish(
+            ("bridge", "ChainIsolated"),
+            (chain_id, env.ledger().timestamp()),
+        );
+    }
+
+    /// Lift isolation for a chain after the cooling-off period.
+    pub fn lift_bridge_chain_isolation(env: Env, admin: Address, chain_id: u32) -> bool {
+        Self::require_admin(&env, &admin);
+        let result = lift_chain_isolation(&env, chain_id);
+
+        if result {
+            env.events().publish(
+                ("bridge", "ChainIsolationLifted"),
+                (chain_id, env.ledger().timestamp()),
+            );
+        }
+
+        result
+    }
+
+    /// Check whether a chain is currently isolated from bridge operations.
+    pub fn is_bridge_chain_isolated(env: Env, chain_id: u32) -> bool {
+        is_chain_isolated(&env, chain_id)
+    }
 }
 
 // Unit tests
@@ -362,6 +601,7 @@ impl BridgeReceiver {
 mod test {
     use super::*;
     use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::Ledger;
     use soroban_sdk::BytesN;
 
     fn create_wrapped_token(env: &Env, admin: &Address) -> Address {
@@ -504,5 +744,127 @@ mod test {
 
         // Second receive with same VAA - should fail
         client.receive_bridged_asset(&vaa_hash, &recipient, &1000, &CHAIN_ETHEREUM);
+    }
+
+    // -----------------------------------------------------------------------
+    // #866 — Cross-chain sync and emergency isolation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "Source chain is currently isolated from bridge operations")]
+    fn test_isolated_chain_blocks_receive() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let admin = Address::generate(&env);
+
+        let contract_id = env.register_contract(None, BridgeReceiver);
+        let client = BridgeReceiverClient::new(&env, &contract_id);
+        client.init(&admin);
+
+        let token = create_wrapped_token(&env, &admin);
+        client.set_wrapped_token(&admin, &token);
+
+        // Isolate Ethereum.
+        client.emergency_isolate_chain(&admin, &CHAIN_ETHEREUM, &soroban_sdk::Symbol::new(&env, "reorg"));
+
+        let vaa_hash = BytesN::from_array(&env, &[2u8; 32]);
+        let recipient = Address::generate(&env);
+        // Should panic — chain is isolated.
+        client.receive_bridged_asset(&vaa_hash, &recipient, &500, &CHAIN_ETHEREUM);
+    }
+
+    #[test]
+    fn test_chain_isolation_and_lift() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+
+        let contract_id = env.register_contract(None, BridgeReceiver);
+        let client = BridgeReceiverClient::new(&env, &contract_id);
+        client.init(&admin);
+
+        assert!(!client.is_bridge_chain_isolated(&CHAIN_ETHEREUM));
+
+        client.emergency_isolate_chain(&admin, &CHAIN_ETHEREUM, &soroban_sdk::Symbol::new(&env, "test"));
+        assert!(client.is_bridge_chain_isolated(&CHAIN_ETHEREUM));
+
+        // Cannot lift within 24h cooldown.
+        let lifted = client.lift_bridge_chain_isolation(&admin, &CHAIN_ETHEREUM);
+        assert!(!lifted);
+
+        // Advance 25 hours.
+        env.ledger().with_mut(|l| l.timestamp = 25 * 60 * 60);
+        let lifted = client.lift_bridge_chain_isolation(&admin, &CHAIN_ETHEREUM);
+        assert!(lifted);
+        assert!(!client.is_bridge_chain_isolated(&CHAIN_ETHEREUM));
+    }
+
+    #[test]
+    fn test_atomic_bridge_op_full_commit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let relayer = Address::generate(&env);
+
+        let contract_id = env.register_contract(None, BridgeReceiver);
+        let client = BridgeReceiverClient::new(&env, &contract_id);
+        client.init(&admin);
+        client.add_trusted_relayer(&admin, &relayer);
+
+        let expected_root = BytesN::from_array(&env, &[0xABu8; 32]);
+
+        let op_id = client.begin_bridge_atomic_op(
+            &relayer,
+            &CHAIN_ETHEREUM,
+            &CHAIN_SOLANA,
+            &expected_root,
+        );
+
+        // Phase 1 — both chains prepare.
+        client.acknowledge_bridge_prepare(&relayer, &op_id, &CHAIN_ETHEREUM);
+        let phase = client.acknowledge_bridge_prepare(&relayer, &op_id, &CHAIN_SOLANA);
+        // Both prepared → phase transitions to Committing (2).
+        assert_eq!(phase, 2u32);
+
+        // Phase 2 — both chains commit with matching root.
+        client.confirm_bridge_commit(&relayer, &op_id, &CHAIN_ETHEREUM, &expected_root);
+        let final_phase = client.confirm_bridge_commit(&relayer, &op_id, &CHAIN_SOLANA, &expected_root);
+        // Both committed → phase transitions to Committed (3).
+        assert_eq!(final_phase, 3u32);
+    }
+
+    #[test]
+    fn test_state_proof_validation() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+
+        let contract_id = env.register_contract(None, BridgeReceiver);
+        let client = BridgeReceiverClient::new(&env, &contract_id);
+        client.init(&admin);
+
+        let root = BytesN::from_array(&env, &[0xAAu8; 32]);
+        let proof_path = soroban_sdk::Vec::new(&env);
+
+        // Trivial proof: state_root == expected_root, empty path.
+        let valid = client.validate_bridge_state_proof(
+            &CHAIN_ETHEREUM,
+            &root,
+            &proof_path,
+            &1_000u64,
+            &root,
+        );
+        assert!(valid);
+
+        // Wrong expected root should fail.
+        let wrong_root = BytesN::from_array(&env, &[0xBBu8; 32]);
+        let invalid = client.validate_bridge_state_proof(
+            &CHAIN_ETHEREUM,
+            &root,
+            &proof_path,
+            &1_000u64,
+            &wrong_root,
+        );
+        assert!(!invalid);
     }
 }

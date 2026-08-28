@@ -8,6 +8,12 @@ use shared::{
     RollbackProposal, SnapshotMeta, StateVerificationReport, EMERGENCY_MSIG_SIGNERS,
     EMERGENCY_MSIG_THRESHOLD, EMERGENCY_THRESHOLD, JUSTICE_RESTORATION_COOLDOWN_SECS,
     MAX_SNAPSHOTS, SecureStorageAccess,
+    // #868 — Key management and rotation
+    emergency_revoke_key, execute_key_rotation, get_current_key, is_key_revoked,
+    is_rotation_due, propose_key_rotation, register_key,
+    KeyRecord, KeyRotationProposal, KeyScheme,
+    // #867 — Transaction intent / high-risk operation protection
+    evaluate_transaction_intent, get_protection_state, TransactionIntent,
 };
 use soroban_sdk::{
     contract, contractimpl, contracterror, contracttype, symbol_short, Address, Bytes, BytesN,
@@ -104,6 +110,11 @@ pub enum DataKey {
     DisputeAudit(u64),
     /// Latest recorded arbitration-fairness audit for a given arbitrator.
     ArbitratorAudit(Address),
+    // -----------------------------------------------------------------------
+    // #868 — Key management keys
+    // -----------------------------------------------------------------------
+    /// Key management namespace root for this multisig instance.
+    KeyManagementRoot,
 }
 
 /// Record of a multisig-signer-reviewed dispute oversight audit.
@@ -1025,6 +1036,174 @@ impl MultisigAdminContract {
     /// Return the last recorded arbitration-fairness audit for `arbitrator`.
     pub fn get_arbitrator_audit(env: Env, arbitrator: Address) -> Option<ArbitrationBiasFlag> {
         env.storage().persistent().get(&DataKey::ArbitratorAudit(arbitrator))
+    }
+
+    // =======================================================================
+    // #868 — Key Management and Rotation
+    // =======================================================================
+
+    /// Register or rotate a signing key for a multisig signer.
+    ///
+    /// Uses hierarchical deterministic derivation so each signer can maintain
+    /// forward secrecy. Only the signer themselves may register their own key.
+    pub fn register_signer_key(
+        env: Env,
+        signer: Address,
+        pubkey_commitment: BytesN<32>,
+        derivation_path_hash: BytesN<32>,
+    ) -> Result<KeyRecord, Error> {
+        if !env.storage().instance().has(&DataKey::Threshold) {
+            return Err(Error::NotInitialized);
+        }
+        if !env.storage().persistent()
+            .get::<_, bool>(&DataKey::Signer(signer.clone()))
+            .unwrap_or(false)
+        {
+            return Err(Error::NotSigner);
+        }
+        signer.require_auth();
+
+        let record = register_key(
+            &env,
+            &signer,
+            KeyScheme::Ed25519,
+            pubkey_commitment,
+            derivation_path_hash,
+            true, // enable forward secrecy
+        );
+
+        env.events().publish(
+            (symbol_short!("multisig"), symbol_short!("key_reg")),
+            (signer, record.version),
+        );
+
+        Ok(record)
+    }
+
+    /// Propose an automatic key rotation for a signer.
+    ///
+    /// The new key becomes active immediately upon `execute_signer_key_rotation`.
+    /// The old key remains valid for `KEY_ROTATION_OVERLAP_SECS` (7 days).
+    pub fn propose_signer_key_rotation(
+        env: Env,
+        signer: Address,
+        new_pubkey_commitment: BytesN<32>,
+        new_derivation_path_hash: BytesN<32>,
+    ) -> Result<KeyRotationProposal, Error> {
+        if !env.storage().instance().has(&DataKey::Threshold) {
+            return Err(Error::NotInitialized);
+        }
+        if !env.storage().persistent()
+            .get::<_, bool>(&DataKey::Signer(signer.clone()))
+            .unwrap_or(false)
+        {
+            return Err(Error::NotSigner);
+        }
+        signer.require_auth();
+
+        let proposal = propose_key_rotation(
+            &env,
+            &signer,
+            KeyScheme::Ed25519,
+            new_pubkey_commitment,
+            new_derivation_path_hash,
+        );
+
+        Ok(proposal)
+    }
+
+    /// Execute a pending key rotation for a signer.
+    pub fn execute_signer_key_rotation(
+        env: Env,
+        signer: Address,
+    ) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Threshold) {
+            return Err(Error::NotInitialized);
+        }
+        signer.require_auth();
+
+        execute_key_rotation(&env, &signer);
+        Ok(())
+    }
+
+    /// Emergency revoke a compromised signer key.
+    ///
+    /// Can be called by any registered signer (peer accountability).
+    /// The affected signer cannot re-register for `REVOCATION_COOLDOWN_SECS`.
+    pub fn emergency_revoke_signer_key(
+        env: Env,
+        caller: Address,
+        compromised_signer: Address,
+        key_version: u32,
+        reason: Symbol,
+    ) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Threshold) {
+            return Err(Error::NotInitialized);
+        }
+        if !env.storage().persistent()
+            .get::<_, bool>(&DataKey::Signer(caller.clone()))
+            .unwrap_or(false)
+        {
+            return Err(Error::NotSigner);
+        }
+        caller.require_auth();
+
+        if is_key_revoked(&env, &compromised_signer, key_version) {
+            return Err(Error::AlreadyExecuted);
+        }
+
+        emergency_revoke_key(&env, &compromised_signer, key_version, reason.clone());
+
+        env.events().publish(
+            (symbol_short!("multisig"), symbol_short!("key_rev")),
+            (caller, compromised_signer, key_version, reason),
+        );
+
+        Ok(())
+    }
+
+    /// Check whether a signer's current key is due for rotation.
+    pub fn is_key_rotation_due(env: Env, signer: Address) -> bool {
+        is_rotation_due(&env, &signer)
+    }
+
+    /// Get the current key record for a signer, if any.
+    pub fn get_signer_key(env: Env, signer: Address) -> Option<KeyRecord> {
+        get_current_key(&env, &signer)
+    }
+
+    // =======================================================================
+    // #867 — Transaction Intent Verification
+    // =======================================================================
+
+    /// Evaluate the risk of a proposed multisig action before signing.
+    ///
+    /// Returns a `TransactionIntent` with risk level, cooling-off requirements,
+    /// anomaly score, and whether the caller's account is blocked. Callers
+    /// should check `account_blocked` and `requires_cooling_off` before
+    /// proceeding with `propose_action` or `sign_action`.
+    pub fn evaluate_action_risk(
+        env: Env,
+        caller: Address,
+        operation: Symbol,
+        amount: i128,
+        is_new_target: bool,
+    ) -> TransactionIntent {
+        evaluate_transaction_intent(
+            &env,
+            &caller,
+            operation,
+            amount,
+            is_new_target,
+        )
+    }
+
+    /// Check whether an account is blocked due to suspicious activity.
+    ///
+    /// High-risk operations should call this before executing.
+    pub fn is_account_blocked(env: Env, account: Address) -> bool {
+        let state = get_protection_state(&env, &account);
+        state.blocked
     }
 }
 

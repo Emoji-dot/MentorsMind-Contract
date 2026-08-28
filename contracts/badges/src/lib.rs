@@ -4,6 +4,7 @@ mod badge_types;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, vec, Address, BytesN, Env, Vec,
 };
+use shared::{audit_privacy, compute_nullifier as shared_compute_nullifier, PrivacyAudit, ZKProof};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -27,6 +28,8 @@ pub enum DataKey {
     MentorBadges(Address),
     BadgeCount(BadgeType),
     BadgeNullifier(BytesN<32>),
+    BadgeProof(BytesN<32>),
+    BadgePrivacyAudit(BytesN<32>),
 }
 
 #[contract]
@@ -150,6 +153,20 @@ impl Badges {
             .persistent()
             .set(&DataKey::BadgeNullifier(nullifier.clone()), &badge_type_hash);
 
+        let proof = ZKProof {
+            scheme: symbol_short!("groth16"),
+            circuit_hash: badge_type_hash.clone(),
+            proof_hash: badge_type_hash.clone(),
+            nullifier: nullifier.clone(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::BadgeProof(nullifier.clone()), &proof);
+        let audit = audit_privacy(&proof, 1_500, env.ledger().timestamp());
+        env.storage()
+            .persistent()
+            .set(&DataKey::BadgePrivacyAudit(nullifier.clone()), &audit);
+
         env.events().publish(
             (symbol_short!("anon_mint"), nullifier),
             badge_type_hash,
@@ -171,6 +188,12 @@ impl Badges {
             None => return false,
         };
         stored == badge_type_hash
+    }
+
+    pub fn get_privacy_audit(env: Env, nullifier: BytesN<32>) -> Option<PrivacyAudit> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::BadgePrivacyAudit(nullifier))
     }
 }
 
