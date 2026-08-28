@@ -65,22 +65,19 @@ pub struct CostSnapshot {
 
 /// Reset the environment budget, execute `f`, then capture CPU + memory.
 ///
-/// Uses soroban-sdk v25+ `testutils::budget` API:
-/// - reset the budget tracker
-/// - run the measured closure
-/// - read back cpu + memory cost counters
+/// Uses the soroban-sdk `testutils` budget API available at runtime:
+///   - `env.budget().reset_default()` clears the instruction/memory counters.
+///   - `env.budget().cpu_instruction_cost()` returns the CPU instructions consumed.
+///   - `env.budget().memory_bytes()` returns the memory bytes consumed (when
+///     available; falls back to 0 on older SDK versions).
 pub fn measure<F: FnOnce()>(env: &Env, f: F) -> CostSnapshot {
-    // `Env::budget()` is available with `soroban-sdk` `testutils` enabled.
-    // It measures host-side cost during native test executions (note: may
-    // underestimate vs actual WASM execution).
-    let mut b = env.budget();
-    b.reset_default();
-
+    env.budget().reset_default();
     f();
-
+    let cpu = env.budget().cpu_instruction_cost();
+    let mem = env.budget().memory_bytes();
     CostSnapshot {
-        cpu_instructions: b.cpu_instruction_cost(),
-        mem_bytes: b.memory_bytes_cost(),
+        cpu_instructions: cpu,
+        mem_bytes: mem,
     }
 }
 
@@ -212,5 +209,116 @@ fn check_metric(
             measured,
             pct_change: pct * 100.0,
         });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Gas-estimation accuracy tracking
+// ---------------------------------------------------------------------------
+
+/// One measured entry point with both actual and estimated gas costs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GasAccuracyResult {
+    pub contract: String,
+    pub operation: String,
+    /// CPU instructions consumed by the actual operation.
+    pub actual_cpu: u64,
+    /// CPU instructions estimated by the on-chain heuristic.
+    pub estimated_cpu: u64,
+    /// Memory bytes consumed by the actual operation.
+    pub actual_mem: u64,
+    /// Memory bytes estimated by the on-chain heuristic (0 if not estimated).
+    pub estimated_mem: u64,
+    /// Relative error between actual and estimated CPU, as a percentage.
+    pub cpu_error_pct: f64,
+    /// Relative error between actual and estimated memory, as a percentage.
+    pub mem_error_pct: f64,
+    /// Whether the estimate is within the default tolerance (20%).
+    pub passes_tolerance: bool,
+}
+
+impl GasAccuracyResult {
+    /// Compute error percentages and tolerance check.
+    pub fn new(
+        contract: impl Into<String>,
+        operation: impl Into<String>,
+        actual_cpu: u64,
+        estimated_cpu: u64,
+        actual_mem: u64,
+        estimated_mem: u64,
+    ) -> Self {
+        let cpu_error_pct = if actual_cpu > 0 {
+            (actual_cpu.max(estimated_cpu) - actual_cpu.min(estimated_cpu)) as f64
+                / actual_cpu as f64
+                * 100.0
+        } else {
+            0.0
+        };
+        let mem_error_pct = if actual_mem > 0 && estimated_mem > 0 {
+            (actual_mem.max(estimated_mem) - actual_mem.min(estimated_mem)) as f64
+                / actual_mem as f64
+                * 100.0
+        } else {
+            0.0
+        };
+        let passes_tolerance = cpu_error_pct <= 20.0;
+        Self {
+            contract: contract.into(),
+            operation: operation.into(),
+            actual_cpu,
+            estimated_cpu,
+            actual_mem,
+            estimated_mem,
+            cpu_error_pct,
+            mem_error_pct,
+            passes_tolerance,
+        }
+    }
+}
+
+/// Return all accuracy results that failed the tolerance check.
+pub fn check_gas_accuracy(results: &[GasAccuracyResult]) -> Vec<&GasAccuracyResult> {
+    results.iter().filter(|r| !r.passes_tolerance).collect()
+}
+
+/// Write gas accuracy results to `benchmarks/results/gas_accuracy.json`.
+pub fn write_gas_accuracy_report(results: &[GasAccuracyResult]) {
+    extern crate std;
+    use std::fs;
+    let dir = "benchmarks/results";
+    let _ = fs::create_dir_all(dir);
+    let path = format!("{}/gas_accuracy.json", dir);
+    let json = serde_json::to_string_pretty(results).expect("failed to serialize gas accuracy");
+    let _ = fs::write(&path, json);
+    eprintln!("📄  Gas accuracy report written to {}", path);
+}
+
+/// Print a human-readable accuracy table to stderr.
+pub fn print_gas_accuracy(results: &[GasAccuracyResult]) {
+    eprintln!("\n── Gas Estimation Accuracy ──");
+    for r in results {
+        let status = if r.passes_tolerance {
+            "✅"
+        } else {
+            "❌"
+        };
+        eprintln!(
+            "  {} {:25} actual_cpu={:>12}  estimated_cpu={:>12}  error={:>5.1}%",
+            status,
+            r.operation,
+            r.actual_cpu,
+            r.estimated_cpu,
+            r.cpu_error_pct
+        );
+    }
+    let failures = check_gas_accuracy(results);
+    if !failures.is_empty() {
+        eprintln!("\n❌  {} estimate(s) exceeded 20% tolerance:", failures.len());
+        for r in failures {
+            eprintln!(
+                "  [{}/{}] estimated={} actual={} error={:.1}%",
+                r.contract, r.operation, r.estimated_cpu, r.actual_cpu, r.cpu_error_pct
+            );
+        }
     }
 }
