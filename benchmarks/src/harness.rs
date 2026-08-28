@@ -65,15 +65,22 @@ pub struct CostSnapshot {
 
 /// Reset the environment budget, execute `f`, then capture CPU + memory.
 ///
-/// Uses soroban-sdk v25+ budget API. The API has changed significantly.
-/// For now, return dummy values while we figure out the correct API.
-pub fn measure<F: FnOnce()>(_env: &Env, f: F) -> CostSnapshot {
-    // For now, just execute the function and return dummy values
-    // This allows benchmarks to run while we investigate the correct API
+/// Uses soroban-sdk v25+ `testutils::budget` API:
+/// - reset the budget tracker
+/// - run the measured closure
+/// - read back cpu + memory cost counters
+pub fn measure<F: FnOnce()>(env: &Env, f: F) -> CostSnapshot {
+    // `Env::budget()` is available with `soroban-sdk` `testutils` enabled.
+    // It measures host-side cost during native test executions (note: may
+    // underestimate vs actual WASM execution).
+    let mut b = env.budget();
+    b.reset_default();
+
     f();
+
     CostSnapshot {
-        cpu_instructions: 1000000, // Dummy value
-        mem_bytes: 50000,         // Dummy value
+        cpu_instructions: b.cpu_instruction_cost(),
+        mem_bytes: b.memory_bytes_cost(),
     }
 }
 
