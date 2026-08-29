@@ -3039,7 +3039,7 @@ mod tests {
             &session2,
             &mentor,
             &learner2,
-            &2_005_400u64,
+            &2_004_500u64,
             &30u32,
             &100i128,
             &token,
@@ -3154,18 +3154,104 @@ mod tests {
         }));
         assert!(result.is_err());
 
-        // Book with full buffer (next bucket at 2_005_400)
+        // Book with exactly the required 15-min buffer (900s after first ends)
         let session3 = Symbol::new(&env, "sess_buffer_3");
         let returned_id = client.register_session(
             &session3,
             &mentor,
             &learner2,
-            &2_005_400u64,
+            &2_004_500u64, // 2_003_600 + 900 = exactly 15 min after first ends
             &30u32,
             &100i128,
             &token,
         );
         assert_eq!(returned_id, session3);
+    }
+
+    /// Regression test for #828: back-to-back sessions whose start and end
+    /// both land exactly on a 30-minute bucket boundary must still be
+    /// rejected for violating the 15-minute buffer, even though the two
+    /// sessions' buckets never literally overlap.
+    #[test]
+    #[should_panic(expected = "SessionConflict")]
+    fn test_bucket_aligned_zero_gap_double_booking_rejected() {
+        let (env, client, _backend) = setup();
+        let mentor = Address::generate(&env);
+        let learner1 = Address::generate(&env);
+        let learner2 = Address::generate(&env);
+        let token = dummy_token(&env);
+
+        // Bucket-aligned start and duration: 1_800_000 / 1800 = 1000 exactly,
+        // and 60 minutes = 3600s = 2 buckets exactly, so the session ends
+        // exactly on a bucket boundary too (1_803_600 / 1800 = 1002).
+        let session1 = Symbol::new(&env, "sess_zerogap_1");
+        client.register_session(
+            &session1,
+            &mentor,
+            &learner1,
+            &1_800_000u64,
+            &60u32,
+            &100i128,
+            &token,
+        );
+
+        // Booked to start at the exact instant session1 ends: zero gap,
+        // well under the mandatory 15-minute buffer.
+        let session2 = Symbol::new(&env, "sess_zerogap_2");
+        client.register_session(
+            &session2,
+            &mentor,
+            &learner2,
+            &1_803_600u64,
+            &30u32,
+            &100i128,
+            &token,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "InvalidDuration")]
+    fn test_zero_duration_session_rejected() {
+        let (env, client, _backend) = setup();
+        let mentor = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let token = dummy_token(&env);
+
+        client.register_session(
+            &Symbol::new(&env, "sess_zero_dur"),
+            &mentor,
+            &learner,
+            &2_000_000u64,
+            &0u32,
+            &100i128,
+            &token,
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_emergency_scheduling_override_requires_backend_auth() {
+        let (env, client, _backend) = setup();
+        let mentor = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let token = dummy_token(&env);
+        let session_id = Symbol::new(&env, "sess_override_auth");
+
+        client.register_session(
+            &session_id,
+            &mentor,
+            &learner,
+            &2_000_000u64,
+            &60u32,
+            &100i128,
+            &token,
+        );
+
+        // Only the backend may invoke the override; an unmocked/other
+        // caller must be rejected rather than silently force-confirming
+        // the session (see #828).
+        env.mock_auths(&[]);
+        client.emergency_scheduling_override(&session_id);
     }
 
     #[test]
@@ -3366,7 +3452,6 @@ mod tests {
     #[test]
     fn test_emergency_scheduling_override_confirms_session() {
         let (env, client, _backend) = setup();
-        env.mock_all_auths();
         let mentor = Address::generate(&env);
         let learner = Address::generate(&env);
         let token = dummy_token(&env);
