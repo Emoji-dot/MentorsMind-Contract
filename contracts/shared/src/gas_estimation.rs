@@ -25,3 +25,52 @@ pub struct GasEstimate {
     /// oracle/reputation/snapshot lookups, etc.).
     pub cross_contract_calls: u32,
 }
+
+impl GasEstimate {
+    /// Default base instruction cost for a typical contract operation.
+    /// Covers dispatch, argument decoding, and basic validation.
+    pub const DEFAULT_BASE_INSTRUCTIONS: u64 = 40_000;
+
+    /// Default CPU cost per individual storage read or write.
+    pub const DEFAULT_PER_STORAGE_OP_INSTRUCTIONS: u64 = 2_000;
+
+    /// Default CPU cost per cross-contract invocation.
+    pub const DEFAULT_PER_CROSS_CALL_INSTRUCTIONS: u64 = 300_000;
+
+    /// Maximum allowed relative error between estimated and actual CPU
+    /// instructions for an estimate to be considered accurate, expressed
+    /// in basis points (1/100 of a percent). Default: 2_000 bps = 20%.
+    pub const DEFAULT_TOLERANCE_BPS: u32 = 2_000;
+
+    /// Compute the total estimated CPU instructions from a base plus
+    /// per-operation costs.
+    pub fn compute_instructions(
+        base: u64,
+        storage_ops: u32,
+        cross_calls: u32,
+    ) -> u64 {
+        base + (storage_ops as u64) * Self::DEFAULT_PER_STORAGE_OP_INSTRUCTIONS
+            + (cross_calls as u64) * Self::DEFAULT_PER_CROSS_CALL_INSTRUCTIONS
+    }
+
+    /// Check whether `actual` is within `tolerance_bps` of `estimated`.
+    /// Returns `true` when the relative error does not exceed the tolerance.
+    pub fn within_tolerance(estimated: u64, actual: u64, tolerance_bps: u32) -> bool {
+        if estimated == 0 && actual == 0 {
+            return true;
+        }
+        if estimated == 0 || actual == 0 {
+            return false;
+        }
+        let larger = u64::max(estimated, actual);
+        let smaller = u64::min(estimated, actual);
+        let diff = larger - smaller;
+        let allowed = (larger * (tolerance_bps as u64)) / 10_000;
+        diff <= allowed
+    }
+
+    /// Convenience helper using `DEFAULT_TOLERANCE_BPS`.
+    pub fn is_accurate(estimated: u64, actual: u64) -> bool {
+        Self::within_tolerance(estimated, actual, Self::DEFAULT_TOLERANCE_BPS)
+    }
+}

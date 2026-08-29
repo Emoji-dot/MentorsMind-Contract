@@ -8,8 +8,9 @@
 /// Output:
 ///   - benchmarks/results/report.json   — full machine-readable results
 ///   - benchmarks/results/report.html   — human-readable per-function table with trends
+///   - benchmarks/results/gas_accuracy.json — gas estimation accuracy report
 ///   - benchmarks/history/<date>_<sha>.json — persisted historical run record
-///   - Exit 0 on pass, 1 on regression
+///   - Exit 0 on pass, 1 on regression or estimation failure
 extern crate std;
 
 mod harness;
@@ -70,6 +71,7 @@ fn run_all_suites() -> Vec<BenchResult> {
     all.extend(suites::timelock::run());
     all.extend(suites::upgrade_registry::run());
     all.extend(suites::dispute_evidence::run());
+    all.extend(suites::gas_estimation::run());
     all
 }
 
