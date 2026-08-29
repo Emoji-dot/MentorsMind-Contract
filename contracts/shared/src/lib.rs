@@ -343,6 +343,18 @@ pub use dynamic_fees::{
     BASE_FEE_BPS, MIN_FEE_BPS, HIGH_LOAD_THRESHOLD,
 };
 pub use validation::{require_auth_and_validate, ValidationError, Validator};
+pub use curriculum_validation::{
+    validate_curriculum_standards, optimize_learning_path, CurriculumValidation, LearningPathOptimization, OutcomeAssessment, CurriculumDispute
+};
+pub use qualification_verification::{
+    verify_credential_validity, assess_skill_level, CredentialVerification, IdentityValidation, SkillAssessment
+};
+pub use proof_of_mentoring::{
+    generate_mentoring_proof, check_session_authenticity, ProofOfMentoring, SessionAuthenticity, ReputationIntegrity
+};
+pub use cross_contract_recovery::{
+    trigger_rollback, execute_with_recovery, RecoveryState, RollbackProtector
+};
 
 // ---------------------------------------------------------------------------
 // #866 — Cross-Chain State Synchronization

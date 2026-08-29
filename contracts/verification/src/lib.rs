@@ -9,6 +9,8 @@ use shared::{
     SpecializationGovernanceRecord,
     // Cross-platform identity validation (#904)
     CrossPlatformIdentity, is_identity_match,
+    verify_credential_validity, assess_skill_level, CredentialVerification, IdentityValidation, SkillAssessment,
+    trigger_rollback, execute_with_recovery, RecoveryState, RollbackProtector,
 };
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol, Vec,
