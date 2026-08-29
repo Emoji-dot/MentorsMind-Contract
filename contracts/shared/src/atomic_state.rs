@@ -221,7 +221,7 @@ pub fn compute_transition_proof_hash(
 }
 
 /// Helper to format symbol as string (works in no_std)
-fn format_symbol(sym: &Symbol) -> &'static str {
+fn format_symbol(_sym: &Symbol) -> &'static str {
     "state_transition"
 }
 
