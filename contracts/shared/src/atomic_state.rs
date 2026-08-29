@@ -1,3 +1,4 @@
+
 use soroban_sdk::{contracttype, Address, Env, Symbol, BytesN};
 
 /// State transition validation context for atomic operations

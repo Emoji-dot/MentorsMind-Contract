@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Symbol};
+use soroban_sdk::{contracttype, Symbol, Vec};
 
 /// Maximum number of detection events retained per session.
 pub const DETECTION_LOG_CAP: u32 = 20;
@@ -51,26 +51,27 @@ pub fn score_attack_event(event_type: &AttackType) -> u32 {
 }
 
 /// Determine whether a series of attack events constitutes a confirmed attack.
-pub fn evaluate_attack_risk(events: &[AttackEvent], now: u64) -> AttackDetectionResult {
+pub fn evaluate_attack_risk(events: &Vec<AttackEvent>, now: u64) -> AttackDetectionResult {
     let window_start = now.saturating_sub(ATTACK_DETECTION_WINDOW_SECS);
-    let recent: u32 = events
-        .iter()
-        .filter(|e| e.timestamp >= window_start)
-        .count() as u32;
+    let mut recent: u32 = 0;
+    let mut total_severity: u32 = 0;
+    let mut dominant = AttackType::SessionFlooding;
+    let mut max_severity: u32 = 0;
 
-    let total_severity: u32 = events
-        .iter()
-        .filter(|e| e.timestamp >= window_start)
-        .map(|e| e.severity)
-        .sum();
+    for i in 0..events.len() {
+        if let Some(e) = events.get(i) {
+            if e.timestamp >= window_start {
+                recent = recent.saturating_add(1);
+                total_severity = total_severity.saturating_add(e.severity);
+                if e.severity >= max_severity {
+                    max_severity = e.severity;
+                    dominant = e.event_type.clone();
+                }
+            }
+        }
+    }
 
     let detected = recent >= ATTACK_FLAG_THRESHOLD;
-    let dominant = events
-        .iter()
-        .filter(|e| e.timestamp >= window_start)
-        .max_by_key(|e| e.severity)
-        .map(|e| e.event_type.clone())
-        .unwrap_or(AttackType::SessionFlooding);
 
     AttackDetectionResult {
         detected,

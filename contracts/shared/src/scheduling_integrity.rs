@@ -10,7 +10,9 @@
 //! scheduling history; these functions are pure scoring/decision logic
 //! over data the caller already has on hand.
 
-use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, IntoVal, Symbol, TryIntoVal, Val, Vec};
+use soroban_sdk::{
+    contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env, IntoVal, Symbol, TryIntoVal, Val, Vec,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -99,15 +101,11 @@ pub fn compute_availability_commitment(
     salt: &BytesN<32>,
 ) -> BytesN<32> {
     let mut input = Bytes::new(env);
-    let mentor_val: Val = mentor.clone().into_val(env);
-    let mentor_bytes: Bytes = mentor_val.try_into_val(env).unwrap();
-    input.append(&mentor_bytes);
+    input.append(&mentor.to_xdr(env));
     for b in slot_start.to_be_bytes().iter() {
         input.push_back(*b);
     }
-    let salt_val: Val = salt.clone().into_val(env);
-    let salt_bytes: Bytes = salt_val.try_into_val(env).unwrap();
-    input.append(&salt_bytes);
+    input.append(&Bytes::from_slice(env, &salt.to_array()));
     env.crypto().sha256(&input).into()
 }
 
