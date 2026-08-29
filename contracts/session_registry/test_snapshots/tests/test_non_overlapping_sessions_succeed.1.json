@@ -63,7 +63,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
                 },
                 {
-                  "u64": "2005400"
+                  "u64": "2004500"
                 },
                 {
                   "u32": 30
@@ -771,7 +771,7 @@
               "val": {
                 "vec": [
                   {
-                    "u64": "2005400"
+                    "u64": "2004500"
                   }
                 ]
               }
@@ -897,36 +897,6 @@
               },
               "durability": "persistent",
               "val": {
-                "symbol": "sess_nooverlap_1"
-              }
-            }
-          },
-          "ext": "v0"
-        },
-        "live_until": 1000000
-      },
-      {
-        "entry": {
-          "last_modified_ledger_seq": 0,
-          "data": {
-            "contract_data": {
-              "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-              "key": {
-                "vec": [
-                  {
-                    "symbol": "MentorScheduleSlot"
-                  },
-                  {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                  },
-                  {
-                    "u64": "1114"
-                  }
-                ]
-              },
-              "durability": "persistent",
-              "val": {
                 "symbol": "sess_nooverlap_2"
               }
             }
@@ -951,7 +921,7 @@
                     "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                   },
                   {
-                    "u64": "1115"
+                    "u64": "1114"
                   }
                 ]
               },
@@ -1310,7 +1280,7 @@
                       "symbol": "scheduled_at"
                     },
                     "val": {
-                      "u64": "2005400"
+                      "u64": "2004500"
                     }
                   },
                   {
@@ -1525,7 +1495,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
                 },
                 {
-                  "u64": "2005400"
+                  "u64": "2004500"
                 }
               ]
             }
