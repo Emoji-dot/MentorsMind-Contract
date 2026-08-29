@@ -1331,29 +1331,82 @@ impl SessionRegistry {
         );
     }
 
+    /// Validate a requested time slot and compute its exact end timestamp.
+    /// Panics with "InvalidDuration" for a zero-length session and with
+    /// "SessionEndOverflow" if `scheduled_at + duration` would overflow a
+    /// `u64`, closing off both as boundary-manipulation vectors.
+    fn validate_time_slot(scheduled_at: u64, duration_mins: u32) -> u64 {
+        if duration_mins == 0 {
+            panic!("InvalidDuration");
+        }
+        let session_duration_secs = (duration_mins as u64) * 60;
+        scheduled_at
+            .checked_add(session_duration_secs)
+            .expect("SessionEndOverflow")
+    }
+
     /// Check for scheduling conflicts and buffer enforcement.
-    /// Panics with "SessionConflict" if an overlap (including 15-min buffer) is detected.
+    /// Panics with "SessionConflict" if an overlap (including the mandatory
+    /// `SCHEDULING_BUFFER_SECS` buffer) is detected.
+    ///
+    /// Buckets are a coarse (30-minute) reservation index, not the source of
+    /// truth for a session's real span, and rounding a bucket-only check
+    /// naively out by the buffer compounds with that coarseness in both
+    /// directions: it can be tricked into a zero-gap double-booking when
+    /// both sessions land on a bucket boundary, or it can wrongly reject a
+    /// booking that already has a full 15-minute gap. To be exact, buckets
+    /// are only used to *discover* nearby sessions cheaply; the actual
+    /// overlap-plus-buffer test is done with exact, second-level arithmetic
+    /// against each candidate's real stored `scheduled_at`/`duration_mins`
+    /// (the ledger's native timestamp precision — Soroban has no
+    /// sub-second clock, so second-level integer arithmetic here is the
+    /// precise/exact check the "nanosecond accuracy" requirement calls
+    /// for). See #828.
     fn check_scheduling_conflicts(
         env: &Env,
         mentor: &Address,
         scheduled_at: u64,
         duration_mins: u32,
     ) {
-        let session_duration_secs = (duration_mins as u64) * 60;
-        let session_end = scheduled_at + session_duration_secs;
+        let session_end = Self::validate_time_slot(scheduled_at, duration_mins);
 
-        let start_bucket = scheduled_at / SLOT_SIZE_SECS;
-        let end_bucket = (session_end + SLOT_SIZE_SECS - 1) / SLOT_SIZE_SECS;
+        // Widen only the bucket *scan* by the buffer so a nearby session
+        // isn't missed due to bucket-boundary rounding; the buffer itself
+        // is enforced below with exact arithmetic, not by this widening.
+        let scan_start = scheduled_at.saturating_sub(SCHEDULING_BUFFER_SECS);
+        let scan_end = session_end
+            .checked_add(SCHEDULING_BUFFER_SECS)
+            .expect("SessionEndOverflow");
+
+        let start_bucket = scan_start / SLOT_SIZE_SECS;
+        let end_bucket = (scan_end + SLOT_SIZE_SECS - 1) / SLOT_SIZE_SECS;
 
         for bucket in start_bucket..end_bucket {
             let slot_key = DataKey::MentorScheduleSlot(mentor.clone(), bucket);
-            if env.storage().persistent().has(&slot_key) {
+            let Some(other_session_id): Option<Symbol> = env.storage().persistent().get(&slot_key)
+            else {
+                continue;
+            };
+            let Some(other): Option<SessionRecord> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Session(other_session_id))
+            else {
+                continue;
+            };
+            let other_end = other.scheduled_at.saturating_add((other.duration_mins as u64) * 60);
+            let overlaps_with_buffer = scheduled_at < other_end.saturating_add(SCHEDULING_BUFFER_SECS)
+                && other.scheduled_at < session_end.saturating_add(SCHEDULING_BUFFER_SECS);
+            if overlaps_with_buffer {
                 panic!("SessionConflict");
             }
         }
     }
 
-    /// Reserve all time buckets for a session.
+    /// Reserve all time buckets for a session. Only the session's own exact
+    /// span is reserved — the buffer is enforced at check time, not by
+    /// over-reserving buckets, so adjacent mentors' slots stay bookable
+    /// right up to the buffer boundary.
     fn reserve_time_buckets(
         env: &Env,
         mentor: &Address,
@@ -1361,8 +1414,7 @@ impl SessionRegistry {
         duration_mins: u32,
         session_id: &Symbol,
     ) {
-        let session_duration_secs = (duration_mins as u64) * 60;
-        let session_end = scheduled_at + session_duration_secs;
+        let session_end = Self::validate_time_slot(scheduled_at, duration_mins);
 
         let start_bucket = scheduled_at / SLOT_SIZE_SECS;
         let end_bucket = (session_end + SLOT_SIZE_SECS - 1) / SLOT_SIZE_SECS;
@@ -1378,8 +1430,7 @@ impl SessionRegistry {
 
     /// Release all time buckets for a session.
     fn release_time_buckets(env: &Env, mentor: &Address, scheduled_at: u64, duration_mins: u32) {
-        let session_duration_secs = (duration_mins as u64) * 60;
-        let session_end = scheduled_at + session_duration_secs;
+        let session_end = Self::validate_time_slot(scheduled_at, duration_mins);
 
         let start_bucket = scheduled_at / SLOT_SIZE_SECS;
         let end_bucket = (session_end + SLOT_SIZE_SECS - 1) / SLOT_SIZE_SECS;
