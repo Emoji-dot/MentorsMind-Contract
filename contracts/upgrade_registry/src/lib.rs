@@ -394,7 +394,7 @@ impl UpgradeRegistryContract {
         Ok(())
     }
 
-    #[allow(deprecated)]
+    #[deprecated(since = "0.2.0", note = "Use two-step schedule_upgrade + execute_pending_upgrade (PATH A) instead. Will be removed in v1.0.0.")]
     pub fn register_upgrade(
         env: Env,
         contract_name: Symbol,
@@ -402,6 +402,10 @@ impl UpgradeRegistryContract {
         new_version: u32,
         changelog_hash: BytesN<32>,
     ) -> Result<(), Error> {
+        soroban_sdk::log!(
+            &env,
+            "DEPRECATION WARNING: register_upgrade is deprecated and will be removed in v1.0.0. Please migrate to schedule_upgrade + execute_pending_upgrade."
+        );
         let admin = Self::require_admin(&env)?;
 
         let current = Self::get_latest_version(env.clone(), contract_name.clone());
@@ -456,6 +460,7 @@ impl UpgradeRegistryContract {
         Ok(())
     }
 
+    #[deprecated(since = "0.2.0", note = "Use two-step schedule_upgrade + execute_pending_upgrade (PATH A) instead. Will be removed in v1.0.0.")]
     pub fn upgrade_contract(
         env: Env,
         new_wasm_hash: BytesN<32>,
@@ -464,6 +469,10 @@ impl UpgradeRegistryContract {
         changelog_hash: BytesN<32>,
         approvers: Vec<Address>,
     ) -> Result<(), Error> {
+        soroban_sdk::log!(
+            &env,
+            "DEPRECATION WARNING: upgrade_contract is deprecated and will be removed in v1.0.0. Please migrate to schedule_upgrade + execute_pending_upgrade."
+        );
         let approved_signers = require_upgrade_approvals_cached(&env, approvers)?;
 
         let current = Self::get_latest_version(env.clone(), contract_name.clone());
