@@ -219,7 +219,7 @@ pub fn register_key(
     env.storage().persistent().set(&ver_key, &record.version);
 
     env.events().publish(
-        (symbol_short!("keymgmt"), symbol_short!("registered")),
+        (symbol_short!("keymgmt"), symbol_short!("register")),
         (account.clone(), record.version, record.scheme as u32),
     );
 
@@ -734,6 +734,7 @@ fn get_current_key_version(env: &Env, account: &Address) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use soroban_sdk::testutils::Address as _;
     extern crate std;
     use super::*;
     use soroban_sdk::{testutils::Ledger, Env};

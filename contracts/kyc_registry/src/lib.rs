@@ -8,10 +8,9 @@ use shared::{
     restore_fair_onboarding_access, is_onboarding_restoration_eligible, OnboardingFairness,
     VerificationAuthenticity, AdmissionEquity, AccessMonitoringRecord, OnboardingAuditRecord,
     OnboardingProtectionRecord, ONBOARDING_RESTORATION_COOLDOWN_SECS,
-    check_access, compute_privacy_intervention, contain_data_breach, detect_cross_session_leak,
-    detect_exploitation, minimize_to_need_to_know, AccessDecision, ConsentRecord,
-    CrossSessionLeakResult, DataBreachContainment, PrivacyInterventionRecord,
-    PrivacyMonitoringResult, ALL_FIELDS,
+    contain_data_breach, detect_cross_session_leak,
+    CrossSessionLeakResult, DataBreachContainment,
+    trigger_rollback, execute_with_recovery, RecoveryState, RollbackProtector,
 };
 use soroban_sdk::{
     contract, contractclient, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
@@ -744,7 +743,7 @@ impl KycRegistry {
     /// Returns true if the user passes all required verification steps.
     pub fn verify_user_identity(env: Env, user: Address) -> bool {
         let kyc_level = Self::get_kyc_level(env.clone(), user.clone());
-        let is_valid = Self::is_kyc_valid(env.clone(), user.clone());
+        let is_valid = Self::is_kyc_valid(env.clone(), user.clone(), KycLevel::Basic);
 
         // Identity verification requires at least Basic KYC that is still valid.
         (kyc_level as u32) >= (KycLevel::Basic as u32) && is_valid
@@ -781,6 +780,31 @@ impl KycRegistry {
                 shared::is_account_locked(&r, now)
             }
         }
+    }
+
+    // ── Qualification Verification (#887) ──────────────────────────
+
+    pub fn register_identity(env: Env, user: Address, identity_hash: BytesN<32>, provider: Address) -> bool {
+        let current_addr = env.current_contract_address();
+        let user_clone = user.clone();
+        let _ = execute_with_recovery(current_addr, Symbol::new(&env, "register_identity"), || {
+            let key = DataKey::CrossPlatformIdentity(user_clone.clone(), Symbol::new(&env, "default"));
+            let record = shared::CrossPlatformIdentity {
+                platform_id: Symbol::new(&env, "default"),
+                user_id: identity_hash.clone(),
+                verified: true,
+                correlation_score: 100,
+            };
+            env.storage().persistent().set(&key, &record);
+            Ok(())
+        });
+        env.events().publish((symbol_short!("kyc"), Symbol::new(&env, "registered")), user);
+        true
+    }
+
+    pub fn verify_kyc_status(env: Env, user: Address) -> bool {
+        let level = Self::get_kyc_level(env.clone(), user.clone());
+        (level as u32) >= (KycLevel::Basic as u32)
     }
 }
 

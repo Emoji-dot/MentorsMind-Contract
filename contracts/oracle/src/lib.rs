@@ -24,6 +24,10 @@ use soroban_sdk::{
     contract, contractclient, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
     Symbol, Vec,
 };
+use shared::mev_protection::{
+    detect_atomic_arbitrage, enforce_protocol_isolation, record_mev_monitoring,
+    MevProtectionFlag, FairValueExtractionRecord, MevMonitoringRecord,
+};
 
 // ---------------------------------------------------------------------------
 // Storage key constants
@@ -32,6 +36,7 @@ use soroban_sdk::{
 const ADMIN: Symbol = symbol_short!("ADMIN");
 const FEEDERS: Symbol = symbol_short!("FEEDERS");
 const RBAC: Symbol = symbol_short!("RBAC");
+const MEV_INTERACTION: Symbol = symbol_short!("MEV_INT");
 
 /// Minimum number of active (non-stale) feeders required to compute TWAP.
 const MIN_FEEDERS: u32 = 3;
@@ -253,6 +258,16 @@ impl OracleContract {
             panic!("price must be positive");
         }
 
+        let interactions = Self::_track_mev_interaction(&env, &feeder);
+        let mev_flag = detect_atomic_arbitrage(&env, &feeder, interactions);
+        if !enforce_protocol_isolation(&mev_flag) {
+            panic!("protocol isolation: MEV arbitrage detected");
+        }
+
+        // -------------------------------------------------------------------
+        // Circuit breaker: reject prices that deviate more than the configured
+        // threshold from the current TWAP.
+        // -------------------------------------------------------------------
         // #866 — Reject if the feeder's chain is currently isolated.
         // Chain ID 0 is used as the oracle chain namespace.
         if is_chain_isolated(&env, 0u32) {
@@ -704,6 +719,15 @@ impl OracleContract {
     // Internal helpers
     // -----------------------------------------------------------------------
 
+    fn _track_mev_interaction(env: &Env, caller: &Address) -> u32 {
+        let key = (MEV_INTERACTION, caller.clone(), env.ledger().sequence());
+        let mut count: u32 = env.storage().temporary().get(&key).unwrap_or(0);
+        count += 1;
+        env.storage().temporary().set(&key, &count);
+        count
+    }
+
+    /// Count the number of distinct feeder addresses in a set of price points.
     fn count_distinct_feeders(env: &Env, points: &Vec<PricePoint>) -> u32 {
         let mut seen: Vec<Address> = Vec::new(env);
         for p in points.iter() {
