@@ -1144,6 +1144,20 @@ impl TreasuryContract {
         if recipient_balance < amount_ref {
             return Err(Error::StateValidationFailed);
         }
+        let conservation = validate_fund_conservation(
+            &env, balance_before, 0, amount_ref, 0, balance_after,
+        );
+        record_invariant_check(&env, &EconomicInvariantRecord {
+            invariant: EconomicInvariant::FundConservation,
+            valid: conservation.valid,
+            observed: conservation.observed,
+            expected: conservation.expected,
+            timestamp: env.ledger().timestamp(),
+            ledger: env.ledger().sequence(),
+        });
+        if !conservation.valid {
+            return Err(Error::StateValidationFailed);
+        }
         pre_snapshot.assert_valid();
 
         let count: u32 = env
@@ -1797,6 +1811,20 @@ impl TreasuryContract {
         if staking_balance < total_amount {
             return Err(Error::StateValidationFailed);
         }
+        let conservation = validate_fund_conservation(
+            &env, balance_before, 0, total_amount, 0, balance_after,
+        );
+        record_invariant_check(&env, &EconomicInvariantRecord {
+            invariant: EconomicInvariant::FundConservation,
+            valid: conservation.valid,
+            observed: conservation.observed,
+            expected: conservation.expected,
+            timestamp: env.ledger().timestamp(),
+            ledger: env.ledger().sequence(),
+        });
+        if !conservation.valid {
+            return Err(Error::StateValidationFailed);
+        }
         pre_snapshot.assert_valid();
 
         let mut receipt: DistributionReceipt = env
@@ -2198,6 +2226,25 @@ impl TreasuryContract {
         token_client.transfer(&env.current_contract_address(), &destination, &amount);
         Ok(())
     // ── Economic monitoring & fairness audit (#903) ────────────────────────
+
+    /// Validates a distribution's allocation vector and emits a monitorable
+    /// violation event when amounts do not reconcile to the declared reward.
+    pub fn verify_reward_allocation(
+        env: Env,
+        total_reward: i128,
+        allocations: Vec<RewardAllocation>,
+    ) -> bool {
+        let result = validate_reward_distribution(&env, total_reward, &allocations);
+        record_invariant_check(&env, &EconomicInvariantRecord {
+            invariant: EconomicInvariant::RewardDistribution,
+            valid: result.valid,
+            observed: result.observed,
+            expected: result.expected,
+            timestamp: env.ledger().timestamp(),
+            ledger: env.ledger().sequence(),
+        });
+        result.valid
+    }
 
     /// Monitor token flows during a distribution to detect manipulation
     /// patterns such as coordinated timing or excessive extraction.

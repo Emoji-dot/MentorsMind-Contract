@@ -16,6 +16,8 @@ use shared::{
     record_epoch_participation,
     record_missed_epoch,
     register_validator,
+    validate_market_observations,
+    MarketObservation,
     ViolationType,
 };
 use soroban_sdk::{
@@ -451,6 +453,7 @@ impl OracleContract {
         let (primary_price, _) = Self::get_price(env.clone(), asset.clone());
 
         let mut secondary_prices: Vec<i128> = Vec::new(&env);
+        let mut observations: Vec<MarketObservation> = Vec::new(&env);
         for source in sources.iter() {
             let price: i128 = env.invoke_contract(
                 &source.source_address,
@@ -458,6 +461,12 @@ impl OracleContract {
                 (asset.clone(),).into_val(&env),
             );
             secondary_prices.push_back(price);
+            observations.push_back(MarketObservation {
+                venue: source.source_address.clone(),
+                price,
+                liquidity: i128::from(source.weight.max(1)),
+                observed_at: env.ledger().timestamp(),
+            });
         }
 
         if (secondary_prices.len() as u32) < MIN_SECONDARY_CONSENSUS {
@@ -465,6 +474,15 @@ impl OracleContract {
         }
 
         let secondary_median = Self::median(secondary_prices.clone());
+
+        let market_check = validate_market_observations(
+            &env,
+            &observations,
+            MAX_SOURCE_DIVERGENCE_BPS as u32,
+        );
+        if !market_check.valid {
+            panic!("market observations failed manipulation-resistance checks");
+        }
 
         // Cross-chain consistency check: primary vs secondary median.
         let divergence = if primary_price > secondary_median {

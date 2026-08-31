@@ -17,6 +17,7 @@ pub mod cross_chain_sync;
 pub mod disaster_recovery;
 pub mod emergency;
 pub mod emergency_rollback;
+pub mod economic_verification;
 pub mod error_context;
 pub mod escrow;
 pub mod events;
@@ -119,6 +120,13 @@ pub use emergency_rollback::{
     EmergencyRollback, ImmutableRollbackAuditRecord, RollbackAuthorization, RollbackJustification,
     RollbackScope, ROLLBACK_COMMUNITY_REVIEW_SECS, ROLLBACK_GOVERNANCE_QUORUM_BPS,
     ROLLBACK_MAX_WINDOW_SECS,
+};
+pub use economic_verification::{
+    record_invariant_check, validate_fund_conservation, validate_market_observations,
+    validate_reward_distribution, validate_temporal_progress, EconomicInvariant,
+    EconomicInvariantRecord, MarketObservation, MarketValidation, PropertyValidation,
+    RewardAllocation, BPS_DENOMINATOR, DEFAULT_MAX_STATE_AGE_SECS,
+    MAX_REWARD_ROUNDING_ERROR,
 };
 pub use error_context::{log_contract_error, ContractErrorContext};
 pub use escrow::{EscrowRecord, EscrowStatus, EscrowTransitionLog};
