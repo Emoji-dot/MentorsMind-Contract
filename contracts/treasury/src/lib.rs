@@ -6,6 +6,14 @@ use shared::{
     detect_price_coordination, validate_market_rate,
     enforce_fair_pricing as shared_enforce_fair_pricing, FairPricingResult, MarketRateValidation,
     PriceCoordinationFlag, DEFAULT_MAX_MARKET_DEVIATION_BPS,
+    detect_atomic_arbitrage, enforce_protocol_isolation, compute_mev_redistribution, record_mev_monitoring,
+    MevProtectionFlag, FairValueExtractionRecord, MevMonitoringRecord,
+    // resource management
+    manage_session_load, check_emergency_trigger,
+    // platform authenticity
+    detect_fee_evasion, PenaltyTier,
+    // dynamic fees
+    calculate_dynamic_fee, detect_fee_gaming,
 };
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, token,
@@ -307,6 +315,15 @@ pub enum DataKey {
     /// used to detect coordinated price setting.
     RecentPricesForToken(Address),
     RecentPriceTimestampsForToken(Address),
+    // -----------------------------------------------------------------------
+    // MEV Protection keys
+    // -----------------------------------------------------------------------
+    MevInteractionCount(Address, u32),
+    // -----------------------------------------------------------------------
+    // Economic Audit
+    // -----------------------------------------------------------------------
+    TotalDeposits(Address),
+    DepositCount(Address),
     // ── Economic monitoring & fairness audit (#903) ────────────────────────
     /// Token flow monitoring record for a distribution epoch.
     TokenFlowRecord(u64),
@@ -813,6 +830,14 @@ impl TreasuryContract {
         Ok(())
     }
 
+    fn _track_mev_interaction(env: &Env, caller: &Address) -> u32 {
+        let key = DataKey::MevInteractionCount(caller.clone(), env.ledger().sequence());
+        let mut count: u32 = env.storage().temporary().get(&key).unwrap_or(0);
+        count += 1;
+        env.storage().temporary().set(&key, &count);
+        count
+    }
+
     fn _is_token_approved(env: &Env, token: &Address) -> bool {
         env.storage()
             .persistent()
@@ -871,6 +896,20 @@ impl TreasuryContract {
         let _guard = ReentrancyGuard::enter(&env, Symbol::new(&env, "deposit"));
 
         from.require_auth();
+
+        // ── Rate Limiting & Emergency Throttling ─────────────────────────────────
+        let req_count = Self::_track_mev_interaction(&env, &from);
+        
+        let global_reqs: u32 = env.storage().temporary().get(&DataKey::NamespaceRoot).unwrap_or(0) + 1;
+        env.storage().temporary().set(&DataKey::NamespaceRoot, &global_reqs);
+        
+        let is_emergency = check_emergency_trigger(global_reqs);
+        let limit_status = manage_session_load(&env, req_count, is_emergency);
+        if !limit_status.allowed {
+            return Err(Error::ReentrancyGuardPaused); // Treat as throttled
+        }
+        // ─────────────────────────────────────────────────────────────────────────
+
         Validator::new(&env)
             .require_positive(amount, "amount")
             .require_max(amount, MAX_FINANCIAL_AMOUNT, "amount")
@@ -889,6 +928,27 @@ impl TreasuryContract {
 
         let balance_after: i128 =
             token::Client::new(&env, &token).balance(&env.current_contract_address());
+
+        // ── Economic Audit ───────────────────────────────────────────────────────
+        let dep_count_key = DataKey::DepositCount(from.clone());
+        let total_dep_key = DataKey::TotalDeposits(from.clone());
+        
+        let count: u32 = env.storage().persistent().get(&dep_count_key).unwrap_or(0) + 1;
+        let total: i128 = env.storage().persistent().get(&total_dep_key).unwrap_or(0) + amount;
+        
+        env.storage().persistent().set(&dep_count_key, &count);
+        env.storage().persistent().set(&total_dep_key, &total);
+        
+        // Expected fee of 100_000 tokens on average per deposit (example baseline)
+        let expected_avg: i128 = 100_000;
+        let actual_avg = total / (count as i128);
+        
+        let audit = detect_fee_evasion(&env, expected_avg, actual_avg);
+        if audit.penalty_tier == PenaltyTier::PermanentBan || audit.penalty_tier == PenaltyTier::TemporarySuspension {
+            return Err(Error::CallerNotAuthorized); // Block deposit if suspended for fee evasion
+        }
+        // ─────────────────────────────────────────────────────────────────────────
+
         if balance_after.checked_sub(balance_before) != Some(amount) {
             return Err(Error::InsufficientBalance);
         }
@@ -957,6 +1017,23 @@ impl TreasuryContract {
         let auth_callers = Self::get_authorized_callers(&env);
         if !validate_caller_is_authorized(&env, &admin, &auth_callers) {
             return Err(Error::CallerNotAuthorized);
+        }
+
+        // ── Rate Limiting & Emergency Throttling ─────────────────────────────────
+        let interactions = Self::_track_mev_interaction(&env, &admin);
+        let global_reqs: u32 = env.storage().temporary().get(&DataKey::NamespaceRoot).unwrap_or(0) + 1;
+        env.storage().temporary().set(&DataKey::NamespaceRoot, &global_reqs);
+        
+        let is_emergency = check_emergency_trigger(global_reqs);
+        let limit_status = manage_session_load(&env, interactions, is_emergency);
+        if !limit_status.allowed {
+            return Err(Error::ReentrancyGuardPaused); // Treat as throttled
+        }
+        // ─────────────────────────────────────────────────────────────────────────
+
+        let mev_flag = detect_atomic_arbitrage(&env, &admin, interactions);
+        if !enforce_protocol_isolation(&mev_flag) {
+            return Err(Error::ReentrancyGuardPaused); // Treat as isolated/blocked
         }
 
         let pre_snapshot = StateSnapshot::capture(&env);
@@ -1065,6 +1142,20 @@ impl TreasuryContract {
         }
         let recipient_balance = token::Client::new(&env, &token_ref).balance(&recipient_ref);
         if recipient_balance < amount_ref {
+            return Err(Error::StateValidationFailed);
+        }
+        let conservation = validate_fund_conservation(
+            &env, balance_before, 0, amount_ref, 0, balance_after,
+        );
+        record_invariant_check(&env, &EconomicInvariantRecord {
+            invariant: EconomicInvariant::FundConservation,
+            valid: conservation.valid,
+            observed: conservation.observed,
+            expected: conservation.expected,
+            timestamp: env.ledger().timestamp(),
+            ledger: env.ledger().sequence(),
+        });
+        if !conservation.valid {
             return Err(Error::StateValidationFailed);
         }
         pre_snapshot.assert_valid();
@@ -1525,6 +1616,12 @@ impl TreasuryContract {
             return Err(Error::CallerNotAuthorized);
         }
 
+        let interactions = Self::_track_mev_interaction(&env, &admin);
+        let mev_flag = detect_atomic_arbitrage(&env, &admin, interactions);
+        if !enforce_protocol_isolation(&mev_flag) {
+            return Err(Error::ReentrancyGuardPaused);
+        }
+
         // -------------------------------------------------------------------
         // Attack-vector dilution mitigation #1: minimum-interval gate.
         // Distributions can't be squeezed right after a big stake to game
@@ -1712,6 +1809,20 @@ impl TreasuryContract {
         let staking_balance =
             token::Client::new(&env, &token).balance(&staking_ref);
         if staking_balance < total_amount {
+            return Err(Error::StateValidationFailed);
+        }
+        let conservation = validate_fund_conservation(
+            &env, balance_before, 0, total_amount, 0, balance_after,
+        );
+        record_invariant_check(&env, &EconomicInvariantRecord {
+            invariant: EconomicInvariant::FundConservation,
+            valid: conservation.valid,
+            observed: conservation.observed,
+            expected: conservation.expected,
+            timestamp: env.ledger().timestamp(),
+            ledger: env.ledger().sequence(),
+        });
+        if !conservation.valid {
             return Err(Error::StateValidationFailed);
         }
         pre_snapshot.assert_valid();
@@ -2066,7 +2177,74 @@ impl TreasuryContract {
             .ok_or(Error::NotInitialized)
     }
 
+    // -----------------------------------------------------------------------
+    // Dynamic Fees & Revenue
+    // -----------------------------------------------------------------------
+
+    pub fn calculate_platform_fees(env: Env, amount: i128, system_load: u32, reputation: u32) -> i128 {
+        let dynamic_fee = calculate_dynamic_fee(&env, system_load, reputation);
+        (amount.saturating_mul(dynamic_fee.fee_bps as i128)) / 10000
+    }
+
+    pub fn collect_fees(
+        env: Env, 
+        from: Address, 
+        token: Address, 
+        amount: i128, 
+        system_load: u32, 
+        reputation: u32
+    ) -> Result<i128, Error> {
+        from.require_auth();
+        let fee = Self::calculate_platform_fees(env.clone(), amount, system_load, reputation);
+        
+        let recent_tx = env.storage().persistent().get(&DataKey::DepositCount(from.clone())).unwrap_or(0);
+        let total_vol = env.storage().persistent().get(&DataKey::TotalDeposits(from.clone())).unwrap_or(0);
+        
+        let evasion = detect_fee_gaming(&env, recent_tx, total_vol);
+        if evasion.is_evading {
+            return Err(Error::CallerNotAuthorized); // Gaming detected
+        }
+        
+        Self::deposit(env, from, token, fee)?;
+        Ok(fee)
+    }
+
+    pub fn distribute_fee_revenue(
+        env: Env,
+        admin: Address,
+        token: Address,
+        amount: i128,
+        destination: Address,
+    ) -> Result<(), Error> {
+        let auth_callers = Self::get_authorized_callers(&env);
+        if !validate_caller_is_authorized(&env, &admin, &auth_callers) {
+            return Err(Error::CallerNotAuthorized);
+        }
+        admin.require_auth();
+        
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&env.current_contract_address(), &destination, &amount);
+        Ok(())
     // ── Economic monitoring & fairness audit (#903) ────────────────────────
+
+    /// Validates a distribution's allocation vector and emits a monitorable
+    /// violation event when amounts do not reconcile to the declared reward.
+    pub fn verify_reward_allocation(
+        env: Env,
+        total_reward: i128,
+        allocations: Vec<RewardAllocation>,
+    ) -> bool {
+        let result = validate_reward_distribution(&env, total_reward, &allocations);
+        record_invariant_check(&env, &EconomicInvariantRecord {
+            invariant: EconomicInvariant::RewardDistribution,
+            valid: result.valid,
+            observed: result.observed,
+            expected: result.expected,
+            timestamp: env.ledger().timestamp(),
+            ledger: env.ledger().sequence(),
+        });
+        result.valid
+    }
 
     /// Monitor token flows during a distribution to detect manipulation
     /// patterns such as coordinated timing or excessive extraction.

@@ -54,3 +54,20 @@ jobs:
       - name: Run Kani proofs
         working-directory: contracts/timelock
         run: cargo kani --output-format terse
+
+  economic-invariants:
+    name: Verify economic invariants (optional)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install Kani
+        run: |
+          cargo install --locked kani-verifier
+          cargo kani setup
+      - name: Run economic proofs
+        working-directory: formal_verification
+        run: cargo kani --output-format terse

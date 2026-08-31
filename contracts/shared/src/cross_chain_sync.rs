@@ -717,6 +717,7 @@ fn check_not_expired(env: &Env, op: &AtomicXChainOp) -> Result<(), XChainSyncErr
 
 #[cfg(test)]
 mod tests {
+    use soroban_sdk::testutils::Address as _;
     extern crate std;
     use super::*;
     use soroban_sdk::{testutils::Ledger, Env};

@@ -651,6 +651,7 @@ fn emergency_state_key() -> Symbol {
 
 #[cfg(test)]
 mod tests {
+    use soroban_sdk::testutils::Address as _;
     extern crate std;
     use super::*;
     use soroban_sdk::{testutils::Ledger, BytesN, Env};

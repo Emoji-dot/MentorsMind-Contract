@@ -7,7 +7,7 @@
 //! - Behavioral fraud detection using anomaly scoring
 //! - Emergency account protection with automatic transaction blocking
 
-use soroban_sdk::{contracttype, symbol_short, Address, Bytes, BytesN, Env, Symbol};
+use soroban_sdk::{contracttype, symbol_short, Address, Bytes, BytesN, Env, Symbol, Vec, xdr::ToXdr};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -296,8 +296,7 @@ pub fn create_multisig_requirement(
     for b in now.to_be_bytes().iter() {
         payload.push_back(*b);
     }
-    let op_bytes = Bytes::from_slice(env, b"operation");
-    payload.append(&op_bytes);
+    payload.append(&operation.to_xdr(env));
     let op_fingerprint: BytesN<32> = env.crypto().sha256(&payload).into();
 
     let req = MultiSigRequirement {
@@ -443,6 +442,7 @@ fn set_protection_state(env: &Env, account: &Address, state: &AccountProtectionS
 
 #[cfg(test)]
 mod tests {
+    use soroban_sdk::testutils::Address as _;
     extern crate std;
     use super::*;
     use soroban_sdk::{testutils::Ledger, Env};

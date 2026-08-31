@@ -49,6 +49,7 @@ members = [
     "contracts/timelock",
     "contracts/treasury",
     "contracts/treasury_analytics",
+    "formal_verification",
     "contracts/upgrade_registry",
     "contracts/velocity_limits",
     "contracts/verification",

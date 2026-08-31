@@ -1,3 +1,4 @@
+
 use soroban_sdk::{contracterror, contracttype, Address, Env, Symbol, Vec};
 
 /// Cartel Detection Error Types
